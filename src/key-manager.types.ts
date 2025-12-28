@@ -124,4 +124,3 @@ export interface AmountRecoveryResult {
   /** Indices of outputs that were recovered */
   indices: number[];
 }
-

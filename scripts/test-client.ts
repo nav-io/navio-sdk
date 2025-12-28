@@ -133,14 +133,14 @@ Example:
         onProgress: (currentHeight, chainTip, blocksProcessed, txKeysProcessed, isReorg) => {
           const now = Date.now();
           const elapsed = (now - lastProgressTime) / 1000;
-          
+
           if (elapsed >= 1 || currentHeight === chainTip) {
             const progress = ((currentHeight / chainTip) * 100).toFixed(1);
             const rate = blocksProcessed / ((now - startTime) / 1000);
             console.log(
               `Progress: ${currentHeight}/${chainTip} (${progress}%) | ` +
-              `Blocks: ${blocksProcessed} | TX Keys: ${txKeysProcessed} | ` +
-              `Rate: ${rate.toFixed(1)} blocks/s`
+                `Blocks: ${blocksProcessed} | TX Keys: ${txKeysProcessed} | ` +
+                `Rate: ${rate.toFixed(1)} blocks/s`
             );
             lastProgressTime = now;
           }
@@ -148,7 +148,9 @@ Example:
       });
 
       const elapsed = ((Date.now() - startTime) / 1000).toFixed(2);
-      console.log(`\n✓ Sync completed: ${txKeysSynced.toLocaleString()} transaction keys synced in ${elapsed}s\n`);
+      console.log(
+        `\n✓ Sync completed: ${txKeysSynced.toLocaleString()} transaction keys synced in ${elapsed}s\n`
+      );
     } else {
       console.log('✓ Wallet is up to date\n');
     }
@@ -169,8 +171,7 @@ Example:
   }
 }
 
-main().catch((error) => {
+main().catch(error => {
   console.error('Fatal error:', error);
   process.exit(1);
 });
-

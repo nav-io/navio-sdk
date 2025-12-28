@@ -24,4 +24,3 @@ describe('NavioClient', () => {
     expect(returnedConfig).toEqual(config);
   });
 });
-

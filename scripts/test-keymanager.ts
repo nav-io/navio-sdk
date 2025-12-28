@@ -46,7 +46,9 @@ const mockBlsct = {
     // Simplified - in real implementation would compute public key from secret key
     const secretBytes = secretKey as unknown as Uint8Array;
     // For mock, just return a 48-byte array (BLS G1 public key size)
-    return new Uint8Array(48).fill(0).map((_, i) => secretBytes[i % secretBytes.length]) as unknown as typeof PublicKey;
+    return new Uint8Array(48)
+      .fill(0)
+      .map((_, i) => secretBytes[i % secretBytes.length]) as unknown as typeof PublicKey;
   },
 
   secretKeyToBytes: (secretKey: typeof SecretKey): Uint8Array => {
@@ -133,7 +135,7 @@ const mockBlsct = {
     combined.set(blindingBytes, 0);
     combined.set(spendingBytes, blindingBytes.length);
     combined.set(viewBytes, blindingBytes.length + spendingBytes.length);
-    
+
     // Simple hash (in real implementation would use SHA256 + RIPEMD160)
     const hash = new Uint8Array(20);
     for (let i = 0; i < 20; i++) {
@@ -150,7 +152,7 @@ const mockBlsct = {
     combined.set(blindingBytes, 0);
     combined.set(viewBytes, blindingBytes.length);
     // Return 16-bit value
-    return (combined[0] << 8 | combined[1]) & 0xffff;
+    return ((combined[0] << 8) | combined[1]) & 0xffff;
   },
 
   calculateNonce: (blindingKey: typeof PublicKey, viewKey: typeof SecretKey): typeof PublicKey => {
@@ -181,7 +183,11 @@ const mockBlsct = {
     new DataView(addressBytes.buffer).setBigUint64(0, BigInt(address), true);
 
     const combined = new Uint8Array(
-      blindingBytes.length + viewBytes.length + spendingBytes.length + accountBytes.length + addressBytes.length
+      blindingBytes.length +
+        viewBytes.length +
+        spendingBytes.length +
+        accountBytes.length +
+        addressBytes.length
     );
     let offset = 0;
     combined.set(blindingBytes, offset);
@@ -206,7 +212,7 @@ function subAddressToString(subAddress: SubAddress): string {
   // For mock, convert to hex
   const bytes = subAddress as unknown as Uint8Array;
   return Array.from(bytes)
-    .map((b) => b.toString(16).padStart(2, '0'))
+    .map(b => b.toString(16).padStart(2, '0'))
     .join('');
 }
 
@@ -228,7 +234,9 @@ function main() {
 
   // Set the HD seed (this derives all master keys)
   console.log('Setting HD seed and deriving master keys...');
-  keyManager.setHDSeed(Scalar.deserialize("3772f190ba41e7486df45fc91915b342589908df962ab92f0a7992de8d55561d"));
+  keyManager.setHDSeed(
+    Scalar.deserialize('3772f190ba41e7486df45fc91915b342589908df962ab92f0a7992de8d55561d')
+  );
   console.log('✓ HD seed set\n');
 
   // Check HD status
@@ -249,11 +257,19 @@ function main() {
   try {
     const viewKey = keyManager.getPrivateViewKey();
     const viewKeyBytes = mockBlsct.secretKeyToBytes(viewKey);
-    console.log(`View Key (hex): ${Array.from(viewKeyBytes).map((b) => b.toString(16).padStart(2, '0')).join('')}`);
+    console.log(
+      `View Key (hex): ${Array.from(viewKeyBytes)
+        .map(b => b.toString(16).padStart(2, '0'))
+        .join('')}`
+    );
     const spendPublicKey = keyManager.getPublicSpendingKey();
     const spendKeyBytes = mockBlsct.publicKeyToBytes(spendPublicKey);
     console.log('spendpublickey', spendPublicKey.serialize());
-    console.log(`Spend Public Key (hex): ${Array.from(spendKeyBytes).map((b) => b.toString(16).padStart(2, '0')).join('')}\n`);
+    console.log(
+      `Spend Public Key (hex): ${Array.from(spendKeyBytes)
+        .map(b => b.toString(16).padStart(2, '0'))
+        .join('')}\n`
+    );
   } catch (error) {
     console.error('Error getting keys:', error);
   }
@@ -263,9 +279,21 @@ function main() {
   if (hdChain) {
     console.log('HD Chain Info:');
     console.log(`  Version: ${hdChain.version}`);
-    console.log(`  Seed ID: ${Array.from(hdChain.seedId).map((b) => b.toString(16).padStart(2, '0')).join('')}`);
-    console.log(`  Spend ID: ${Array.from(hdChain.spendId).map((b) => b.toString(16).padStart(2, '0')).join('')}`);
-    console.log(`  View ID: ${Array.from(hdChain.viewId).map((b) => b.toString(16).padStart(2, '0')).join('')}\n`);
+    console.log(
+      `  Seed ID: ${Array.from(hdChain.seedId)
+        .map(b => b.toString(16).padStart(2, '0'))
+        .join('')}`
+    );
+    console.log(
+      `  Spend ID: ${Array.from(hdChain.spendId)
+        .map(b => b.toString(16).padStart(2, '0'))
+        .join('')}`
+    );
+    console.log(
+      `  View ID: ${Array.from(hdChain.viewId)
+        .map(b => b.toString(16).padStart(2, '0'))
+        .join('')}\n`
+    );
   }
 
   console.log('✓ Test completed successfully!');
@@ -278,4 +306,3 @@ try {
   console.error('Error running test:', error);
   process.exit(1);
 }
-

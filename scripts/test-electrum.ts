@@ -1,7 +1,7 @@
 /**
  * Test script for Electrum Client
  * Demonstrates connecting to Electrum server and fetching transaction keys
- * 
+ *
  * Usage: npm run test:electrum
  */
 
@@ -93,7 +93,9 @@ Example:
       const blockTxKeys = await client.getBlockTransactionKeys(0);
       console.log(`Block 0 Transaction Keys: ${blockTxKeys.length} transactions`);
       if (blockTxKeys.length > 0) {
-        console.log(`First transaction keys: ${JSON.stringify(blockTxKeys[0]).substring(0, 100)}...\n`);
+        console.log(
+          `First transaction keys: ${JSON.stringify(blockTxKeys[0]).substring(0, 100)}...\n`
+        );
       } else {
         console.log('No transaction keys found for block 0\n');
       }
@@ -113,7 +115,9 @@ Example:
       console.log(`  Next height: ${rangeResult.nextHeight}`);
       if (rangeResult.blocks.length > 0) {
         const firstBlock = rangeResult.blocks[0];
-        console.log(`  First block (height ${firstBlock.height}): ${firstBlock.txKeys.length} transactions\n`);
+        console.log(
+          `  First block (height ${firstBlock.height}): ${firstBlock.txKeys.length} transactions\n`
+        );
       } else {
         console.log('  No blocks returned\n');
       }
@@ -147,8 +151,7 @@ Example:
 }
 
 // Run the test
-main().catch((error) => {
+main().catch(error => {
   console.error('Fatal error running tests:', error);
   process.exit(1);
 });
-

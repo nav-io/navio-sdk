@@ -1,7 +1,7 @@
 /**
  * Navio SDK Client
  * Main client class for interacting with the Navio blockchain
- * 
+ *
  * This is the primary entry point for the SDK. It manages:
  * - Wallet database connection
  * - Electrum server connection
@@ -46,7 +46,7 @@ export class NavioClient {
    */
   constructor(config: NavioClientConfig) {
     this.config = config;
-    
+
     // Initialize components
     this.walletDB = new WalletDB(config.walletDbPath);
     this.electrumClient = new ElectrumClient(config.electrum);
@@ -74,7 +74,7 @@ export class NavioClient {
         } else {
           throw new Error(
             `Wallet not found at ${this.config.walletDbPath}. ` +
-            `Set createWalletIfNotExists: true to create a new wallet.`
+              `Set createWalletIfNotExists: true to create a new wallet.`
           );
         }
       }

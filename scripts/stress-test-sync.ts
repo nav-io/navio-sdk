@@ -1,7 +1,7 @@
 #!/usr/bin/env tsx
 /**
  * Stress Test Script for Transaction Keys Sync
- * 
+ *
  * Tests the sync functionality by feeding large amounts of random transaction keys
  * with outputs to verify:
  * - Output detection performance
@@ -40,17 +40,17 @@ function randomHex(length: number): string {
  */
 function generateRandomTxKeys(txHash: string, numOutputs: number): any {
   const outputs: any[] = [];
-  
+
   for (let i = 0; i < numOutputs; i++) {
     // Generate random keys (these won't match the wallet, but test the processing)
     // BLS public keys are 48 bytes, serialize to hex strings
     const viewTag = Math.floor(Math.random() * 65536); // 16-bit
     const outputHash = randomHex(64);
-    
+
     // Convert to hex strings (PublicKey.deserialize expects hex strings or Uint8Array)
     const blindingKey = PublicKey.random().serialize();
     const spendingKey = PublicKey.random().serialize();
-    
+
     outputs.push({
       blindingKey,
       spendingKey,
@@ -59,7 +59,7 @@ function generateRandomTxKeys(txHash: string, numOutputs: number): any {
       outputIndex: i,
     });
   }
-  
+
   return {
     outputs,
     inputs: [], // Empty inputs for this test
@@ -76,33 +76,33 @@ function generateMatchingTxKeys(
   matchProbability: number = 0.1
 ): any {
   const outputs: any[] = [];
-  
+
   for (let i = 0; i < numOutputs; i++) {
     const shouldMatch = Math.random() < matchProbability;
-    
+
     if (shouldMatch) {
       // Generate a sub-address that belongs to the wallet
       const account = Math.floor(Math.random() * 3); // 0-2
       const address = Math.floor(Math.random() * 10); // 0-9
-      
+
       try {
         const subAddress = keyManager.getSubAddress({ account, address });
-        
+
         // Extract keys from sub-address
         // SubAddr has methods to get blinding and spending keys
         const subAddrBytes = subAddress.serialize();
         const { DoublePublicKey } = blsctModule;
         const dpk = DoublePublicKey.deserialize(subAddrBytes);
-        
+
         // Get view key to calculate view tag
         const viewKey = keyManager.getPrivateViewKey();
         const blindingKey = dpk.getBlindingKey();
         const spendingKey = dpk.getSpendingKey();
-        
+
         // Calculate view tag
         const viewTag = keyManager.calculateViewTag(blindingKey);
         const outputHash = randomHex(64);
-        
+
         outputs.push({
           blindingKey,
           spendingKey,
@@ -119,7 +119,7 @@ function generateMatchingTxKeys(
       outputs.push(...generateRandomTxKeys(txHash, 1).outputs);
     }
   }
-  
+
   return {
     outputs,
     inputs: [],
@@ -131,35 +131,38 @@ function generateMatchingTxKeys(
  */
 class MockElectrumClient extends ElectrumClient {
   private mockOutputs: Map<string, string> = new Map();
-  
+
   constructor() {
     super({ host: 'localhost', port: 50001 });
   }
-  
+
   async connect(): Promise<void> {
     // Mock connection - always succeeds
     (this as any).connected = true;
   }
-  
+
   async disconnect(): Promise<void> {
     (this as any).connected = false;
   }
-  
+
   async getChainTipHeight(): Promise<number> {
     return 1000000; // Mock chain tip
   }
-  
+
   async getBlockHeader(height: number): Promise<string> {
     // Return mock block header (80 bytes = 160 hex chars)
     return randomHex(160);
   }
-  
-  async getBlockHeaders(startHeight: number, count: number): Promise<{ count: number; hex: string; max: number }> {
+
+  async getBlockHeaders(
+    startHeight: number,
+    count: number
+  ): Promise<{ count: number; hex: string; max: number }> {
     // Return mock headers
     const hex = randomHex(160 * count);
     return { count, hex, max: 1000 };
   }
-  
+
   async getTransactionOutput(outputHash: string): Promise<string> {
     // Return cached mock output or generate new one
     if (!this.mockOutputs.has(outputHash)) {
@@ -169,7 +172,7 @@ class MockElectrumClient extends ElectrumClient {
     }
     return this.mockOutputs.get(outputHash)!;
   }
-  
+
   setMockOutput(outputHash: string, outputData: string): void {
     this.mockOutputs.set(outputHash, outputData);
   }
@@ -273,24 +276,26 @@ Example:
 
     for (let blockHeight = 0; blockHeight < numTransactions; blockHeight++) {
       const txKeys: Array<{ txHash: string; keys: any }> = [];
-      
+
       // Generate 1-3 transactions per block
       const txsPerBlock = Math.floor(Math.random() * 3) + 1;
-      
+
       for (let txIdx = 0; txIdx < txsPerBlock; txIdx++) {
         const txHash = randomHex(64);
         const keys = generateMatchingTxKeys(txHash, numOutputsPerTx, keyManager, matchProbability);
         txKeys.push({ txHash, keys });
         totalOutputs += numOutputsPerTx;
       }
-      
+
       testBlocks.push({
         height: blockHeight,
         txKeys,
       });
     }
 
-    console.log(`Generated ${testBlocks.length} blocks with ${totalOutputs.toLocaleString()} total outputs\n`);
+    console.log(
+      `Generated ${testBlocks.length} blocks with ${totalOutputs.toLocaleString()} total outputs\n`
+    );
 
     // Stress test processing
     console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
@@ -307,40 +312,48 @@ Example:
     // Process in batches
     for (let i = 0; i < testBlocks.length; i += batchSize) {
       const batch = testBlocks.slice(i, i + batchSize);
-      
+
       for (const block of batch) {
         try {
           // Process each transaction in the block
-            for (const txKey of block.txKeys) {
-              // Access private method through type assertion (for testing only)
-                // The keys structure should be: [txHash, { outputs: [...] }]
-              const processTxKeys = (syncManager as any).processTransactionKeys.bind(syncManager);
-              await processTxKeys(
-                txKey.txHash,
-                [txKey.txHash, txKey.keys], // Match expected structure: keys[1]?.outputs
-                block.height,
-                randomHex(64) // blockHash
-              );
-              
-              processedOutputs += txKey.keys.outputs?.length || 0;
-              
-              // Count matching outputs (would be stored in wallet_outputs)
-              for (const output of txKey.keys.outputs || []) {
-                try {
-                  const { PublicKey } = require('navio-blsct');
-                  // Keys are hex strings, deserialize them
-                  const blindingKeyObj = PublicKey.deserialize(Buffer.from(output.blindingKey, 'hex'));
-                  const spendingKeyObj = PublicKey.deserialize(Buffer.from(output.spendingKey, 'hex'));
-                  const isMine = keyManager.isMineByKeys(blindingKeyObj, spendingKeyObj, output.viewTag);
-                  if (isMine) {
-                    matchedOutputs++;
-                  }
-                } catch (error) {
-                  // Skip invalid keys
+          for (const txKey of block.txKeys) {
+            // Access private method through type assertion (for testing only)
+            // The keys structure should be: [txHash, { outputs: [...] }]
+            const processTxKeys = (syncManager as any).processTransactionKeys.bind(syncManager);
+            await processTxKeys(
+              txKey.txHash,
+              [txKey.txHash, txKey.keys], // Match expected structure: keys[1]?.outputs
+              block.height,
+              randomHex(64) // blockHash
+            );
+
+            processedOutputs += txKey.keys.outputs?.length || 0;
+
+            // Count matching outputs (would be stored in wallet_outputs)
+            for (const output of txKey.keys.outputs || []) {
+              try {
+                const { PublicKey } = require('navio-blsct');
+                // Keys are hex strings, deserialize them
+                const blindingKeyObj = PublicKey.deserialize(
+                  Buffer.from(output.blindingKey, 'hex')
+                );
+                const spendingKeyObj = PublicKey.deserialize(
+                  Buffer.from(output.spendingKey, 'hex')
+                );
+                const isMine = keyManager.isMineByKeys(
+                  blindingKeyObj,
+                  spendingKeyObj,
+                  output.viewTag
+                );
+                if (isMine) {
+                  matchedOutputs++;
                 }
+              } catch (error) {
+                // Skip invalid keys
               }
             }
-          
+          }
+
           processedBlocks++;
         } catch (error) {
           errors++;
@@ -350,12 +363,12 @@ Example:
 
       // Progress update
       if ((i + batchSize) % (batchSize * 10) === 0 || i + batchSize >= testBlocks.length) {
-        const progress = ((i + batchSize) / testBlocks.length * 100).toFixed(1);
+        const progress = (((i + batchSize) / testBlocks.length) * 100).toFixed(1);
         const elapsed = (Date.now() - startTime) / 1000;
         const rate = processedBlocks / elapsed;
         console.log(
           `Progress: ${progress}% | Blocks: ${processedBlocks.toLocaleString()} | ` +
-          `Outputs: ${processedOutputs.toLocaleString()} | Rate: ${rate.toFixed(1)} blocks/s`
+            `Outputs: ${processedOutputs.toLocaleString()} | Rate: ${rate.toFixed(1)} blocks/s`
         );
       }
     }
@@ -367,9 +380,10 @@ Example:
     // Check database state
     const db = walletDB.getDatabase();
     const walletOutputsResult = db.exec('SELECT COUNT(*) FROM wallet_outputs');
-    const walletOutputsCount = walletOutputsResult.length > 0 && walletOutputsResult[0].values.length > 0
-      ? walletOutputsResult[0].values[0][0] as number
-      : 0;
+    const walletOutputsCount =
+      walletOutputsResult.length > 0 && walletOutputsResult[0].values.length > 0
+        ? (walletOutputsResult[0].values[0][0] as number)
+        : 0;
 
     // Results
     console.log('\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
@@ -385,8 +399,8 @@ Example:
     console.log(`  Total time: ${elapsed.toFixed(2)}s`);
     console.log(`  Blocks per second: ${(processedBlocks / elapsed).toFixed(2)}`);
     console.log(`  Outputs per second: ${(processedOutputs / elapsed).toFixed(2)}`);
-    console.log(`  Time per block: ${(elapsed / processedBlocks * 1000).toFixed(2)}ms`);
-    console.log(`  Time per output: ${(elapsed / processedOutputs * 1000).toFixed(3)}ms`);
+    console.log(`  Time per block: ${((elapsed / processedBlocks) * 1000).toFixed(2)}ms`);
+    console.log(`  Time per output: ${((elapsed / processedOutputs) * 1000).toFixed(3)}ms`);
 
     console.log(`\nMemory usage:`);
     const memoryDelta = {
@@ -426,8 +440,7 @@ Example:
   }
 }
 
-main().catch((error) => {
+main().catch(error => {
   console.error('Fatal error:', error);
   process.exit(1);
 });
-

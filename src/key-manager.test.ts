@@ -4,37 +4,40 @@ import type { SecretKey, PublicKey, SubAddress, SubAddressIdentifier } from './k
 
 // Mock navio-blsct module
 const mockBlsct = {
-  genRandomSeed: vi.fn((): SecretKey => ({ type: 'secret', random: true } as SecretKey)),
-  deriveMasterSK: vi.fn((_seed: Uint8Array): SecretKey => ({ type: 'secret' } as SecretKey)),
+  genRandomSeed: vi.fn((): SecretKey => ({ type: 'secret', random: true }) as SecretKey),
+  deriveMasterSK: vi.fn((_seed: Uint8Array): SecretKey => ({ type: 'secret' }) as SecretKey),
   deriveChildSK: vi.fn(
-    (_parentSK: SecretKey, _index: number): SecretKey => ({ type: 'secret', derived: true } as SecretKey)
+    (_parentSK: SecretKey, _index: number): SecretKey =>
+      ({ type: 'secret', derived: true }) as SecretKey
   ),
   secretKeyToPublicKey: vi.fn(
-    (secretKey: SecretKey): PublicKey => ({ type: 'public', from: secretKey } as PublicKey)
+    (secretKey: SecretKey): PublicKey => ({ type: 'public', from: secretKey }) as PublicKey
   ),
   secretKeyToBytes: vi.fn((_secretKey: SecretKey): Uint8Array => new Uint8Array(32)),
   publicKeyToBytes: vi.fn((_publicKey: PublicKey): Uint8Array => new Uint8Array(48)),
-  bytesToSecretKey: vi.fn((_bytes: Uint8Array): SecretKey => ({ type: 'secret' } as SecretKey)),
-  bytesToPublicKey: vi.fn((_bytes: Uint8Array): PublicKey => ({ type: 'public' } as PublicKey)),
-  fromSeedToChildKey: vi.fn((_seed: SecretKey): SecretKey => ({ type: 'secret', derived: 'child' } as SecretKey)),
+  bytesToSecretKey: vi.fn((_bytes: Uint8Array): SecretKey => ({ type: 'secret' }) as SecretKey),
+  bytesToPublicKey: vi.fn((_bytes: Uint8Array): PublicKey => ({ type: 'public' }) as PublicKey),
+  fromSeedToChildKey: vi.fn(
+    (_seed: SecretKey): SecretKey => ({ type: 'secret', derived: 'child' }) as SecretKey
+  ),
   fromChildToTransactionKey: vi.fn(
-    (_childKey: SecretKey): SecretKey => ({ type: 'secret', derived: 'transaction' } as SecretKey)
+    (_childKey: SecretKey): SecretKey => ({ type: 'secret', derived: 'transaction' }) as SecretKey
   ),
   fromChildToBlindingKey: vi.fn(
-    (_childKey: SecretKey): SecretKey => ({ type: 'secret', derived: 'blinding' } as SecretKey)
+    (_childKey: SecretKey): SecretKey => ({ type: 'secret', derived: 'blinding' }) as SecretKey
   ),
   fromChildToTokenKey: vi.fn(
-    (_childKey: SecretKey): SecretKey => ({ type: 'secret', derived: 'token' } as SecretKey)
+    (_childKey: SecretKey): SecretKey => ({ type: 'secret', derived: 'token' }) as SecretKey
   ),
   fromTransactionToViewKey: vi.fn(
-    (_txKey: SecretKey): SecretKey => ({ type: 'secret', derived: 'view' } as SecretKey)
+    (_txKey: SecretKey): SecretKey => ({ type: 'secret', derived: 'view' }) as SecretKey
   ),
   fromTransactionToSpendKey: vi.fn(
-    (_txKey: SecretKey): SecretKey => ({ type: 'secret', derived: 'spend' } as SecretKey)
+    (_txKey: SecretKey): SecretKey => ({ type: 'secret', derived: 'spend' }) as SecretKey
   ),
   deriveSubAddress: vi.fn(
     (_viewKey: SecretKey, _spendPublicKey: PublicKey, _id: SubAddressIdentifier): SubAddress =>
-      ({ type: 'subAddress' } as SubAddress)
+      ({ type: 'subAddress' }) as SubAddress
   ),
   calculateHashId: vi.fn(
     (_blindingKey: PublicKey, _spendingKey: PublicKey, _viewKey: SecretKey): Uint8Array =>
@@ -42,7 +45,8 @@ const mockBlsct = {
   ),
   calculateViewTag: vi.fn((_blindingKey: PublicKey, _viewKey: SecretKey): number => 12345),
   calculateNonce: vi.fn(
-    (_blindingKey: PublicKey, _viewKey: SecretKey): PublicKey => ({ type: 'public', nonce: true } as PublicKey)
+    (_blindingKey: PublicKey, _viewKey: SecretKey): PublicKey =>
+      ({ type: 'public', nonce: true }) as PublicKey
   ),
   calculatePrivateSpendingKey: vi.fn(
     (
@@ -51,7 +55,7 @@ const mockBlsct = {
       _spendingKey: SecretKey,
       _account: number,
       _address: number
-    ): SecretKey => ({ type: 'secret', spending: true } as SecretKey)
+    ): SecretKey => ({ type: 'secret', spending: true }) as SecretKey
   ),
 };
 
@@ -273,4 +277,3 @@ describe('KeyManager', () => {
     });
   });
 });
-

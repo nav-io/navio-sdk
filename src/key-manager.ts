@@ -1,7 +1,7 @@
 /**
  * KeyManager - Replicates blsct::keyman functionality from navio-core
  * Uses low-level functions from navio-blsct library
- * 
+ *
  * Based on navio-blsct documentation: https://nav-io.github.io/libblsct-bindings/ts/
  */
 
@@ -61,8 +61,10 @@ export class KeyManager {
   // In-memory key storage (replicates KeyRing functionality)
   private keys: Map<string, ScalarType> = new Map(); // keyId (hex) -> secret key
   private outKeys: Map<string, ScalarType> = new Map(); // outId (hex) -> secret key
-  private cryptedKeys: Map<string, { publicKey: PublicKeyType; encryptedSecret: Uint8Array }> = new Map(); // keyId -> encrypted key
-  private cryptedOutKeys: Map<string, { publicKey: PublicKeyType; encryptedSecret: Uint8Array }> = new Map(); // outId -> encrypted key
+  private cryptedKeys: Map<string, { publicKey: PublicKeyType; encryptedSecret: Uint8Array }> =
+    new Map(); // keyId -> encrypted key
+  private cryptedOutKeys: Map<string, { publicKey: PublicKeyType; encryptedSecret: Uint8Array }> =
+    new Map(); // outId -> encrypted key
   private keyMetadata: Map<string, { nCreateTime: number }> = new Map(); // keyId -> metadata
 
   // SubAddress management
@@ -72,12 +74,11 @@ export class KeyManager {
   private subAddressPool: Map<number, Set<number>> = new Map(); // account -> Set<address indices>
   private subAddressPoolTime: Map<string, number> = new Map(); // "${account}:${address}" -> timestamp
   private timeFirstKey: number | null = null; // Creation time of first key
-  
+
   // Flags
   private fViewKeyDefined = false;
   private fSpendKeyDefined = false;
   private fDecryptionThoroughlyChecked = true;
-
 
   /**
    * Check if HD is enabled (has a seed)
@@ -117,31 +118,31 @@ export class KeyManager {
     // Derive keys following the same path as navio-core using navio-blsct API
     // FromSeedToChildKey: ChildKey(seed) with index 130
     const childKey = new ChildKey(seed);
-    
+
     // FromChildToTransactionKey: childKey.toTxKey() (index 0)
     const txKey = childKey.toTxKey();
-    
+
     // FromChildToBlindingKey: childKey.toBlindingKey() (index 1)
     const blindingKey = childKey.toBlindingKey();
-    
+
     // FromChildToTokenKey: childKey.toTokenKey() (index 2)
     const tokenKey = childKey.toTokenKey();
-    
+
     // FromTransactionToViewKey: txKey.toViewKey() (index 0)
     const viewKey = new Scalar(txKey.toViewKey().value());
-    
+
     // FromTransactionToSpendKey: txKey.toSpendingKey() (index 1)
     const spendKey = new Scalar(txKey.toSpendingKey().value());
 
     // Store the derived keys
     this.viewKey = viewKey;
     this.spendKey = spendKey; // Store private spending key
-    
+
     // Get public key from spend key
     // In navio-core, spendKey is a PrivateKey (Scalar) and we call GetPublicKey() on it
     // In navio-blsct, SpendingKey might need to be converted to Scalar first, or have a different API
     let spendPublicKey: PublicKeyType = PublicKey.fromScalar(spendKey);
-    
+
     this.spendPublicKey = spendPublicKey;
 
     // Calculate IDs using hash160
@@ -412,11 +413,11 @@ export class KeyManager {
     if (!this.viewKey) {
       throw new Error('View key not available');
     }
-    
+
     // Use calcKeyId from navio-blsct
     // Reference: https://nav-io.github.io/libblsct-bindings/ts/functions/calcKeyId.html
     const keyId = calcKeyId(blindingKey, spendingKey, this.viewKey);
-    
+
     // calcKeyId returns a Uint8Array (20 bytes for hash160)
     // Convert to Uint8Array if needed
     if (keyId instanceof Uint8Array) {
@@ -436,7 +437,7 @@ export class KeyManager {
     if (!this.viewKey) {
       throw new Error('View key not available');
     }
-    
+
     // Use calcViewTag from navio-blsct
     // Reference: https://nav-io.github.io/libblsct-bindings/ts/functions/calcViewTag.html
     return new ViewTag(blindingKey, this.viewKey);
@@ -452,7 +453,7 @@ export class KeyManager {
     if (!this.viewKey) {
       throw new Error('View key not available');
     }
-    
+
     // Use calcNonce from navio-blsct
     // Reference: https://nav-io.github.io/libblsct-bindings/ts/functions/calcNonce.html
     return calcNonce(blindingKey, this.viewKey);
@@ -879,7 +880,7 @@ export class KeyManager {
 
   private bytesToHex(bytes: Uint8Array): string {
     return Array.from(bytes)
-      .map((b) => b.toString(16).padStart(2, '0'))
+      .map(b => b.toString(16).padStart(2, '0'))
       .join('');
   }
 
@@ -932,7 +933,11 @@ export class KeyManager {
    * @param key - Output parameter for the spending key
    * @returns True if successful
    */
-  getSpendingKeyForOutputById(out: CTxOut, hashId: Uint8Array, key: { value: ScalarType | null }): boolean {
+  getSpendingKeyForOutputById(
+    out: CTxOut,
+    hashId: Uint8Array,
+    key: { value: ScalarType | null }
+  ): boolean {
     const id: SubAddressIdentifier = { account: 0, address: 0 };
     if (!this.getSubAddressId(hashId, id)) {
       return false;
@@ -947,20 +952,24 @@ export class KeyManager {
    * @param key - Output parameter for the spending key
    * @returns True if successful
    */
-  getSpendingKeyForOutputBySubAddress(out: CTxOut, id: SubAddressIdentifier, key: { value: ScalarType | null }): boolean {
+  getSpendingKeyForOutputBySubAddress(
+    out: CTxOut,
+    id: SubAddressIdentifier,
+    key: { value: ScalarType | null }
+  ): boolean {
     if (!this.fViewKeyDefined || !this.viewKey) {
       throw new Error('KeyManager: the wallet has no view key available');
     }
 
     const sk = this.getSpendingKey();
-    
+
     // Calculate private spending key using navio-blsct
     // Uses calcPrivSpendingKey(blindingKey, viewKey, spendingKey, account, address)
     // Reference: https://nav-io.github.io/libblsct-bindings/ts/functions/calcPrivSpendingKey.html
     const blindingKey = out.blsctData.blindingKey as PublicKeyType;
     const viewKeyScalar = this.getScalarFromViewKey(this.viewKey);
     const spendingKeyScalar = this.getScalarFromScalar(sk);
-    
+
     key.value = calcPrivSpendingKey(
       blindingKey,
       viewKeyScalar,
@@ -990,7 +999,11 @@ export class KeyManager {
    * @param key - Output parameter for the spending key
    * @returns True if successful
    */
-  getSpendingKeyForOutputWithCacheById(out: CTxOut, hashId: Uint8Array, key: { value: ScalarType | null }): boolean {
+  getSpendingKeyForOutputWithCacheById(
+    out: CTxOut,
+    hashId: Uint8Array,
+    key: { value: ScalarType | null }
+  ): boolean {
     const id: SubAddressIdentifier = { account: 0, address: 0 };
     if (!this.getSubAddressId(hashId, id)) {
       return false;
@@ -1005,23 +1018,28 @@ export class KeyManager {
    * @param key - Output parameter for the spending key
    * @returns True if successful
    */
-  getSpendingKeyForOutputWithCacheBySubAddress(out: CTxOut, id: SubAddressIdentifier, key: { value: ScalarType | null }): boolean {
+  getSpendingKeyForOutputWithCacheBySubAddress(
+    out: CTxOut,
+    id: SubAddressIdentifier,
+    key: { value: ScalarType | null }
+  ): boolean {
     if (!this.fViewKeyDefined || !this.viewKey) {
       throw new Error('KeyManager: the wallet has no view key available');
     }
 
     const sk = this.getSpendingKey();
-    
+
     // Calculate outId for caching: Hash(blindingKey || viewKey || spendingKey || account || address)
     const blindingKey = out.blsctData.blindingKey as PublicKeyType;
     const viewKeyScalar = this.getScalarFromViewKey(this.viewKey);
     const spendingKeyScalar = this.getScalarFromScalar(sk);
-    
+
     const outIdData = new Uint8Array(
       this.getPublicKeyBytes(blindingKey).length +
-      this.getScalarBytes(viewKeyScalar).length +
-      this.getScalarBytes(spendingKeyScalar).length +
-      8 + 8 // account (int64) + address (uint64)
+        this.getScalarBytes(viewKeyScalar).length +
+        this.getScalarBytes(spendingKeyScalar).length +
+        8 +
+        8 // account (int64) + address (uint64)
     );
     let offset = 0;
     outIdData.set(this.getPublicKeyBytes(blindingKey), offset);
@@ -1030,23 +1048,23 @@ export class KeyManager {
     offset += this.getScalarBytes(viewKeyScalar).length;
     outIdData.set(this.getScalarBytes(spendingKeyScalar), offset);
     offset += this.getScalarBytes(spendingKeyScalar).length;
-    
+
     // Write account and address as little-endian
     const accountView = new DataView(outIdData.buffer, offset, 8);
     accountView.setBigInt64(0, BigInt(id.account), true);
     offset += 8;
     const addressView = new DataView(outIdData.buffer, offset, 8);
     addressView.setBigUint64(0, BigInt(id.address), true);
-    
+
     const outId = sha256(outIdData);
-    
+
     // Check cache first
     const cachedKey = this.getOutKey(outId);
     if (cachedKey) {
       key.value = cachedKey;
       return true;
     }
-    
+
     // Calculate and cache using navio-blsct API
     // Reference: https://nav-io.github.io/libblsct-bindings/ts/functions/calcPrivSpendingKey.html
     const calculatedKey = calcPrivSpendingKey(
@@ -1056,7 +1074,7 @@ export class KeyManager {
       id.account,
       id.address
     );
-    
+
     // Cache it
     this.addKeyOutKey(calculatedKey, outId);
     key.value = calculatedKey;
@@ -1077,7 +1095,7 @@ export class KeyManager {
     // Check if spendingKey is zero (extract from script)
     const spendingKey = txout.blsctData.spendingKey as PublicKeyType;
     const isZero = this.isPublicKeyZero(spendingKey);
-    
+
     if (isZero) {
       // Try to extract spending key from script
       const extractedSpendingKey: { value: PublicKeyType | null } = { value: null };
@@ -1090,7 +1108,7 @@ export class KeyManager {
       }
       return false;
     }
-    
+
     return this.isMineByKeys(
       txout.blsctData.blindingKey as PublicKeyType,
       spendingKey,
@@ -1150,7 +1168,7 @@ export class KeyManager {
 
     const spendingKey = txout.blsctData.spendingKey as PublicKeyType;
     const isZero = this.isPublicKeyZero(spendingKey);
-    
+
     if (isZero) {
       // Try to extract from script
       const extractedSpendingKey: { value: PublicKeyType | null } = { value: null };
@@ -1163,10 +1181,7 @@ export class KeyManager {
       return new Uint8Array(20); // Return empty hash ID
     }
 
-    return this.getHashId(
-      txout.blsctData.blindingKey as PublicKeyType,
-      spendingKey
-    );
+    return this.getHashId(txout.blsctData.blindingKey as PublicKeyType, spendingKey);
   }
 
   /**
@@ -1194,7 +1209,7 @@ export class KeyManager {
   getDestination(txout: CTxOut): CTxDestination | null {
     const hashId = this.getHashIdFromTxOut(txout);
     const subAddress: { value: SubAddrType | null } = { value: null };
-    
+
     if (!this.getSubAddressByHashId(hashId, subAddress)) {
       return null;
     }
@@ -1212,7 +1227,7 @@ export class KeyManager {
   outputIsChange(out: CTxOut): boolean {
     const hashId = this.getHashIdFromTxOut(out);
     const id: SubAddressIdentifier = { account: 0, address: 0 };
-    
+
     if (!this.getSubAddressId(hashId, id)) {
       return false;
     }
@@ -1261,24 +1276,24 @@ export class KeyManager {
 
     // Build recovery requests for outputs that match our view tag
     const recoveryRequests: any[] = [];
-    
+
     for (let i = 0; i < outs.length; i++) {
       const out = outs[i];
-      
+
       // Check if output has BLS CT data and range proof
       if (!out.blsctData || !out.blsctData.rangeProof) {
         continue;
       }
-      
+
       // Check view tag matches
       const calculatedViewTag = this.calculateViewTag(out.blsctData.blindingKey as PublicKeyType);
       if (out.blsctData.viewTag !== calculatedViewTag) {
         continue;
       }
-      
+
       // Calculate nonce
       const nonce = this.calculateNonce(out.blsctData.blindingKey as PublicKeyType);
-      
+
       // Build recovery request
       // Format depends on navio-blsct API - need to check exact structure
       recoveryRequests.push({
@@ -1296,7 +1311,7 @@ export class KeyManager {
     // Call navio-blsct recoverAmount
     // Reference: https://nav-io.github.io/libblsct-bindings/ts/functions/recoverAmount.html
     const result = recoverAmount(recoveryRequests);
-    
+
     // Convert result to our format
     // Need to check the actual return type from navio-blsct
     if (result && result.success !== undefined) {
@@ -1306,7 +1321,7 @@ export class KeyManager {
         indices: result.indices || [],
       };
     }
-    
+
     // Fallback if result format is different
     return { success: false, amounts: [], indices: [] };
   }
@@ -1325,15 +1340,15 @@ export class KeyManager {
 
     // Build recovery requests using provided nonce
     const recoveryRequests: any[] = [];
-    
+
     for (let i = 0; i < outs.length; i++) {
       const out = outs[i];
-      
+
       // Check if output has BLS CT data and range proof
       if (!out.blsctData || !out.blsctData.rangeProof) {
         continue;
       }
-      
+
       // Use the provided nonce instead of calculating it
       recoveryRequests.push({
         rangeProof: out.blsctData.rangeProof,
@@ -1349,7 +1364,7 @@ export class KeyManager {
 
     // Call navio-blsct recoverAmount with provided nonce
     const result = recoverAmount(recoveryRequests);
-    
+
     // Convert result to our format
     if (result && result.success !== undefined) {
       return {
@@ -1358,7 +1373,7 @@ export class KeyManager {
         indices: result.indices || [],
       };
     }
-    
+
     return { success: false, amounts: [], indices: [] };
   }
 
@@ -1413,7 +1428,7 @@ export class KeyManager {
     if (!this.haveSubAddress(hashId)) {
       return false;
     }
-    
+
     const hashIdHex = this.bytesToHex(hashId);
     const id = this.subAddresses.get(hashIdHex)!;
     address.value = this.getSubAddress(id);
@@ -1431,7 +1446,7 @@ export class KeyManager {
     if (!this.haveSubAddress(hashId)) {
       return false;
     }
-    
+
     const hashIdHex = this.bytesToHex(hashId);
     const storedId = this.subAddresses.get(hashIdHex)!;
     id.account = storedId.account;
@@ -1488,7 +1503,11 @@ export class KeyManager {
    * @param nIndex - Output parameter for the address index
    * @param keypool - Output parameter for the keypool entry
    */
-  reserveSubAddressFromPool(account: number, nIndex: { value: number }, keypool: { value: { id: SubAddressIdentifier; subAddress: SubAddrType } | null }): void {
+  reserveSubAddressFromPool(
+    account: number,
+    nIndex: { value: number },
+    keypool: { value: { id: SubAddressIdentifier; subAddress: SubAddrType } | null }
+  ): void {
     const pool = this.subAddressPool.get(account);
     if (!pool || pool.size === 0) {
       throw new Error('KeyManager: Sub-address pool is empty');
@@ -1543,7 +1562,11 @@ export class KeyManager {
    * @param id - Output parameter for the sub-address identifier
    * @returns True if successful
    */
-  getSubAddressFromPool(account: number, result: { value: Uint8Array | null }, id: { value: SubAddressIdentifier | null }): boolean {
+  getSubAddressFromPool(
+    account: number,
+    result: { value: Uint8Array | null },
+    id: { value: SubAddressIdentifier | null }
+  ): boolean {
     const pool = this.subAddressPool.get(account);
     if (!pool || pool.size === 0) {
       return false;
@@ -1552,12 +1575,12 @@ export class KeyManager {
     const index = Array.from(pool)[0];
     const subAddressId: SubAddressIdentifier = { account, address: index };
     const subAddress = this.getSubAddress(subAddressId);
-    
+
     // Get hash ID from sub-address
     // This requires getting the keys from SubAddress and calculating hash ID
     // For now, we'll need to extract keys from SubAddress
     const hashId = this.getHashIdFromSubAddress(subAddress);
-    
+
     result.value = hashId;
     id.value = subAddressId;
     return true;
@@ -1618,7 +1641,10 @@ export class KeyManager {
    * @param spendingKey - Output parameter for the spending key
    * @returns True if successful
    */
-  extractSpendingKeyFromScript(script: Uint8Array, spendingKey: { value: PublicKeyType | null }): boolean {
+  extractSpendingKeyFromScript(
+    script: Uint8Array,
+    spendingKey: { value: PublicKeyType | null }
+  ): boolean {
     // This extracts spending key from OP_BLSCHECKSIG script
     // For now, return false - needs script parsing implementation
     // TODO: Implement script parsing for OP_BLSCHECKSIG
@@ -1680,17 +1706,19 @@ export class KeyManager {
     // Method: DoublePublicKey.deserialize(subaddress.serialize())
     const serialized = (subAddress as any).serialize();
     const doublePublicKey = DoublePublicKey.deserialize(serialized);
-    
+
     // Get keys from DoublePublicKey
     // Need to check navio-blsct API for getting individual keys
     // For now, try common method names
-    const keys = (doublePublicKey as any).getKeys ? (doublePublicKey as any).getKeys() : doublePublicKey;
-    
+    const keys = (doublePublicKey as any).getKeys
+      ? (doublePublicKey as any).getKeys()
+      : doublePublicKey;
+
     // Extract spending and blinding keys
     // DoublePublicKey typically contains two public keys
     const spendingKey = (keys as any).spendingKey || (keys as any).key1 || keys;
     const blindingKey = (keys as any).blindingKey || (keys as any).key2 || keys;
-    
+
     // Calculate hash ID
     return this.getHashId(blindingKey as PublicKeyType, spendingKey as PublicKeyType);
   }

@@ -4,4 +4,3 @@
 
 // NavioClientConfig is now defined in client.ts
 // This file can be used for other shared types
-

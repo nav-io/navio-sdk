@@ -1,6 +1,6 @@
 /**
  * Transaction Keys Sync Module
- * 
+ *
  * Synchronizes transaction keys from Electrum server to wallet database
  * - Tracks sync progress and resumes from last state
  * - Handles block reorganizations
@@ -183,8 +183,8 @@ export class TransactionKeysSync {
         if (stopOnReorg) {
           throw new Error(
             `Chain reorganization detected at height ${reorgInfo.height}. ` +
-            `Old hash: ${reorgInfo.oldHash}, New hash: ${reorgInfo.newHash}. ` +
-            `Need to revert ${reorgInfo.blocksToRevert} blocks.`
+              `Old hash: ${reorgInfo.oldHash}, New hash: ${reorgInfo.newHash}. ` +
+              `Need to revert ${reorgInfo.blocksToRevert} blocks.`
           );
         } else {
           // Handle reorganization
@@ -208,18 +208,18 @@ export class TransactionKeysSync {
       const blockHeights = rangeResult.blocks
         .filter(block => block.height <= syncEndHeight)
         .map(block => block.height);
-      
+
       let blockHeadersMap: Map<number, string> = new Map();
       if (blockHeights.length > 0 && verifyHashes) {
         // Fetch headers in batch using getBlockHeaders
         const firstHeight = blockHeights[0];
         const count = blockHeights.length;
         const headersResult = await this.electrumClient.getBlockHeaders(firstHeight, count);
-        
+
         // Parse concatenated hex string - each header is 80 bytes (160 hex chars)
         const headerSize = 160; // 80 bytes * 2 hex chars per byte
         const hex = headersResult.hex;
-        
+
         // Map headers by height
         for (let i = 0; i < count && i * headerSize < hex.length; i++) {
           const height = firstHeight + i;
@@ -252,12 +252,12 @@ export class TransactionKeysSync {
           const blockHeader = await this.electrumClient.getBlockHeader(block.height);
           blockHash = this.extractBlockHash(blockHeader);
         }
-        
+
         // Verify block hash if requested
         if (verifyHashes) {
           // Store block hash for future verification (pass chainTip to avoid repeated fetches)
           await this.storeBlockHash(block.height, blockHash, chainTip);
-          
+
           // Check for reorganization
           if (this.syncState && block.height <= this.syncState.lastSyncedHeight) {
             const storedHash = await this.getStoredBlockHash(block.height);
@@ -273,7 +273,7 @@ export class TransactionKeysSync {
               if (stopOnReorg) {
                 throw new Error(
                   `Chain reorganization detected at height ${block.height}. ` +
-                  `Old hash: ${storedHash}, New hash: ${blockHash}.`
+                    `Old hash: ${storedHash}, New hash: ${blockHash}.`
                 );
               } else {
                 await this.handleReorganization(reorgInfo);
@@ -287,12 +287,12 @@ export class TransactionKeysSync {
 
         // Store transaction keys for this block
         const txKeysCount = await this.storeBlockTransactionKeys(block, blockHash, keepTxKeys);
-        
+
         // Check for spent outputs in this block's transactions
         if (this.keyManager) {
           await this.processBlockForSpentOutputs(block, blockHash);
         }
-        
+
         totalTxKeysSynced += txKeysCount;
         blocksProcessed++;
 
@@ -306,7 +306,7 @@ export class TransactionKeysSync {
       if (rangeResult.blocks.length > 0) {
         const lastBlock = rangeResult.blocks[rangeResult.blocks.length - 1];
         let lastBlockHash: string;
-        
+
         if (blockHeadersMap.has(lastBlock.height)) {
           const lastBlockHeader = blockHeadersMap.get(lastBlock.height)!;
           lastBlockHash = this.extractBlockHash(lastBlockHeader);
@@ -315,7 +315,7 @@ export class TransactionKeysSync {
           const lastBlockHeader = await this.electrumClient.getBlockHeader(lastBlock.height);
           lastBlockHash = this.extractBlockHash(lastBlockHeader);
         }
-        
+
         await this.updateSyncState({
           lastSyncedHeight: lastBlock.height,
           lastSyncedHash: lastBlockHash,
@@ -323,9 +323,9 @@ export class TransactionKeysSync {
           lastSyncTime: Date.now(),
           chainTipAtLastSync: chainTip,
         });
-        
+
         // Save database periodically if saveInterval is set
-        if (saveInterval > 0 && (lastBlock.height - lastSaveHeight) >= saveInterval) {
+        if (saveInterval > 0 && lastBlock.height - lastSaveHeight >= saveInterval) {
           await this.walletDB.saveDatabase();
           lastSaveHeight = lastBlock.height;
         }
@@ -333,10 +333,12 @@ export class TransactionKeysSync {
 
       // Move to next batch (server tells us where to continue)
       currentHeight = rangeResult.nextHeight;
-      
+
       // Safety check to prevent infinite loops
       if (currentHeight <= rangeResult.blocks[rangeResult.blocks.length - 1]?.height) {
-        throw new Error(`Server did not advance next_height properly. Current: ${currentHeight}, Last block: ${rangeResult.blocks[rangeResult.blocks.length - 1]?.height}`);
+        throw new Error(
+          `Server did not advance next_height properly. Current: ${currentHeight}, Last block: ${rangeResult.blocks[rangeResult.blocks.length - 1]?.height}`
+        );
       }
     }
 
@@ -393,7 +395,9 @@ export class TransactionKeysSync {
    * @param reorgInfo - Reorganization information
    */
   private async handleReorganization(reorgInfo: ReorganizationInfo): Promise<void> {
-    console.log(`Handling reorganization: reverting ${reorgInfo.blocksToRevert} blocks from height ${reorgInfo.height}`);
+    console.log(
+      `Handling reorganization: reverting ${reorgInfo.blocksToRevert} blocks from height ${reorgInfo.height}`
+    );
 
     // Revert blocks in database
     const revertHeight = reorgInfo.height + reorgInfo.blocksToRevert - 1;
@@ -402,7 +406,7 @@ export class TransactionKeysSync {
     // Update sync state
     await this.updateSyncState({
       lastSyncedHeight: reorgInfo.height - 1,
-      lastSyncedHash: await this.getStoredBlockHash(reorgInfo.height - 1) || '',
+      lastSyncedHash: (await this.getStoredBlockHash(reorgInfo.height - 1)) || '',
       totalTxKeysSynced: this.syncState?.totalTxKeysSynced ?? 0,
       lastSyncTime: Date.now(),
       chainTipAtLastSync: await this.electrumClient.getChainTipHeight(),
@@ -414,7 +418,10 @@ export class TransactionKeysSync {
    * @param block - Block transaction keys
    * @param _blockHash - Block hash (for reference)
    */
-  private async processBlockForSpentOutputs(block: BlockTransactionKeys, _blockHash: string): Promise<void> {
+  private async processBlockForSpentOutputs(
+    block: BlockTransactionKeys,
+    _blockHash: string
+  ): Promise<void> {
     for (const txKeys of block.txKeys) {
       const txHash = txKeys.txHash || '';
       if (!txHash) {
@@ -429,13 +436,15 @@ export class TransactionKeysSync {
       if (Array.isArray(inputs)) {
         for (const input of inputs) {
           const outputHash = input?.outputHash || input?.output_hash || input?.prevout?.hash;
-          
+
           if (outputHash) {
             // Check if we own this output
             const db = this.walletDB.getDatabase();
-            const stmt = db.prepare('SELECT output_hash FROM wallet_outputs WHERE output_hash = ? AND is_spent = 0');
+            const stmt = db.prepare(
+              'SELECT output_hash FROM wallet_outputs WHERE output_hash = ? AND is_spent = 0'
+            );
             stmt.bind([outputHash]);
-            
+
             if (stmt.step()) {
               // We own this output, mark it as spent
               const updateStmt = db.prepare(
@@ -446,7 +455,7 @@ export class TransactionKeysSync {
               updateStmt.run([txHash, block.height, outputHash]);
               updateStmt.free();
             }
-            
+
             stmt.free();
           }
         }
@@ -468,13 +477,13 @@ export class TransactionKeysSync {
       const stmt = db.prepare('DELETE FROM tx_keys WHERE block_height = ?');
       stmt.run([height]);
       stmt.free();
-      
+
       // Revert wallet outputs: delete outputs created in this block and unspend outputs spent in this block
       // Delete outputs created in this block
       const deleteOutputsStmt = db.prepare('DELETE FROM wallet_outputs WHERE block_height = ?');
       deleteOutputsStmt.run([height]);
       deleteOutputsStmt.free();
-      
+
       // Unspend outputs that were spent in this block
       const unspendStmt = db.prepare(
         `UPDATE wallet_outputs 
@@ -498,7 +507,11 @@ export class TransactionKeysSync {
    * @param keepTxKeys - Whether to keep transaction keys in database after processing
    * @returns Number of transaction keys stored
    */
-  private async storeBlockTransactionKeys(block: BlockTransactionKeys, blockHash: string, keepTxKeys: boolean = false): Promise<number> {
+  private async storeBlockTransactionKeys(
+    block: BlockTransactionKeys,
+    blockHash: string,
+    keepTxKeys: boolean = false
+  ): Promise<number> {
     const db = this.walletDB.getDatabase();
 
     let count = 0;
@@ -511,7 +524,7 @@ export class TransactionKeysSync {
         // Try to extract hash from keys object
         txHash = (txKeys.keys as any).txHash || (txKeys.keys as any).hash || '';
       }
-      
+
       // If still no hash, generate a placeholder (shouldn't happen in production)
       if (!txHash) {
         txHash = `block_${block.height}_tx_${count}`;
@@ -528,11 +541,7 @@ export class TransactionKeysSync {
         const stmt = db.prepare(
           'INSERT OR REPLACE INTO tx_keys (tx_hash, block_height, keys_data) VALUES (?, ?, ?)'
         );
-        stmt.run([
-          txHash,
-          block.height,
-          JSON.stringify(txKeys.keys),
-        ]);
+        stmt.run([txHash, block.height, JSON.stringify(txKeys.keys)]);
         stmt.free();
       }
 
@@ -562,14 +571,14 @@ export class TransactionKeysSync {
     // Transaction keys structure: { outputs: [{ blindingKey, spendingKey, viewTag, outputHash, ... }, ...] }
     // The exact structure depends on electrumx implementation
     const outputs = keys[1]?.outputs || keys[1]?.vout || [];
-    
+
     if (!Array.isArray(outputs)) {
       return;
     }
 
     for (let outputIndex = 0; outputIndex < outputs.length; outputIndex++) {
       const outputKeys = outputs[outputIndex];
-      
+
       // Extract keys from output
       const blindingKey = outputKeys?.blindingKey || outputKeys?.blinding_key;
       const spendingKey = outputKeys?.spendingKey || outputKeys?.spending_key;
@@ -577,13 +586,15 @@ export class TransactionKeysSync {
       const outputHash = outputKeys?.outputHash || outputKeys?.output_hash;
 
       if (!blindingKey || !spendingKey || viewTag === undefined || !outputHash) {
-        console.warn(`Invalid output keys: blindingKey: ${blindingKey}, spendingKey: ${spendingKey}, viewTag: ${viewTag}, outputHash: ${outputHash}, blockHeight: ${blockHeight}`);
+        console.warn(
+          `Invalid output keys: blindingKey: ${blindingKey}, spendingKey: ${spendingKey}, viewTag: ${viewTag}, outputHash: ${outputHash}, blockHeight: ${blockHeight}`
+        );
         continue;
       }
 
       // Convert keys to PublicKey format if needed (they might be hex strings or serialized)
       const { PublicKey } = require('navio-blsct');
-      let blindingKeyObj: any = PublicKey.deserialize(blindingKey); 
+      let blindingKeyObj: any = PublicKey.deserialize(blindingKey);
       let spendingKeyObj: any = PublicKey.deserialize(spendingKey);
 
       // Check if output belongs to wallet
@@ -592,7 +603,7 @@ export class TransactionKeysSync {
         // Fetch output from Electrum server
         try {
           const outputHex = await this.electrumClient.getTransactionOutput(outputHash);
-          
+
           // Store output as spendable
           await this.storeWalletOutput(
             outputHash,
@@ -677,13 +688,13 @@ export class TransactionKeysSync {
 
     const stmt = db.prepare('SELECT hash FROM block_hashes WHERE height = ?');
     stmt.bind([height]);
-    
+
     if (stmt.step()) {
       const row = stmt.getAsObject();
       stmt.free();
       return row.hash as string;
     }
-    
+
     stmt.free();
     return null;
   }
@@ -701,9 +712,9 @@ export class TransactionKeysSync {
     // If retention is enabled (non-zero), only store recent block hashes
     if (this.blockHashRetention > 0) {
       // Get chain tip if not provided
-      const currentChainTip = chainTip ?? await this.electrumClient.getChainTipHeight();
+      const currentChainTip = chainTip ?? (await this.electrumClient.getChainTipHeight());
       const retentionStart = Math.max(0, currentChainTip - this.blockHashRetention + 1);
-      
+
       // Only store if within retention window
       if (height < retentionStart) {
         return; // Skip storing old block hashes
@@ -796,15 +807,15 @@ export class TransactionKeysSync {
     try {
       const db = this.walletDB.getDatabase();
 
-    const stmt = db.prepare('SELECT keys_data FROM tx_keys WHERE tx_hash = ?');
-    stmt.bind([txHash]);
-    
-    if (stmt.step()) {
-      const row = stmt.getAsObject();
-      stmt.free();
-      return JSON.parse(row.keys_data as string);
-    }
-    
+      const stmt = db.prepare('SELECT keys_data FROM tx_keys WHERE tx_hash = ?');
+      stmt.bind([txHash]);
+
+      if (stmt.step()) {
+        const row = stmt.getAsObject();
+        stmt.free();
+        return JSON.parse(row.keys_data as string);
+      }
+
       stmt.free();
       return null;
     } catch {
@@ -821,13 +832,15 @@ export class TransactionKeysSync {
     try {
       const db = this.walletDB.getDatabase();
 
-    const result = db.exec('SELECT tx_hash, keys_data FROM tx_keys WHERE block_height = ?', [height]);
-    if (result.length > 0) {
-      return result[0].values.map((row: any[]) => ({
-        txHash: row[0] as string,
-        keys: JSON.parse(row[1] as string),
-      }));
-    }
+      const result = db.exec('SELECT tx_hash, keys_data FROM tx_keys WHERE block_height = ?', [
+        height,
+      ]);
+      if (result.length > 0) {
+        return result[0].values.map((row: any[]) => ({
+          txHash: row[0] as string,
+          keys: JSON.parse(row[1] as string),
+        }));
+      }
 
       return [];
     } catch {
@@ -849,4 +862,3 @@ export class TransactionKeysSync {
     this.syncState = null;
   }
 }
-

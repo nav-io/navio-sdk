@@ -1,9 +1,9 @@
 /**
  * Electrum Client - Connect and interact with Electrum servers
- * 
+ *
  * Supports WebSocket and TCP connections
  * Implements Electrum protocol for fetching transaction keys and blockchain data
- * 
+ *
  * Based on electrumx server implementation and Navio-specific extensions
  */
 
@@ -302,7 +302,10 @@ export class ElectrumClient {
    * @param count - Number of headers to fetch
    * @returns Block headers
    */
-  async getBlockHeaders(startHeight: number, count: number): Promise<{ count: number; hex: string; max: number }> {
+  async getBlockHeaders(
+    startHeight: number,
+    count: number
+  ): Promise<{ count: number; hex: string; max: number }> {
     return this.call('blockchain.block.headers', startHeight, count);
   }
 
@@ -356,20 +359,20 @@ export class ElectrumClient {
    */
   async getBlockTransactionKeysRange(startHeight: number): Promise<BlockTransactionKeysRange> {
     const result = await this.call('blockchain.block.get_range_txs_keys', startHeight);
-    
+
     // Transform result to our format
     // result.blocks is an array where each element is an array of transaction keys for that block
     const blocks: BlockTransactionKeys[] = [];
-    
+
     if (result.blocks && Array.isArray(result.blocks)) {
       for (let i = 0; i < result.blocks.length; i++) {
         const blockData = result.blocks[i];
         const blockHeight = startHeight + i;
-        
+
         // blockData is an array of transaction keys for this block
         // Each element may be just the keys object, or an object with txHash and keys
         const txKeys: TransactionKeys[] = [];
-        
+
         if (Array.isArray(blockData)) {
           for (const txKeyData of blockData) {
             if (typeof txKeyData === 'object' && txKeyData !== null) {
@@ -390,7 +393,7 @@ export class ElectrumClient {
             }
           }
         }
-        
+
         blocks.push({
           height: blockHeight,
           txKeys,
@@ -419,10 +422,10 @@ export class ElectrumClient {
 
     while (currentHeight <= tipHeight) {
       const rangeResult = await this.getBlockTransactionKeysRange(currentHeight);
-      
+
       allBlocks.push(...rangeResult.blocks);
       totalBlocksProcessed += rangeResult.blocks.length;
-      
+
       if (progressCallback) {
         progressCallback(currentHeight, tipHeight, totalBlocksProcessed);
       }
@@ -458,7 +461,11 @@ export class ElectrumClient {
    * @param blockHash - Optional block hash for context
    * @returns Raw transaction or verbose transaction data
    */
-  async getRawTransaction(txHash: string, verbose = false, blockHash?: string): Promise<string | any> {
+  async getRawTransaction(
+    txHash: string,
+    verbose = false,
+    blockHash?: string
+  ): Promise<string | any> {
     return this.call('blockchain.transaction.get', txHash, verbose, blockHash);
   }
 
@@ -531,4 +538,3 @@ export class ElectrumClient {
     return Buffer.from(bytes.reverse()).toString('hex');
   }
 }
-

@@ -9,4 +9,3 @@ export * from './key-manager.types';
 export * from './wallet-db';
 export * from './electrum';
 export * from './tx-keys-sync';
-

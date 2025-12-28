@@ -1,7 +1,7 @@
 #!/usr/bin/env tsx
 /**
  * Database Analysis Script
- * 
+ *
  * Analyzes the wallet database to see what's taking up space
  * Helps optimize database size by identifying large tables/data
  */
@@ -25,9 +25,10 @@ async function getTableStats(db: any, tableName: string): Promise<TableStats> {
   try {
     // Get row count
     const countResult = db.exec(`SELECT COUNT(*) as count FROM ${tableName}`);
-    const rowCount = countResult.length > 0 && countResult[0].values.length > 0
-      ? countResult[0].values[0][0] as number
-      : 0;
+    const rowCount =
+      countResult.length > 0 && countResult[0].values.length > 0
+        ? (countResult[0].values[0][0] as number)
+        : 0;
 
     if (rowCount === 0) {
       return {
@@ -42,11 +43,11 @@ async function getTableStats(db: any, tableName: string): Promise<TableStats> {
     // For TEXT columns, we'll estimate based on actual data
     let totalSize = 0;
     const sampleSize = Math.min(100, rowCount);
-    
+
     // Get column info
     const schemaResult = db.exec(`PRAGMA table_info(${tableName})`);
     const columns = schemaResult.length > 0 ? schemaResult[0].values : [];
-    
+
     // Sample rows to estimate size
     const sampleResult = db.exec(`SELECT * FROM ${tableName} LIMIT ${sampleSize}`);
     if (sampleResult.length > 0 && sampleResult[0].values.length > 0) {
@@ -68,11 +69,11 @@ async function getTableStats(db: any, tableName: string): Promise<TableStats> {
         }
         totalSize += rowSize;
       }
-      
+
       // Extrapolate to full table size
       const avgRowSize = totalSize / rows.length;
       const estimatedTotalSize = avgRowSize * rowCount;
-      
+
       return {
         name: tableName,
         rowCount,
@@ -121,9 +122,10 @@ function getTableDetails(db: any, tableName: string): void {
 
     // Get row count
     const countResult = db.exec(`SELECT COUNT(*) FROM ${tableName}`);
-    const rowCount = countResult.length > 0 && countResult[0].values.length > 0
-      ? countResult[0].values[0][0] as number
-      : 0;
+    const rowCount =
+      countResult.length > 0 && countResult[0].values.length > 0
+        ? (countResult[0].values[0][0] as number)
+        : 0;
     console.log(`Total Rows: ${rowCount.toLocaleString()}\n`);
 
     // Show sample data for large TEXT columns
@@ -142,12 +144,12 @@ function getTableDetails(db: any, tableName: string): void {
             for (let j = 0; j < Math.min(columns.length, row.length); j++) {
               const colName = columns[j][1] as string;
               let value = row[j];
-              
+
               // Truncate long values
               if (typeof value === 'string' && value.length > 100) {
                 value = value.substring(0, 100) + '...';
               }
-              
+
               // Show size for TEXT columns
               if (typeof value === 'string') {
                 const size = Buffer.from(value, 'utf8').length;
@@ -240,7 +242,9 @@ async function main() {
   console.log('  Database Size Analysis');
   console.log('═══════════════════════════════════════════════════════════\n');
   console.log(`Database file: ${dbPath}`);
-  console.log(`File size: ${formatBytes(fileStats.size)} (${fileStats.size.toLocaleString()} bytes)\n`);
+  console.log(
+    `File size: ${formatBytes(fileStats.size)} (${fileStats.size.toLocaleString()} bytes)\n`
+  );
 
   try {
     const walletDB = new WalletDB(dbPath);
@@ -277,7 +281,9 @@ async function main() {
 
     // Print summary table
     console.log('Summary (sorted by estimated size):\n');
-    console.log('Table Name'.padEnd(25) + 'Rows'.padEnd(15) + 'Est. Size'.padEnd(15) + 'Avg Row Size');
+    console.log(
+      'Table Name'.padEnd(25) + 'Rows'.padEnd(15) + 'Est. Size'.padEnd(15) + 'Avg Row Size'
+    );
     console.log('-'.repeat(70));
 
     let totalEstimatedSize = 0;
@@ -286,18 +292,15 @@ async function main() {
       const rowCountStr = stats.rowCount.toLocaleString().padEnd(15);
       const sizeStr = formatBytes(stats.sizeBytes).padEnd(15);
       const avgSizeStr = formatBytes(stats.avgRowSize);
-      console.log(
-        stats.name.padEnd(25) + 
-        rowCountStr + 
-        sizeStr + 
-        avgSizeStr
-      );
+      console.log(stats.name.padEnd(25) + rowCountStr + sizeStr + avgSizeStr);
     }
 
     console.log('-'.repeat(70));
     console.log(`Total estimated: ${formatBytes(totalEstimatedSize)}`);
     console.log(`File size: ${formatBytes(fileStats.size)}`);
-    console.log(`Difference: ${formatBytes(fileStats.size - totalEstimatedSize)} (overhead/indexes)\n`);
+    console.log(
+      `Difference: ${formatBytes(fileStats.size - totalEstimatedSize)} (overhead/indexes)\n`
+    );
 
     // Show detailed info for largest tables
     console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
@@ -340,10 +343,11 @@ async function main() {
         FROM wallet_outputs 
         WHERE is_spent = 1
       `);
-      const spentCount = spentResult.length > 0 && spentResult[0].values.length > 0
-        ? spentResult[0].values[0][0] as number
-        : 0;
-      
+      const spentCount =
+        spentResult.length > 0 && spentResult[0].values.length > 0
+          ? (spentResult[0].values[0][0] as number)
+          : 0;
+
       if (spentCount > 0) {
         console.log('🗑️  Spent outputs:');
         console.log(`   - ${spentCount.toLocaleString()} spent outputs found`);
@@ -358,8 +362,7 @@ async function main() {
   }
 }
 
-main().catch((error) => {
+main().catch(error => {
   console.error('Fatal error:', error);
   process.exit(1);
 });
-

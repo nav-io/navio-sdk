@@ -1,7 +1,7 @@
 /**
  * Test script for Transaction Keys Sync
  * Demonstrates syncing transaction keys from Electrum server
- * 
+ *
  * Usage: npm run test:tx-keys-sync
  */
 
@@ -80,7 +80,7 @@ Example:
     console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n');
 
     const walletDB = new WalletDB(dbPath);
-    
+
     // Create or load wallet
     let keyManager;
     if (!fs.existsSync(dbPath)) {
@@ -90,7 +90,7 @@ Example:
       keyManager = await walletDB.loadWallet();
       console.log('✓ Loaded existing wallet');
     }
-      
+
     const subAddressId: SubAddressIdentifier = { account: 0, address: 0 };
     const subAddress = keyManager?.getSubAddress(subAddressId);
     let dpk = DoublePublicKey.deserialize(subAddress.serialize());
@@ -108,12 +108,12 @@ Example:
     console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n');
 
     const syncManager = new TransactionKeysSync(walletDB, electrumClient);
-    
+
     // Set KeyManager for output detection
     if (keyManager) {
       syncManager.setKeyManager(keyManager);
     }
-    
+
     await syncManager.initialize();
 
     const syncState = syncManager.getSyncState();
@@ -158,12 +158,12 @@ Example:
         onProgress: (currentHeight, chainTip, blocksProcessed, txKeysProcessed, isReorg) => {
           const now = Date.now();
           const elapsed = (now - lastProgressTime) / 1000;
-          
+
           if (elapsed >= 1 || currentHeight % 10 === 0) {
             const progress = ((currentHeight / chainTip) * 100).toFixed(1);
             console.log(
               `Progress: ${currentHeight}/${chainTip} (${progress}%) | ` +
-              `Blocks: ${blocksProcessed} | TX Keys: ${txKeysProcessed}${isReorg ? ' [REORG]' : ''}`
+                `Blocks: ${blocksProcessed} | TX Keys: ${txKeysProcessed}${isReorg ? ' [REORG]' : ''}`
             );
             lastProgressTime = now;
           }
@@ -216,8 +216,7 @@ Example:
 }
 
 // Run the test
-main().catch((error) => {
+main().catch(error => {
   console.error('Fatal error running tests:', error);
   process.exit(1);
 });
-

@@ -2,7 +2,7 @@
  * WalletDB - Database persistence layer for KeyManager
  * Uses SQL.js (SQLite compiled to WebAssembly) for cross-platform compatibility
  * Works on web browsers, Node.js, and mobile platforms
- * 
+ *
  * Database schema replicates navio-core wallet database structure
  */
 
@@ -18,7 +18,7 @@ let SQL: any;
 // Lazy load SQL.js to support both browser and Node.js
 async function loadSQL(): Promise<any> {
   if (SQL) return SQL;
-  
+
   try {
     // Try to load SQL.js
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -27,7 +27,7 @@ async function loadSQL(): Promise<any> {
       const sqlJs = await import('sql.js');
       initSqlJs = sqlJs.default;
       SQL = await initSqlJs({
-        locateFile: (file: string) => `https://sql.js.org/dist/${file}`
+        locateFile: (file: string) => `https://sql.js.org/dist/${file}`,
       });
     } else {
       // Node.js environment
@@ -43,7 +43,7 @@ async function loadSQL(): Promise<any> {
             return wasmPath;
           }
           return file;
-        }
+        },
       });
     }
     return SQL;
@@ -233,7 +233,7 @@ export class WalletDB {
         keys_data TEXT NOT NULL
       )
     `);
-    
+
     // Create index for block_height
     this.db.run(`
       CREATE INDEX IF NOT EXISTS idx_tx_keys_block_height ON tx_keys(block_height)
@@ -273,7 +273,7 @@ export class WalletDB {
         created_at INTEGER NOT NULL
       )
     `);
-    
+
     // Create indexes for wallet_outputs
     this.db.run(`
       CREATE INDEX IF NOT EXISTS idx_wallet_outputs_tx_hash ON wallet_outputs(tx_hash)
@@ -334,16 +334,15 @@ export class WalletDB {
         const secretKey = this.deserializeScalar(row[1] as string);
         const publicKey = this.deserializePublicKey(row[2] as string);
         keyManager.loadKey(secretKey, publicKey);
-        
+
         // Load metadata
         const stmt = this.db.prepare('SELECT create_time FROM key_metadata WHERE key_id = ?');
         stmt.bind([row[0]]);
         if (stmt.step()) {
           const metadataRow = stmt.getAsObject();
-          keyManager.loadKeyMetadata(
-            this.hexToBytes(row[0] as string),
-            { nCreateTime: metadataRow.create_time as number }
-          );
+          keyManager.loadKeyMetadata(this.hexToBytes(row[0] as string), {
+            nCreateTime: metadataRow.create_time as number,
+          });
         }
         stmt.free();
       }
@@ -414,7 +413,7 @@ export class WalletDB {
     await this.initDatabase();
 
     const keyManager = new KeyManager();
-    
+
     // Generate new seed
     const seed = keyManager.generateNewSeed();
     keyManager.setHDSeed(seed);
@@ -440,7 +439,7 @@ export class WalletDB {
     await this.initDatabase();
 
     const keyManager = new KeyManager();
-    
+
     // Deserialize seed
     const seed = this.deserializeScalar(seedHex);
     keyManager.setHDSeed(seed);
@@ -512,13 +511,8 @@ export class WalletDB {
       try {
         const viewKey = km.getPrivateViewKey();
         const viewPublicKey = this.getPublicKeyFromViewKey(viewKey);
-        const stmt = this.db.prepare(
-          'INSERT INTO view_key (public_key, secret_key) VALUES (?, ?)'
-        );
-        stmt.run([
-          this.serializePublicKey(viewPublicKey),
-          this.serializeViewKey(viewKey)
-        ]);
+        const stmt = this.db.prepare('INSERT INTO view_key (public_key, secret_key) VALUES (?, ?)');
+        stmt.run([this.serializePublicKey(viewPublicKey), this.serializeViewKey(viewKey)]);
         stmt.free();
       } catch {
         // View key not available
@@ -527,9 +521,7 @@ export class WalletDB {
       // Save spend key
       try {
         const spendPublicKey = km.getPublicSpendingKey();
-        const stmt = this.db.prepare(
-          'INSERT INTO spend_key (public_key) VALUES (?)'
-        );
+        const stmt = this.db.prepare('INSERT INTO spend_key (public_key) VALUES (?)');
         stmt.run([this.serializePublicKey(spendPublicKey)]);
         stmt.free();
       } catch {
@@ -571,7 +563,9 @@ export class WalletDB {
    */
   getDatabase(): any {
     if (!this.isOpen) {
-      throw new Error('Database not initialized. Call loadWallet(), createWallet(), or restoreWallet() first.');
+      throw new Error(
+        'Database not initialized. Call loadWallet(), createWallet(), or restoreWallet() first.'
+      );
     }
     return this.db;
   }
@@ -650,7 +644,7 @@ export class WalletDB {
 
   private bytesToHex(bytes: Uint8Array): string {
     return Array.from(bytes)
-      .map((b) => b.toString(16).padStart(2, '0'))
+      .map(b => b.toString(16).padStart(2, '0'))
       .join('');
   }
 
@@ -662,4 +656,3 @@ export class WalletDB {
     return bytes;
   }
 }
-
