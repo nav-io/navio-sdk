@@ -17,6 +17,7 @@
     "test:walletdb": "tsx scripts/test-walletdb.ts",
     "test:electrum": "tsx scripts/test-electrum.ts",
     "test:client": "tsx scripts/test-client.ts",
+    "test:stress": "tsx scripts/stress-test-sync.ts",
     "analyze:db": "tsx scripts/analyze-db.ts",
         "test:tx-keys-sync": "tsx scripts/test-tx-keys-sync.ts",
         "lint": "eslint src --ext .ts",
