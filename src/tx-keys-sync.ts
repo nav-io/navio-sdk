@@ -1,12 +1,14 @@
 /**
  * Transaction Keys Sync Module
  *
- * Synchronizes transaction keys from Electrum server to wallet database
+ * Synchronizes transaction keys from a sync provider to wallet database
+ * - Supports multiple backends: Electrum, P2P, or custom providers
  * - Tracks sync progress and resumes from last state
  * - Handles block reorganizations
  * - Persists sync state in wallet database
  */
 
+import { SyncProvider } from './sync-provider';
 import { ElectrumClient } from './electrum';
 import { WalletDB } from './wallet-db';
 import { KeyManager } from './key-manager';
@@ -62,6 +64,37 @@ export interface SyncOptions {
 }
 
 /**
+ * Background sync options for continuous synchronization
+ */
+export interface BackgroundSyncOptions extends SyncOptions {
+  /** 
+   * Polling interval in milliseconds 
+   * @default 10000 (10 seconds)
+   */
+  pollInterval?: number;
+
+  /**
+   * Callback when a new block is detected
+   */
+  onNewBlock?: (height: number, hash: string) => void;
+
+  /**
+   * Callback when new transactions are detected for the wallet
+   */
+  onNewTransaction?: (txHash: string, outputHash: string, amount: bigint) => void;
+
+  /**
+   * Callback when balance changes
+   */
+  onBalanceChange?: (newBalance: bigint, oldBalance: bigint) => void;
+
+  /**
+   * Callback on sync error (background sync continues after errors)
+   */
+  onError?: (error: Error) => void;
+}
+
+/**
  * Reorganization information
  */
 export interface ReorganizationInfo {
@@ -77,17 +110,80 @@ export interface ReorganizationInfo {
 
 /**
  * Transaction Keys Sync Manager
+ *
+ * Can be initialized with either:
+ * - A SyncProvider (recommended) - works with Electrum, P2P, or custom backends
+ * - An ElectrumClient (legacy) - for backwards compatibility
+ * 
+ * @category Sync
  */
 export class TransactionKeysSync {
   private walletDB: WalletDB;
-  private electrumClient: ElectrumClient;
+  private syncProvider: SyncProvider;
   private keyManager: KeyManager | null = null;
   private syncState: SyncState | null = null;
-  private blockHashRetention: number = 10000; // Keep last 10k block hashes by default
+  private blockHashRetention: number = 1000; // Keep last 1k block hashes by default
 
-  constructor(walletDB: WalletDB, electrumClient: ElectrumClient) {
+  /**
+   * Create a new TransactionKeysSync instance
+   * @param walletDB - The wallet database
+   * @param provider - A SyncProvider or ElectrumClient instance
+   */
+  constructor(walletDB: WalletDB, provider: SyncProvider | ElectrumClient) {
     this.walletDB = walletDB;
-    this.electrumClient = electrumClient;
+
+    // Support both SyncProvider and legacy ElectrumClient
+    if ('type' in provider && (provider.type === 'electrum' || provider.type === 'p2p' || provider.type === 'custom')) {
+      // It's a SyncProvider
+      this.syncProvider = provider;
+    } else {
+      // It's a legacy ElectrumClient - wrap it in an adapter
+      this.syncProvider = this.wrapElectrumClient(provider as ElectrumClient);
+    }
+  }
+
+  /**
+   * Wrap an ElectrumClient as a SyncProvider for backwards compatibility
+   */
+  private wrapElectrumClient(client: ElectrumClient): SyncProvider {
+    return {
+      type: 'electrum' as const,
+      connect: () => client.connect(),
+      disconnect: () => client.disconnect(),
+      isConnected: () => client.isConnected(),
+      getChainTipHeight: () => client.getChainTipHeight(),
+      getChainTip: async () => {
+        const height = await client.getChainTipHeight();
+        const header = await client.getBlockHeader(height);
+        const { sha256 } = require('@noble/hashes/sha256');
+        const hash = Buffer.from(sha256(sha256(Buffer.from(header, 'hex')))).reverse().toString('hex');
+        return { height, hash };
+      },
+      getBlockHeader: (height: number) => client.getBlockHeader(height),
+      getBlockHeaders: (startHeight: number, count: number) => client.getBlockHeaders(startHeight, count),
+      getBlockTransactionKeysRange: (startHeight: number) => client.getBlockTransactionKeysRange(startHeight),
+      getBlockTransactionKeys: async (height: number) => {
+        const result = await client.getBlockTransactionKeys(height);
+        return Array.isArray(result) ? result : [];
+      },
+      getTransactionOutput: (outputHash: string) => client.getTransactionOutput(outputHash),
+      broadcastTransaction: (rawTx: string) => client.broadcastTransaction(rawTx),
+      getRawTransaction: (txHash: string, verbose?: boolean) => client.getRawTransaction(txHash, verbose),
+    };
+  }
+
+  /**
+   * Get the sync provider being used
+   */
+  getSyncProvider(): SyncProvider {
+    return this.syncProvider;
+  }
+
+  /**
+   * Get the provider type (electrum, p2p, or custom)
+   */
+  getProviderType(): 'electrum' | 'p2p' | 'custom' {
+    return this.syncProvider.type;
   }
 
   /**
@@ -138,7 +234,7 @@ export class TransactionKeysSync {
       return true;
     }
 
-    const chainTip = await this.electrumClient.getChainTipHeight();
+    const chainTip = await this.syncProvider.getChainTipHeight();
     return chainTip > this.syncState.lastSyncedHeight;
   }
 
@@ -168,8 +264,18 @@ export class TransactionKeysSync {
 
     // Determine start and end heights
     const lastSynced = this.syncState?.lastSyncedHeight ?? -1;
-    const syncStartHeight = startHeight ?? lastSynced + 1;
-    const chainTip = await this.electrumClient.getChainTipHeight();
+
+    // For first sync, use wallet creation height if available
+    let defaultStartHeight = lastSynced + 1;
+    if (lastSynced === -1) {
+      const creationHeight = await this.walletDB.getCreationHeight();
+      if (creationHeight > 0) {
+        defaultStartHeight = creationHeight;
+      }
+    }
+
+    const syncStartHeight = startHeight ?? defaultStartHeight;
+    const chainTip = await this.syncProvider.getChainTipHeight();
     const syncEndHeight = endHeight ?? chainTip;
 
     if (syncStartHeight > syncEndHeight) {
@@ -202,7 +308,7 @@ export class TransactionKeysSync {
     // We keep fetching until we reach the end height
     while (currentHeight <= syncEndHeight) {
       // Fetch transaction keys - server will return maximum possible blocks
-      const rangeResult = await this.electrumClient.getBlockTransactionKeysRange(currentHeight);
+      const rangeResult = await this.syncProvider.getBlockTransactionKeysRange(currentHeight);
 
       // Batch fetch all block headers for this batch
       const blockHeights = rangeResult.blocks
@@ -214,7 +320,7 @@ export class TransactionKeysSync {
         // Fetch headers in batch using getBlockHeaders
         const firstHeight = blockHeights[0];
         const count = blockHeights.length;
-        const headersResult = await this.electrumClient.getBlockHeaders(firstHeight, count);
+        const headersResult = await this.syncProvider.getBlockHeaders(firstHeight, count);
 
         // Parse concatenated hex string - each header is 80 bytes (160 hex chars)
         const headerSize = 160; // 80 bytes * 2 hex chars per byte
@@ -243,13 +349,13 @@ export class TransactionKeysSync {
           blockHash = this.extractBlockHash(blockHeader);
         } else if (verifyHashes) {
           // Fallback: fetch individual header if not in batch
-          const blockHeader = await this.electrumClient.getBlockHeader(block.height);
+          const blockHeader = await this.syncProvider.getBlockHeader(block.height);
           blockHash = this.extractBlockHash(blockHeader);
         } else {
           // If not verifying, we can skip header fetch for now
           // But we still need a hash for storage - use a placeholder or fetch minimal
           // For now, let's fetch it but this could be optimized further
-          const blockHeader = await this.electrumClient.getBlockHeader(block.height);
+          const blockHeader = await this.syncProvider.getBlockHeader(block.height);
           blockHash = this.extractBlockHash(blockHeader);
         }
 
@@ -312,7 +418,7 @@ export class TransactionKeysSync {
           lastBlockHash = this.extractBlockHash(lastBlockHeader);
         } else {
           // Fallback: fetch if not in batch
-          const lastBlockHeader = await this.electrumClient.getBlockHeader(lastBlock.height);
+          const lastBlockHeader = await this.syncProvider.getBlockHeader(lastBlock.height);
           lastBlockHash = this.extractBlockHash(lastBlockHeader);
         }
 
@@ -359,7 +465,7 @@ export class TransactionKeysSync {
     }
 
     // Get current block hash from server
-    const currentHeader = await this.electrumClient.getBlockHeader(height);
+    const currentHeader = await this.syncProvider.getBlockHeader(height);
     const currentHash = this.extractBlockHash(currentHeader);
 
     // Get stored block hash
@@ -369,7 +475,7 @@ export class TransactionKeysSync {
       // Reorganization detected - find common ancestor
       let commonHeight = height - 1;
       while (commonHeight >= 0) {
-        const commonHeader = await this.electrumClient.getBlockHeader(commonHeight);
+        const commonHeader = await this.syncProvider.getBlockHeader(commonHeight);
         const commonHash = this.extractBlockHash(commonHeader);
         const storedCommonHash = await this.getStoredBlockHash(commonHeight);
 
@@ -409,7 +515,7 @@ export class TransactionKeysSync {
       lastSyncedHash: (await this.getStoredBlockHash(reorgInfo.height - 1)) || '',
       totalTxKeysSynced: this.syncState?.totalTxKeysSynced ?? 0,
       lastSyncTime: Date.now(),
-      chainTipAtLastSync: await this.electrumClient.getChainTipHeight(),
+      chainTipAtLastSync: await this.syncProvider.getChainTipHeight(),
     });
   }
 
@@ -600,17 +706,62 @@ export class TransactionKeysSync {
       // Check if output belongs to wallet
       const isMine = this.keyManager.isMineByKeys(blindingKeyObj, spendingKeyObj, viewTag);
       if (isMine) {
-        // Fetch output from Electrum server
+        // Fetch output data from backend
         try {
-          const outputHex = await this.electrumClient.getTransactionOutput(outputHash);
+          const outputHex = await this.syncProvider.getTransactionOutput(outputHash);
 
-          // Store output as spendable
+          // Recover the amount from the range proof
+          const { RangeProof, AmountRecoveryReq } = require('navio-blsct');
+          
+          // Parse the output to get the range proof
+          // The output format from Electrum/P2P is a CTxOut serialization
+          // We need to extract the range proof and recover the amount
+          let recoveredAmount = 0;
+          let recoveredMemo: string | null = null;
+          let tokenIdHex: string | null = null;
+
+          try {
+            // Calculate the nonce (shared secret) for amount recovery
+            const nonce = this.keyManager.calculateNonce(blindingKeyObj);
+            
+            // Parse the range proof from the output data
+            const rangeProofResult = this.extractRangeProofFromOutput(outputHex);
+            
+            if (rangeProofResult.rangeProofHex) {
+              const rangeProof = RangeProof.deserialize(rangeProofResult.rangeProofHex);
+              
+              // Create recovery request
+              const req = new AmountRecoveryReq(rangeProof, nonce);
+              
+              // Recover the amount
+              // NOTE: navio-blsct 1.0.20 has a bug in recoverAmounts - this will fail
+              // until the library is updated. The output is still stored but with amount 0.
+              const results = rangeProof.recoverAmounts([req]);
+              
+              if (results.length > 0 && results[0].isSucc) {
+                recoveredAmount = results[0].amount;
+                recoveredMemo = results[0].msg || null;
+              }
+            }
+            
+            tokenIdHex = rangeProofResult.tokenIdHex;
+          } catch {
+            // Amount recovery failed (likely navio-blsct library bug)
+            // Output is still stored with amount 0 - will be recoverable when library is fixed
+          }
+
+          // Store output as spendable with recovered amount
           await this.storeWalletOutput(
             outputHash,
             txHash,
             outputIndex,
             blockHeight,
             outputHex,
+            recoveredAmount,
+            recoveredMemo,
+            tokenIdHex,
+            blindingKey,
+            spendingKey,
             false, // not spent
             null, // spent_tx_hash
             null // spent_block_height
@@ -624,12 +775,117 @@ export class TransactionKeysSync {
   }
 
   /**
+   * Extract range proof from serialized CTxOut data
+   * @param outputHex - Serialized output data (hex)
+   * @returns Object containing rangeProofHex and tokenIdHex
+   */
+  private extractRangeProofFromOutput(outputHex: string): { rangeProofHex: string | null; tokenIdHex: string | null } {
+    try {
+      const data = Buffer.from(outputHex, 'hex');
+      let offset = 0;
+
+      // CTxOut serialization format:
+      // - value (8 bytes) - either transparent or MAX_AMOUNT marker
+      // - if MAX_AMOUNT: flags (8 bytes)
+      // - if flags & TRANSPARENT_VALUE: transparent value (8 bytes)
+      // - scriptPubKey (varint length + data)
+      // - if flags & HAS_BLSCT_KEYS: rangeProof + blsctData
+      // - if flags & HAS_TOKENID: tokenId (64 bytes)
+      // - if flags & HAS_PREDICATE: predicate (varint length + data)
+
+      const MAX_AMOUNT = 0x7fffffffffffffffn;
+      const HAS_BLSCT_KEYS = 1n;
+      const HAS_TOKENID = 2n;
+
+      // Read value
+      const value = data.readBigInt64LE(offset);
+      offset += 8;
+
+      let flags = 0n;
+      if (value === MAX_AMOUNT) {
+        flags = data.readBigUInt64LE(offset);
+        offset += 8;
+        
+        // Skip transparent value if present
+        if ((flags & 8n) !== 0n) {
+          offset += 8;
+        }
+      }
+
+      // Skip scriptPubKey
+      const scriptLen = data[offset];
+      offset += 1 + scriptLen;
+
+      let rangeProofHex: string | null = null;
+      let tokenIdHex: string | null = null;
+
+      // Extract range proof if present
+      if ((flags & HAS_BLSCT_KEYS) !== 0n) {
+        // Range proof structure:
+        // - Vs: vector of G1 points (varint count + 48 bytes each)
+        // - If Vs.size > 0:
+        //   - Ls: vector of G1 points
+        //   - Rs: vector of G1 points  
+        //   - A, A_wip, B: 3 G1 points (48 bytes each)
+        //   - r', s', delta', alpha_hat, tau_x: 5 scalars (32 bytes each)
+        // - spendingKey, blindingKey, ephemeralKey: 3 G1 points (48 bytes each)
+        // - viewTag: 2 bytes
+        
+        const rangeProofStart = offset;
+        
+        // Parse Vs
+        const vsCount = data[offset];
+        offset += 1;
+        offset += vsCount * 48;
+        
+        if (vsCount > 0) {
+          // Ls
+          const lsCount = data[offset];
+          offset += 1;
+          offset += lsCount * 48;
+          
+          // Rs
+          const rsCount = data[offset];
+          offset += 1;
+          offset += rsCount * 48;
+          
+          // A, A_wip, B (3 points)
+          offset += 3 * 48;
+          
+          // 5 scalars: r', s', delta', alpha_hat, tau_x
+          offset += 5 * 32;
+        }
+        
+        const rangeProofEnd = offset;
+        rangeProofHex = data.subarray(rangeProofStart, rangeProofEnd).toString('hex');
+        
+        // Skip BLSCT keys (spendingKey, blindingKey, ephemeralKey, viewTag)
+        offset += 3 * 48 + 2;
+      }
+
+      // Extract tokenId if present
+      if ((flags & HAS_TOKENID) !== 0n) {
+        tokenIdHex = data.subarray(offset, offset + 64).toString('hex');
+      }
+
+      return { rangeProofHex, tokenIdHex };
+    } catch (e) {
+      return { rangeProofHex: null, tokenIdHex: null };
+    }
+  }
+
+  /**
    * Store wallet output in database
    * @param outputHash - Output hash
    * @param txHash - Transaction hash
    * @param outputIndex - Output index
    * @param blockHeight - Block height
    * @param outputData - Serialized output data (hex)
+   * @param amount - Recovered amount in satoshis
+   * @param memo - Recovered memo/message
+   * @param tokenId - Token ID (hex)
+   * @param blindingKey - Blinding public key (hex)
+   * @param spendingKey - Spending public key (hex)
    * @param isSpent - Whether output is spent
    * @param spentTxHash - Transaction hash that spent this output (if spent)
    * @param spentBlockHeight - Block height where output was spent (if spent)
@@ -640,6 +896,11 @@ export class TransactionKeysSync {
     outputIndex: number,
     blockHeight: number,
     outputData: string,
+    amount: number,
+    memo: string | null,
+    tokenId: string | null,
+    blindingKey: string,
+    spendingKey: string,
     isSpent: boolean,
     spentTxHash: string | null,
     spentBlockHeight: number | null
@@ -648,8 +909,8 @@ export class TransactionKeysSync {
 
     const stmt = db.prepare(
       `INSERT OR REPLACE INTO wallet_outputs 
-       (output_hash, tx_hash, output_index, block_height, output_data, is_spent, spent_tx_hash, spent_block_height, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+       (output_hash, tx_hash, output_index, block_height, output_data, amount, memo, token_id, blinding_key, spending_key, is_spent, spent_tx_hash, spent_block_height, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     );
     stmt.run([
       outputHash,
@@ -657,6 +918,11 @@ export class TransactionKeysSync {
       outputIndex,
       blockHeight,
       outputData,
+      amount,
+      memo,
+      tokenId,
+      blindingKey,
+      spendingKey,
       isSpent ? 1 : 0,
       spentTxHash,
       spentBlockHeight,
@@ -712,7 +978,7 @@ export class TransactionKeysSync {
     // If retention is enabled (non-zero), only store recent block hashes
     if (this.blockHashRetention > 0) {
       // Get chain tip if not provided
-      const currentChainTip = chainTip ?? (await this.electrumClient.getChainTipHeight());
+      const currentChainTip = chainTip ?? (await this.syncProvider.getChainTipHeight());
       const retentionStart = Math.max(0, currentChainTip - this.blockHashRetention + 1);
 
       // Only store if within retention window

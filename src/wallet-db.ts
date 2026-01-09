@@ -9,6 +9,24 @@
 import { KeyManager } from './key-manager';
 import type { HDChain, SubAddressIdentifier } from './key-manager.types';
 
+/**
+ * Wallet output structure returned by getUnspentOutputs and getAllOutputs
+ */
+export interface WalletOutput {
+  outputHash: string;
+  txHash: string;
+  outputIndex: number;
+  blockHeight: number;
+  amount: bigint;
+  memo: string | null;
+  tokenId: string | null;
+  blindingKey: string;
+  spendingKey: string;
+  isSpent: boolean;
+  spentTxHash: string | null;
+  spentBlockHeight: number | null;
+}
+
 // Import SQL.js for cross-platform SQLite support
 // In browser: uses WebAssembly SQLite
 // In Node.js: uses native SQLite bindings if available, falls back to WASM
@@ -53,7 +71,12 @@ async function loadSQL(): Promise<any> {
 }
 
 /**
- * WalletDB - Manages wallet database persistence
+ * WalletDB - Manages wallet database persistence.
+ * 
+ * Uses SQL.js (SQLite compiled to WebAssembly) for cross-platform compatibility.
+ * Works on web browsers, Node.js, and mobile platforms.
+ * 
+ * @category Wallet
  */
 export class WalletDB {
   private db: any = null;
@@ -259,6 +282,17 @@ export class WalletDB {
       )
     `);
 
+    // Wallet metadata table (single row, always id = 0)
+    this.db.run(`
+      CREATE TABLE IF NOT EXISTS wallet_metadata (
+        id INTEGER PRIMARY KEY,
+        creation_height INTEGER NOT NULL DEFAULT 0,
+        creation_time INTEGER NOT NULL,
+        restored_from_seed INTEGER NOT NULL DEFAULT 0,
+        version INTEGER NOT NULL DEFAULT 1
+      )
+    `);
+
     // Wallet outputs table (UTXOs)
     this.db.run(`
       CREATE TABLE IF NOT EXISTS wallet_outputs (
@@ -267,6 +301,11 @@ export class WalletDB {
         output_index INTEGER NOT NULL,
         block_height INTEGER NOT NULL,
         output_data TEXT NOT NULL,
+        amount INTEGER NOT NULL DEFAULT 0,
+        memo TEXT,
+        token_id TEXT,
+        blinding_key TEXT,
+        spending_key TEXT,
         is_spent INTEGER NOT NULL DEFAULT 0,
         spent_tx_hash TEXT,
         spent_block_height INTEGER,
@@ -289,6 +328,7 @@ export class WalletDB {
   /**
    * Load wallet from database
    * @returns The loaded KeyManager instance
+   * @throws Error if no wallet exists in the database
    */
   async loadWallet(): Promise<KeyManager> {
     await this.initDatabase();
@@ -297,26 +337,27 @@ export class WalletDB {
 
     // Load HD chain
     const hdChainResult = this.db.exec('SELECT * FROM hd_chain LIMIT 1');
-    if (hdChainResult.length > 0 && hdChainResult[0].values.length > 0) {
-      const row = hdChainResult[0].values[0];
-      const hdChain: HDChain = {
-        version: row[1] as number,
-        seedId: this.hexToBytes(row[2] as string),
-        spendId: this.hexToBytes(row[3] as string),
-        viewId: this.hexToBytes(row[4] as string),
-        tokenId: this.hexToBytes(row[5] as string),
-        blindingId: this.hexToBytes(row[6] as string),
-      };
-      keyManager.loadHDChain(hdChain);
+    if (hdChainResult.length === 0 || hdChainResult[0].values.length === 0) {
+      throw new Error('No wallet found in database');
     }
+
+    const row = hdChainResult[0].values[0];
+    const hdChain: HDChain = {
+      version: row[1] as number,
+      seedId: this.hexToBytes(row[2] as string),
+      spendId: this.hexToBytes(row[3] as string),
+      viewId: this.hexToBytes(row[4] as string),
+      tokenId: this.hexToBytes(row[5] as string),
+      blindingId: this.hexToBytes(row[6] as string),
+    };
+    keyManager.loadHDChain(hdChain);
 
     // Load view key
     const viewKeyResult = this.db.exec('SELECT * FROM view_key LIMIT 1');
     if (viewKeyResult.length > 0 && viewKeyResult[0].values.length > 0) {
       const row = viewKeyResult[0].values[0];
-      const publicKey = this.deserializePublicKey(row[0] as string);
       const viewKey = this.deserializeViewKey(row[1] as string);
-      keyManager.loadViewKey(viewKey, publicKey);
+      keyManager.loadViewKey(viewKey);
     }
 
     // Load spend key
@@ -401,15 +442,25 @@ export class WalletDB {
       }
     }
 
+    // If no sub-addresses were loaded from DB, regenerate the pools
+    // This is needed because sub-address saving was not fully implemented
+    if (subAddressesResult.length === 0 || subAddressesResult[0].values.length === 0) {
+      // Regenerate sub-address pools (like navio-core does during startup)
+      keyManager.newSubAddressPool(0);
+      keyManager.newSubAddressPool(-1);
+      keyManager.newSubAddressPool(-2);
+    }
+
     this.keyManager = keyManager;
     return keyManager;
   }
 
   /**
    * Create a new wallet
+   * @param creationHeight - Optional block height when wallet was created (for sync optimization)
    * @returns The new KeyManager instance
    */
-  async createWallet(): Promise<KeyManager> {
+  async createWallet(creationHeight?: number): Promise<KeyManager> {
     await this.initDatabase();
 
     const keyManager = new KeyManager();
@@ -426,6 +477,13 @@ export class WalletDB {
     // Save to database
     await this.saveWallet(keyManager);
 
+    // Save wallet metadata
+    await this.saveWalletMetadata({
+      creationHeight: creationHeight ?? 0,
+      creationTime: Date.now(),
+      restoredFromSeed: false,
+    });
+
     this.keyManager = keyManager;
     return keyManager;
   }
@@ -433,9 +491,10 @@ export class WalletDB {
   /**
    * Restore wallet from seed
    * @param seedHex - The seed as hex string
+   * @param creationHeight - Optional block height to start scanning from (for faster restore)
    * @returns The restored KeyManager instance
    */
-  async restoreWallet(seedHex: string): Promise<KeyManager> {
+  async restoreWallet(seedHex: string, creationHeight?: number): Promise<KeyManager> {
     await this.initDatabase();
 
     const keyManager = new KeyManager();
@@ -452,8 +511,114 @@ export class WalletDB {
     // Save to database
     await this.saveWallet(keyManager);
 
+    // Save wallet metadata with restore height
+    await this.saveWalletMetadata({
+      creationHeight: creationHeight ?? 0,
+      creationTime: Date.now(),
+      restoredFromSeed: true,
+    });
+
     this.keyManager = keyManager;
     return keyManager;
+  }
+
+  /**
+   * Save wallet metadata to database
+   */
+  private async saveWalletMetadata(metadata: {
+    creationHeight: number;
+    creationTime: number;
+    restoredFromSeed: boolean;
+  }): Promise<void> {
+    if (!this.isOpen) {
+      await this.initDatabase();
+    }
+
+    const stmt = this.db.prepare(`
+      INSERT OR REPLACE INTO wallet_metadata (id, creation_height, creation_time, restored_from_seed, version)
+      VALUES (0, ?, ?, ?, 1)
+    `);
+    stmt.run([metadata.creationHeight, metadata.creationTime, metadata.restoredFromSeed ? 1 : 0]);
+    stmt.free();
+
+    // Persist to disk
+    this.persistToDisk();
+  }
+
+  /**
+   * Persist database to disk (if not in-memory)
+   */
+  private persistToDisk(): void {
+    if (this.dbPath !== ':memory:' && this.db) {
+      const fs = this.getFileSystem();
+      if (fs) {
+        const data = this.db.export();
+        const buffer = Buffer.from(data);
+        fs.writeFileSync(this.dbPath, buffer);
+      }
+    }
+  }
+
+  /**
+   * Get wallet metadata from database
+   * @returns Wallet metadata or null if not found
+   */
+  async getWalletMetadata(): Promise<{
+    creationHeight: number;
+    creationTime: number;
+    restoredFromSeed: boolean;
+    version: number;
+  } | null> {
+    if (!this.isOpen) {
+      await this.initDatabase();
+    }
+
+    const result = this.db.exec('SELECT creation_height, creation_time, restored_from_seed, version FROM wallet_metadata WHERE id = 0');
+    if (result.length === 0 || result[0].values.length === 0) {
+      return null;
+    }
+
+    const [creationHeight, creationTime, restoredFromSeed, version] = result[0].values[0];
+    return {
+      creationHeight: creationHeight as number,
+      creationTime: creationTime as number,
+      restoredFromSeed: (restoredFromSeed as number) === 1,
+      version: version as number,
+    };
+  }
+
+  /**
+   * Get the wallet creation height (block height to start scanning from)
+   * @returns Creation height or 0 if not set
+   */
+  async getCreationHeight(): Promise<number> {
+    const metadata = await this.getWalletMetadata();
+    return metadata?.creationHeight ?? 0;
+  }
+
+  /**
+   * Set the wallet creation height
+   * @param height - Block height
+   */
+  async setCreationHeight(height: number): Promise<void> {
+    if (!this.isOpen) {
+      await this.initDatabase();
+    }
+
+    // Check if metadata exists
+    const existing = await this.getWalletMetadata();
+    if (existing) {
+      const stmt = this.db.prepare('UPDATE wallet_metadata SET creation_height = ? WHERE id = 0');
+      stmt.run([height]);
+      stmt.free();
+      this.persistToDisk();
+    } else {
+      await this.saveWalletMetadata({
+        creationHeight: height,
+        creationTime: Date.now(),
+        restoredFromSeed: false,
+      });
+    }
   }
 
   /**
@@ -535,15 +700,8 @@ export class WalletDB {
       // Commit transaction
       this.db.run('COMMIT');
 
-      // Save to file if not in-memory
-      if (this.dbPath !== ':memory:') {
-        const fs = this.getFileSystem();
-        if (fs) {
-          const data = this.db.export();
-          const buffer = Buffer.from(data);
-          fs.writeFileSync(this.dbPath, buffer);
-        }
-      }
+      // Persist to disk
+      this.persistToDisk();
     } catch (error) {
       this.db.run('ROLLBACK');
       throw error;
@@ -585,13 +743,7 @@ export class WalletDB {
     if (this.dbPath === ':memory:' || !this.isOpen) {
       return;
     }
-
-    const fs = this.getFileSystem();
-    if (fs) {
-      const data = this.db.export();
-      const buffer = Buffer.from(data);
-      fs.writeFileSync(this.dbPath, buffer);
-    }
+    this.persistToDisk();
   }
 
   /**
@@ -623,8 +775,30 @@ export class WalletDB {
   }
 
   private deserializeViewKey(hex: string): any {
-    const { ViewKey } = require('navio-blsct');
-    return ViewKey.deserialize(hex);
+    const blsctModule = require('navio-blsct');
+    const ViewKey = blsctModule.ViewKey;
+    const Scalar = blsctModule.Scalar;
+    
+    if (!ViewKey) {
+      // Fallback: ViewKey might not be exported, return Scalar
+      // loadViewKey will convert it to Scalar internally anyway
+      return Scalar.deserialize(hex);
+    }
+    
+    // Try to deserialize as ViewKey first
+    if (ViewKey.deserialize) {
+      return ViewKey.deserialize(hex);
+    }
+    
+    // If ViewKey doesn't have deserialize, try creating from Scalar
+    // ViewKey might be constructible from Scalar or have a fromScalar method
+    const scalar = Scalar.deserialize(hex);
+    if (ViewKey.fromScalar) {
+      return ViewKey.fromScalar(scalar);
+    }
+    
+    // Last resort: return Scalar (loadViewKey converts ViewKey to Scalar anyway)
+    return scalar;
   }
 
   private serializePublicKey(publicKey: any): string {
@@ -654,5 +828,131 @@ export class WalletDB {
       bytes[i / 2] = parseInt(hex.substr(i, 2), 16);
     }
     return bytes;
+  }
+
+  /**
+   * Get wallet balance (sum of unspent output amounts)
+   * @param tokenId - Optional token ID to filter by (null for NAV)
+   * @returns Balance in satoshis
+   */
+  async getBalance(tokenId: string | null = null): Promise<bigint> {
+    if (!this.isOpen) {
+      throw new Error('Database not initialized');
+    }
+
+    let query = 'SELECT SUM(amount) as total FROM wallet_outputs WHERE is_spent = 0';
+    const params: any[] = [];
+
+    if (tokenId === null) {
+      // NAV balance - outputs with no token_id or default token_id
+      query += ' AND (token_id IS NULL OR token_id = ?)';
+      params.push('0000000000000000000000000000000000000000000000000000000000000000');
+    } else {
+      query += ' AND token_id = ?';
+      params.push(tokenId);
+    }
+
+    const result = this.db.exec(query);
+    if (result.length === 0 || result[0].values.length === 0 || result[0].values[0][0] === null) {
+      return 0n;
+    }
+
+    return BigInt(result[0].values[0][0] as number);
+  }
+
+  /**
+   * Get unspent outputs (UTXOs)
+   * @param tokenId - Optional token ID to filter by (null for NAV)
+   * @returns Array of unspent outputs
+   */
+  async getUnspentOutputs(tokenId: string | null = null): Promise<WalletOutput[]> {
+    if (!this.isOpen) {
+      throw new Error('Database not initialized');
+    }
+
+    let query = `
+      SELECT output_hash, tx_hash, output_index, block_height, amount, memo, token_id, 
+             blinding_key, spending_key, is_spent, spent_tx_hash, spent_block_height
+      FROM wallet_outputs 
+      WHERE is_spent = 0
+    `;
+    const params: any[] = [];
+
+    if (tokenId === null) {
+      // NAV - outputs with no token_id or default token_id
+      query += ' AND (token_id IS NULL OR token_id = ?)';
+      params.push('0000000000000000000000000000000000000000000000000000000000000000');
+    } else {
+      query += ' AND token_id = ?';
+      params.push(tokenId);
+    }
+
+    query += ' ORDER BY block_height ASC';
+
+    const stmt = this.db.prepare(query);
+    if (params.length > 0) {
+      stmt.bind(params);
+    }
+
+    const outputs: WalletOutput[] = [];
+    while (stmt.step()) {
+      const row = stmt.getAsObject();
+      outputs.push({
+        outputHash: row.output_hash as string,
+        txHash: row.tx_hash as string,
+        outputIndex: row.output_index as number,
+        blockHeight: row.block_height as number,
+        amount: BigInt(row.amount as number),
+        memo: row.memo as string | null,
+        tokenId: row.token_id as string | null,
+        blindingKey: row.blinding_key as string,
+        spendingKey: row.spending_key as string,
+        isSpent: (row.is_spent as number) === 1,
+        spentTxHash: row.spent_tx_hash as string | null,
+        spentBlockHeight: row.spent_block_height as number | null,
+      });
+    }
+    stmt.free();
+
+    return outputs;
+  }
+
+  /**
+   * Get all outputs (spent and unspent)
+   * @returns Array of all wallet outputs
+   */
+  async getAllOutputs(): Promise<WalletOutput[]> {
+    if (!this.isOpen) {
+      throw new Error('Database not initialized');
+    }
+
+    const stmt = this.db.prepare(`
+      SELECT output_hash, tx_hash, output_index, block_height, amount, memo, token_id, 
+             blinding_key, spending_key, is_spent, spent_tx_hash, spent_block_height
+      FROM wallet_outputs 
+      ORDER BY block_height ASC
+    `);
+
+    const outputs: WalletOutput[] = [];
+    while (stmt.step()) {
+      const row = stmt.getAsObject();
+      outputs.push({
+        outputHash: row.output_hash as string,
+        txHash: row.tx_hash as string,
+        outputIndex: row.output_index as number,
+        blockHeight: row.block_height as number,
+        amount: BigInt(row.amount as number),
+        memo: row.memo as string | null,
+        tokenId: row.token_id as string | null,
+        blindingKey: row.blinding_key as string,
+        spendingKey: row.spending_key as string,
+        isSpent: (row.is_spent as number) === 1,
+        spentTxHash: row.spent_tx_hash as string | null,
+        spentBlockHeight: row.spent_block_height as number | null,
+      });
+    }
+    stmt.free();
+
+    return outputs;
   }
 }

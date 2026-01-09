@@ -41,3 +41,8 @@ pnpm-debug.log*
 .temp/
 *.tmp
 *.db
+
+
+# Generated documentation
+docs/
+docs-html/

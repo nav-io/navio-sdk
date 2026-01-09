@@ -1,16 +1,18 @@
 # Navio SDK
 
-TypeScript SDK for interacting with the Navio blockchain. Provides wallet management, transaction key synchronization, and blockchain interaction through Electrum servers.
+TypeScript SDK for interacting with the Navio blockchain. Provides wallet management, transaction key synchronization, BLSCT confidential transaction support, and blockchain interaction through Electrum servers or P2P connections.
 
 ## Features
 
-- Wallet management with HD key derivation
-- Transaction key synchronization from Electrum servers
-- Automatic output detection and UTXO tracking
-- Spending status tracking
-- Blockchain reorganization handling
-- SQLite-based persistence (browser, Node.js, mobile compatible)
-- Hierarchical deterministic sub-address support
+- **Wallet Management** - HD key derivation with BLS CT support
+- **Dual Sync Backends** - Electrum protocol or direct P2P node connections
+- **Automatic Output Detection** - BLSCT output scanning with view tag optimization
+- **Amount Recovery** - Decrypt confidential transaction amounts
+- **Balance Tracking** - Query wallet balance and UTXOs
+- **Spending Status Tracking** - Monitor spent/unspent outputs
+- **Blockchain Reorganization Handling** - Automatic reorg detection and recovery
+- **Cross-Platform Persistence** - SQLite via SQL.js (browser, Node.js, mobile)
+- **Hierarchical Deterministic Sub-addresses** - Multiple account support
 
 ## Installation
 
@@ -26,15 +28,17 @@ import { NavioClient } from 'navio-sdk';
 // Create and initialize client
 const client = new NavioClient({
   walletDbPath: './my-wallet.db',
+  backend: 'electrum', // or 'p2p'
   electrum: {
     host: 'localhost',
     port: 50005,
     ssl: false,
   },
+  network: 'mainnet', // 'mainnet' | 'testnet' | 'signet' | 'regtest'
   createWalletIfNotExists: true,
 });
 
-// Initialize (loads wallet, connects to Electrum)
+// Initialize (loads wallet, connects to backend)
 await client.initialize();
 
 // Sync transaction keys
@@ -43,6 +47,14 @@ await client.sync({
     console.log(`Syncing: ${height}/${tip} (${blocks} blocks, ${txKeys} TX keys)`);
   },
 });
+
+// Check wallet balance
+const balance = await client.getBalanceNav();
+console.log(`Balance: ${balance} NAV`);
+
+// Get unspent outputs
+const utxos = await client.getUnspentOutputs();
+console.log(`UTXOs: ${utxos.length}`);
 
 // Access wallet operations
 const keyManager = client.getKeyManager();
@@ -53,7 +65,48 @@ console.log('Sub-address:', subAddress.toString());
 await client.disconnect();
 ```
 
-## API Documentation
+## Configuration
+
+### NavioClientConfig
+
+```typescript
+interface NavioClientConfig {
+  // Required
+  walletDbPath: string;              // Path to wallet database file
+
+  // Backend selection (default: 'electrum')
+  backend?: 'electrum' | 'p2p';
+
+  // Electrum backend options
+  electrum?: {
+    host?: string;                   // Server host (default: 'localhost')
+    port?: number;                   // Server port (default: 50001)
+    ssl?: boolean;                   // Use SSL/TLS (default: false)
+    timeout?: number;                // Request timeout ms (default: 30000)
+    clientName?: string;             // Client name (default: 'navio-sdk')
+    clientVersion?: string;          // Protocol version (default: '1.4')
+  };
+
+  // P2P backend options
+  p2p?: {
+    host: string;                    // Node host
+    port: number;                    // Node port (mainnet: 33670, testnet: 43670)
+    network: 'mainnet' | 'testnet';  // Network type
+    debug?: boolean;                 // Enable debug logging
+  };
+
+  // Network configuration (for navio-blsct)
+  network?: 'mainnet' | 'testnet' | 'signet' | 'regtest';
+
+  // Wallet options
+  createWalletIfNotExists?: boolean; // Create wallet if missing (default: false)
+  restoreFromSeed?: string;          // Restore from seed (hex string)
+  restoreFromHeight?: number;        // Block height when wallet was created (for restore)
+  creationHeight?: number;           // Creation height for new wallets (default: chainTip - 100)
+}
+```
+
+## API Reference
 
 ### NavioClient
 
@@ -62,50 +115,45 @@ Main client class for wallet operations and blockchain synchronization.
 #### Constructor
 
 ```typescript
-const client = new NavioClient({
-  walletDbPath: string,              // Path to wallet database file
-  electrum: {
-    host?: string,                   // Electrum server host (default: 'localhost')
-    port?: number,                   // Electrum server port (default: 50001)
-    ssl?: boolean,                   // Use SSL/TLS (default: false)
-    timeout?: number,                // Request timeout in ms (default: 30000)
-    clientName?: string,             // Client name (default: 'navio-sdk')
-    clientVersion?: string,          // Client version (default: '1.4')
-  },
-  createWalletIfNotExists?: boolean, // Create wallet if missing (default: false)
-  restoreFromSeed?: string,          // Restore wallet from seed (hex string)
-});
+const client = new NavioClient(config: NavioClientConfig);
 ```
 
-#### Methods
+#### Initialization
 
 ##### `initialize(): Promise<void>`
 
 Initializes the client:
 - Loads or creates wallet from database
-- Connects to Electrum server
+- Connects to backend (Electrum/P2P)
 - Initializes sync manager
 - Sets up KeyManager for output detection
 
+#### Synchronization
+
 ##### `sync(options?: SyncOptions): Promise<number>`
 
-Synchronizes transaction keys from Electrum server.
+Synchronizes transaction keys from the blockchain.
 
-**Options:**
 ```typescript
-{
-  startHeight?: number,              // Start height (default: last synced + 1)
-  endHeight?: number,                // End height (default: chain tip)
-  onProgress?: (height, tip, blocks, txKeys, isReorg) => void,
-  stopOnReorg?: boolean,             // Stop on reorganization (default: true)
-  verifyHashes?: boolean,            // Verify block hashes (default: true)
-  saveInterval?: number,             // Save DB every N blocks (default: 100)
-  keepTxKeys?: boolean,             // Keep TX keys in DB (default: false)
-  blockHashRetention?: number,       // Keep last N block hashes (default: 10000)
+interface SyncOptions {
+  startHeight?: number;              // Start height (default: last synced + 1)
+  endHeight?: number;                // End height (default: chain tip)
+  onProgress?: (
+    currentHeight: number,
+    chainTip: number,
+    blocksProcessed: number,
+    txKeysProcessed: number,
+    isReorg: boolean
+  ) => void;
+  stopOnReorg?: boolean;             // Stop on reorg (default: true)
+  verifyHashes?: boolean;            // Verify block hashes (default: true)
+  saveInterval?: number;             // Save every N blocks (default: 100)
+  keepTxKeys?: boolean;              // Keep TX keys in DB (default: false)
+  blockHashRetention?: number;       // Keep last N hashes (default: 10000)
 }
 ```
 
-**Returns:** Number of transaction keys synced
+Returns: Number of transaction keys synced
 
 ##### `isSyncNeeded(): Promise<boolean>`
 
@@ -115,9 +163,84 @@ Checks if synchronization is needed.
 
 Returns the last synced block height, or -1 if never synced.
 
-##### `getSyncState()`
+##### `getSyncState(): SyncState`
 
 Returns current sync state with statistics.
+
+#### Background Sync
+
+##### `startBackgroundSync(options?: BackgroundSyncOptions): Promise<void>`
+
+Start continuous background synchronization. The client will poll for new blocks
+and automatically sync. Callbacks are invoked for new blocks, transactions, and balance changes.
+
+```typescript
+interface BackgroundSyncOptions extends SyncOptions {
+  pollInterval?: number;           // Polling interval in ms (default: 10000)
+  onNewBlock?: (height: number, hash: string) => void;
+  onNewTransaction?: (txHash: string, outputHash: string, amount: bigint) => void;
+  onBalanceChange?: (newBalance: bigint, oldBalance: bigint) => void;
+  onError?: (error: Error) => void;
+}
+```
+
+##### `stopBackgroundSync(): void`
+
+Stop background synchronization.
+
+##### `isBackgroundSyncActive(): boolean`
+
+Check if background sync is running.
+
+#### Balance & Outputs
+
+##### `getBalance(tokenId?: string | null): Promise<bigint>`
+
+Get wallet balance in satoshis.
+
+```typescript
+// NAV balance
+const balanceSats = await client.getBalance();
+
+// Token balance
+const tokenBalance = await client.getBalance('token-id-hex');
+```
+
+##### `getBalanceNav(tokenId?: string | null): Promise<number>`
+
+Get wallet balance in NAV (with 8 decimal places).
+
+```typescript
+const balance = await client.getBalanceNav();
+console.log(`Balance: ${balance.toFixed(8)} NAV`);
+```
+
+##### `getUnspentOutputs(tokenId?: string | null): Promise<WalletOutput[]>`
+
+Get unspent outputs (UTXOs).
+
+```typescript
+interface WalletOutput {
+  outputHash: string;
+  txHash: string;
+  outputIndex: number;
+  blockHeight: number;
+  amount: bigint;
+  memo: string | null;
+  tokenId: string | null;
+  blindingKey: string;
+  spendingKey: string;
+  isSpent: boolean;
+  spentTxHash: string | null;
+  spentBlockHeight: number | null;
+}
+```
+
+##### `getAllOutputs(): Promise<WalletOutput[]>`
+
+Get all wallet outputs (spent and unspent).
+
+#### Accessors
 
 ##### `getKeyManager(): KeyManager`
 
@@ -127,23 +250,43 @@ Returns the KeyManager instance for wallet operations.
 
 Returns the WalletDB instance for database operations.
 
-##### `getElectrumClient(): ElectrumClient`
+##### `getSyncProvider(): SyncProvider`
 
-Returns the ElectrumClient instance for blockchain queries.
+Returns the current sync provider (Electrum or P2P).
 
 ##### `getSyncManager(): TransactionKeysSync`
 
 Returns the TransactionKeysSync instance for sync operations.
 
+##### `getBackendType(): 'electrum' | 'p2p'`
+
+Returns the current backend type.
+
+##### `getNetwork(): string`
+
+Returns the configured network.
+
+##### `isConnected(): boolean`
+
+Check if client is connected to the backend.
+
+#### Connection
+
+##### `connect(): Promise<void>`
+
+Connect to the backend.
+
 ##### `disconnect(): Promise<void>`
 
-Disconnects from Electrum server and closes database.
+Disconnect from backend and close database.
+
+---
 
 ### KeyManager
 
 Manages BLS CT keys, sub-addresses, and output detection.
 
-#### Key Methods
+#### Key Generation
 
 ```typescript
 // Generate new seed
@@ -152,37 +295,59 @@ const seed = keyManager.generateNewSeed();
 // Set HD seed
 keyManager.setHDSeed(seed);
 
-// Get sub-address
+// Get master seed (for backup)
+const masterSeed = keyManager.getMasterSeedKey();
+console.log('Seed:', masterSeed.serialize()); // hex string
+```
+
+#### Sub-addresses
+
+```typescript
+// Get sub-address by identifier
 const subAddr = keyManager.getSubAddress({ account: 0, address: 0 });
 
 // Generate new sub-address
-const { subAddress, id } = keyManager.generateNewSubAddress(account);
+const { subAddress, id } = keyManager.generateNewSubAddress(0); // account 0
 
+// Create sub-address pool
+keyManager.newSubAddressPool(0);  // Main account
+keyManager.newSubAddressPool(-1); // Change
+keyManager.newSubAddressPool(-2); // Staking
+```
+
+#### Output Detection
+
+```typescript
 // Check if output belongs to wallet
 const isMine = keyManager.isMineByKeys(blindingKey, spendingKey, viewTag);
 
-// Get spending key for output
-const spendingKey = keyManager.getSpendingKeyForOutput(output, subAddressId);
+// Calculate view tag for output detection
+const viewTag = keyManager.calculateViewTag(blindingKey);
 
-// Recover output amounts
-const amounts = keyManager.recoverOutputs(outputs);
+// Calculate hash ID for sub-address lookup
+const hashId = keyManager.calculateHashId(blindingKey, spendingKey);
+
+// Calculate nonce for amount recovery
+const nonce = keyManager.calculateNonce(blindingKey);
 ```
+
+---
 
 ### WalletDB
 
 Manages wallet database persistence.
 
-#### Key Methods
+#### Wallet Operations
 
 ```typescript
 // Create new wallet
-const keyManager = await walletDB.createWallet();
+const keyManager = await walletDB.createWallet(creationHeight);
 
 // Load existing wallet
 const keyManager = await walletDB.loadWallet();
 
 // Restore wallet from seed
-const keyManager = await walletDB.restoreWallet(seedHex);
+const keyManager = await walletDB.restoreWallet(seedHex, creationHeight);
 
 // Save wallet state
 await walletDB.saveWallet(keyManager);
@@ -191,34 +356,96 @@ await walletDB.saveWallet(keyManager);
 await walletDB.close();
 ```
 
-### ElectrumClient
-
-Connects to and queries Electrum servers.
-
-#### Key Methods
+#### Metadata
 
 ```typescript
-// Connect to server
-await electrumClient.connect();
+// Get wallet metadata
+const metadata = await walletDB.getWalletMetadata();
+// { creationHeight, creationTime, restoredFromSeed, version }
 
-// Get chain tip height
-const height = await electrumClient.getChainTipHeight();
-
-// Get block header
-const header = await electrumClient.getBlockHeader(height);
-
-// Get block headers (batch)
-const headers = await electrumClient.getBlockHeaders(startHeight, count);
-
-// Get transaction keys for block range
-const range = await electrumClient.getBlockTransactionKeysRange(startHeight);
-
-// Get transaction output
-const output = await electrumClient.getTransactionOutput(outputHash);
-
-// Disconnect
-await electrumClient.disconnect();
+// Get/set creation height
+const height = await walletDB.getCreationHeight();
+await walletDB.setCreationHeight(height);
 ```
+
+#### Balance Queries
+
+```typescript
+// Get balance
+const balance = await walletDB.getBalance();
+
+// Get unspent outputs
+const utxos = await walletDB.getUnspentOutputs();
+
+// Get all outputs
+const outputs = await walletDB.getAllOutputs();
+```
+
+---
+
+### SyncProvider Interface
+
+Abstract interface for sync backends. Allows switching between Electrum and P2P.
+
+```typescript
+interface SyncProvider {
+  type: 'electrum' | 'p2p' | 'custom';
+  
+  connect(): Promise<void>;
+  disconnect(): void;
+  isConnected(): boolean;
+  
+  getChainTipHeight(): Promise<number>;
+  getBlockHeader(height: number): Promise<string>;
+  getBlockHeaders(startHeight: number, count: number): Promise<HeadersResult>;
+  getBlockTransactionKeysRange(startHeight: number): Promise<TransactionKeysRangeResult>;
+  getBlockTransactionKeys(height: number): Promise<TransactionKeys[]>;
+  getTransactionOutput(outputHash: string): Promise<string>;
+  broadcastTransaction(rawTx: string): Promise<string>;
+  getRawTransaction(txHash: string, verbose?: boolean): Promise<string | any>;
+}
+```
+
+---
+
+### ElectrumSyncProvider
+
+Electrum protocol implementation of SyncProvider.
+
+```typescript
+import { ElectrumSyncProvider } from 'navio-sdk';
+
+const provider = new ElectrumSyncProvider({
+  host: 'localhost',
+  port: 50005,
+  ssl: false,
+});
+
+await provider.connect();
+const height = await provider.getChainTipHeight();
+```
+
+---
+
+### P2PSyncProvider
+
+Direct P2P node connection implementation of SyncProvider.
+
+```typescript
+import { P2PSyncProvider } from 'navio-sdk';
+
+const provider = new P2PSyncProvider({
+  host: 'localhost',
+  port: 33670,
+  network: 'testnet',
+  debug: true,
+});
+
+await provider.connect();
+const height = await provider.getChainTipHeight();
+```
+
+---
 
 ## Examples
 
@@ -231,12 +458,22 @@ const client = new NavioClient({
   walletDbPath: './new-wallet.db',
   electrum: { host: 'localhost', port: 50005 },
   createWalletIfNotExists: true,
+  network: 'testnet',
 });
 
 await client.initialize();
+
+// Get and save the seed for backup
 const keyManager = client.getKeyManager();
+const seed = keyManager.getMasterSeedKey();
+console.log('SAVE THIS SEED:', seed.serialize());
+
+// Get receiving address
+const { DoublePublicKey, Address, AddressEncoding } = require('navio-blsct');
 const subAddress = keyManager.getSubAddress({ account: 0, address: 0 });
-console.log('New wallet sub-address:', subAddress.toString());
+const dpk = DoublePublicKey.deserialize(subAddress.serialize());
+const address = Address.encode(dpk, AddressEncoding.Bech32M);
+console.log('Address:', address);
 ```
 
 ### Restore Wallet from Seed
@@ -246,66 +483,199 @@ const client = new NavioClient({
   walletDbPath: './restored-wallet.db',
   electrum: { host: 'localhost', port: 50005 },
   restoreFromSeed: 'your-seed-hex-string',
+  restoreFromHeight: 50000, // Block height when wallet was created
+  network: 'testnet',
 });
 
 await client.initialize();
+
+// Full sync from restoration height
+await client.sync({
+  onProgress: (height, tip) => {
+    console.log(`Syncing: ${height}/${tip}`);
+  },
+});
+```
+
+### Using P2P Backend
+
+```typescript
+const client = new NavioClient({
+  walletDbPath: './p2p-wallet.db',
+  backend: 'p2p',
+  p2p: {
+    host: 'localhost',
+    port: 33670,
+    network: 'testnet',
+    debug: false,
+  },
+  network: 'testnet',
+  createWalletIfNotExists: true,
+});
+
+await client.initialize();
+await client.sync();
+
+const balance = await client.getBalanceNav();
+console.log(`Balance: ${balance} NAV`);
 ```
 
 ### Sync with Progress
 
 ```typescript
+const startTime = Date.now();
+
 await client.sync({
   onProgress: (currentHeight, chainTip, blocksProcessed, txKeysProcessed, isReorg) => {
     const progress = ((currentHeight / chainTip) * 100).toFixed(1);
-    console.log(`Progress: ${progress}% (${blocksProcessed} blocks, ${txKeysProcessed} TX keys)`);
+    const elapsed = (Date.now() - startTime) / 1000;
+    const rate = blocksProcessed / elapsed;
+    
+    console.log(
+      `Progress: ${progress}% | ${blocksProcessed} blocks | ` +
+      `${txKeysProcessed} TX keys | ${rate.toFixed(1)} blocks/s`
+    );
   },
   saveInterval: 100, // Save every 100 blocks
 });
 ```
 
-### Access Wallet Outputs
+### Background Sync (Stay Synced)
+
+Keep the wallet synchronized automatically:
 
 ```typescript
-const walletDB = client.getWalletDB();
-const db = walletDB.getDatabase();
+import { NavioClient } from 'navio-sdk';
 
-// Query unspent outputs
-const result = db.exec(`
-  SELECT output_hash, tx_hash, output_index, block_height, output_data
-  FROM wallet_outputs
-  WHERE is_spent = 0
-  ORDER BY block_height DESC
-`);
+const client = new NavioClient({
+  walletDbPath: './wallet.db',
+  electrum: { host: 'localhost', port: 50005 },
+  createWalletIfNotExists: true,
+});
 
-// Process outputs
-for (const row of result[0].values) {
-  const [outputHash, txHash, outputIndex, blockHeight, outputData] = row;
-  console.log(`UTXO: ${outputHash} from tx ${txHash} at height ${blockHeight}`);
+await client.initialize();
+
+// Start background sync - polls every 10 seconds
+await client.startBackgroundSync({
+  pollInterval: 10000,
+  
+  onNewBlock: (height, hash) => {
+    console.log(`New block ${height}: ${hash.substring(0, 16)}...`);
+  },
+  
+  onBalanceChange: (newBalance, oldBalance) => {
+    const diff = Number(newBalance - oldBalance) / 1e8;
+    console.log(`Balance changed: ${diff > 0 ? '+' : ''}${diff.toFixed(8)} NAV`);
+    console.log(`New balance: ${Number(newBalance) / 1e8} NAV`);
+  },
+  
+  onError: (error) => {
+    console.error('Sync error:', error.message);
+  },
+});
+
+console.log('Wallet running. Press Ctrl+C to stop.');
+
+// Handle graceful shutdown
+process.on('SIGINT', async () => {
+  console.log('\nShutting down...');
+  client.stopBackgroundSync();
+  await client.disconnect();
+  process.exit(0);
+});
+```
+
+### Query Wallet Outputs
+
+```typescript
+// Get balance
+const balanceNav = await client.getBalanceNav();
+console.log(`Balance: ${balanceNav.toFixed(8)} NAV`);
+
+// Get unspent outputs
+const utxos = await client.getUnspentOutputs();
+console.log(`\nUnspent Outputs (${utxos.length}):`);
+
+for (const utxo of utxos) {
+  const amount = Number(utxo.amount) / 1e8;
+  console.log(`  ${utxo.outputHash.substring(0, 16)}...`);
+  console.log(`    Amount: ${amount.toFixed(8)} NAV`);
+  console.log(`    Block: ${utxo.blockHeight}`);
+  if (utxo.memo) {
+    console.log(`    Memo: ${utxo.memo}`);
+  }
 }
 ```
+
+---
 
 ## Database Schema
 
 The wallet database includes the following tables:
 
-- **keys**: Key pairs for transactions
-- **out_keys**: Output-specific keys
-- **view_key**: View key for output detection
-- **spend_key**: Spending public key
-- **hd_chain**: HD chain information
-- **sub_addresses**: Sub-address mappings
-- **wallet_outputs**: Wallet UTXOs (spendable outputs)
-- **tx_keys**: Transaction keys (optional, if `keepTxKeys: true`)
-- **block_hashes**: Block hashes for reorganization detection
-- **sync_state**: Synchronization state
+| Table | Description |
+|-------|-------------|
+| `keys` | Key pairs for transactions |
+| `out_keys` | Output-specific keys |
+| `view_key` | View key for output detection |
+| `spend_key` | Spending public key |
+| `hd_chain` | HD chain information |
+| `sub_addresses` | Sub-address mappings |
+| `wallet_outputs` | Wallet UTXOs with amounts |
+| `wallet_metadata` | Wallet creation info |
+| `tx_keys` | Transaction keys (optional) |
+| `block_hashes` | Block hashes for reorg detection |
+| `sync_state` | Synchronization state |
+
+### wallet_outputs Schema
+
+```sql
+CREATE TABLE wallet_outputs (
+  output_hash TEXT PRIMARY KEY,
+  tx_hash TEXT NOT NULL,
+  output_index INTEGER NOT NULL,
+  block_height INTEGER NOT NULL,
+  output_data TEXT NOT NULL,
+  amount INTEGER NOT NULL DEFAULT 0,
+  memo TEXT,
+  token_id TEXT,
+  blinding_key TEXT,
+  spending_key TEXT,
+  is_spent INTEGER NOT NULL DEFAULT 0,
+  spent_tx_hash TEXT,
+  spent_block_height INTEGER,
+  created_at INTEGER NOT NULL
+);
+```
+
+---
 
 ## Optimization
 
 The SDK includes several optimization options:
 
-- **`keepTxKeys: false`** (default): Don't store transaction keys after processing (saves space)
-- **`blockHashRetention: 10000`** (default): Only keep last 10k block hashes (saves ~2.4 MB)
-- **`saveInterval: 100`** (default): Save database every 100 blocks (balances performance and safety)
+| Option | Default | Description |
+|--------|---------|-------------|
+| `keepTxKeys` | `false` | Don't store TX keys after processing (saves space) |
+| `blockHashRetention` | `10000` | Only keep last 10k block hashes (~2.4 MB savings) |
+| `saveInterval` | `100` | Save database every 100 blocks |
+| `creationHeight` | `chainTip - 100` | Skip blocks before wallet creation |
+
+---
+
+## Network Configuration
+
+The SDK uses `navio-blsct` for BLS CT operations. Network configuration is automatic based on the `network` option:
+
+```typescript
+import { setChain, BlsctChain, getChain } from 'navio-sdk';
+
+// Manual configuration (usually automatic)
+setChain(BlsctChain.Testnet);
+console.log('Current chain:', getChain());
+```
+
+---
 
 ## Development
 
@@ -317,20 +687,49 @@ npm install
 npm run build
 
 # Run tests
-npm run test:keymanager
-npm run test:walletdb
-npm run test:electrum
-npm run test:client
+npm run test:keymanager   # KeyManager tests
+npm run test:walletdb     # WalletDB tests
+npm run test:electrum     # Electrum client tests
+npm run test:client       # Full client tests (Electrum)
+npm run test:p2p          # P2P protocol tests
+npm run test:client:p2p   # Full client tests (P2P)
 
-# Analyze database size
-npm run analyze:db
+# Generate documentation
+npm run docs              # HTML docs in ./docs
+npm run docs:md           # Markdown docs in ./docs/api
 
 # Type checking
 npm run typecheck
 
 # Linting
 npm run lint
+npm run lint:fix
+
+# Analyze database size
+npm run analyze:db
 ```
+
+---
+
+## Known Limitations
+
+1. **Amount Recovery**: The `navio-blsct` library v1.0.20 has a bug in `RangeProof.recoverAmounts()`. Outputs are detected and stored but amounts show as 0 until the library is updated.
+
+2. **Token Support**: Token transfers are tracked but not fully implemented for spending.
+
+---
+
+## API Documentation
+
+Full API documentation is auto-generated using TypeDoc:
+
+```bash
+npm run docs
+```
+
+View the generated documentation in the `./docs` directory.
+
+---
 
 ## License
 

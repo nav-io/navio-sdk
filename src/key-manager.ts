@@ -16,22 +16,18 @@ const PublicKey = blsctModule.PublicKey;
 const SubAddr = blsctModule.SubAddr;
 const SubAddrId = blsctModule.SubAddrId;
 const DoublePublicKey = blsctModule.DoublePublicKey;
-// SpendingKey might be exported separately
-const SpendingKey = blsctModule.SpendingKey;
-// Helper functions
+// Helper functions and classes
 const calcPrivSpendingKey = blsctModule.calcPrivSpendingKey;
 const recoverAmount = blsctModule.recoverAmount;
 const ViewTag = blsctModule.ViewTag;
-const calcKeyId = blsctModule.calcKeyId;
+const HashId = blsctModule.HashId;
 const calcNonce = blsctModule.calcNonce;
 
 // Derive types from runtime values using typeof
 type ScalarType = InstanceType<typeof Scalar>;
-type ChildKeyType = InstanceType<typeof ChildKey>;
 type ViewKeyType = InstanceType<typeof ViewKey>;
 type PublicKeyType = InstanceType<typeof PublicKey>;
 type SubAddrType = InstanceType<typeof SubAddr>;
-type SubAddrIdType = InstanceType<typeof SubAddrId>;
 
 import type {
   HDChain,
@@ -43,14 +39,19 @@ import type {
 } from './key-manager.types';
 
 /**
- * KeyManager class for managing BLS CT keys
- * Replicates functionality from navio-core's blsct::keyman
+ * KeyManager class for managing BLS CT keys.
+ * Replicates functionality from navio-core's blsct::keyman.
+ * 
+ * Handles HD key derivation, sub-address generation, output detection,
+ * and amount recovery for BLSCT confidential transactions.
+ * 
+ * @category Keys
  */
 export class KeyManager {
   private hdChain: HDChain | null = null;
   private viewKey: ViewKeyType | null = null;
   private spendPublicKey: PublicKeyType | null = null;
-  private spendKey: any = null; // Store private spending key
+  private spendKey: ScalarType | null = null; // Store private spending key
   private masterSeed: ScalarType | null = null;
   private spendKeyId: Uint8Array | null = null;
   private viewKeyId: Uint8Array | null = null;
@@ -129,18 +130,17 @@ export class KeyManager {
     const tokenKey = childKey.toTokenKey();
 
     // FromTransactionToViewKey: txKey.toViewKey() (index 0)
-    const viewKey = new Scalar(txKey.toViewKey().value());
+    const viewKey = Scalar.deserialize(txKey.toViewKey().serialize());
 
     // FromTransactionToSpendKey: txKey.toSpendingKey() (index 1)
-    const spendKey = new Scalar(txKey.toSpendingKey().value());
+    const spendKey = Scalar.deserialize(txKey.toSpendingKey().serialize());
 
     // Store the derived keys
     this.viewKey = viewKey;
-    this.spendKey = spendKey; // Store private spending key
+    this.spendKey = spendKey;
 
     // Get public key from spend key
     // In navio-core, spendKey is a PrivateKey (Scalar) and we call GetPublicKey() on it
-    // In navio-blsct, SpendingKey might need to be converted to Scalar first, or have a different API
     let spendPublicKey: PublicKeyType = PublicKey.fromScalar(spendKey);
 
     this.spendPublicKey = spendPublicKey;
@@ -207,7 +207,7 @@ export class KeyManager {
         // Create PublicKey from bytes
         const spendingPublicKey = this.createPublicKeyFromBytes(spendingKeyBytes);
 
-        this.viewKey = new Scalar(viewKey.value());
+        this.viewKey = Scalar.deserialize(viewKey.serialize());
         this.spendPublicKey = spendingPublicKey;
 
         // Note: This is a simplified import - full implementation would need more setup
@@ -293,6 +293,10 @@ export class KeyManager {
       throw new Error('Cannot generate keys - HD not enabled');
     }
 
+    if (!this.viewKey || !this.spendPublicKey) {
+      throw new Error('View key or spending public key not available');
+    }
+
     // Initialize counter if needed
     if (!this.subAddressCounter.has(account)) {
       this.subAddressCounter.set(account, 0);
@@ -306,11 +310,21 @@ export class KeyManager {
 
     const subAddress = this.getSubAddress(id);
 
-    // Store the sub-address mapping by the sub-address identifier
-    // Note: Hash ID calculation requires the blinding key from transaction outputs,
-    // so we store by sub-address identifier here and calculate hash ID when processing outputs
-    const subAddressKey = `${id.account}:${id.address}`;
-    this.subAddresses.set(subAddressKey, id);
+    // Calculate hashId for this sub-address so we can look it up during output scanning
+    // Generate DoublePublicKey which contains (blindingKey, spendingKey) for this sub-address
+    const dpk = DoublePublicKey.fromKeysAcctAddr(this.viewKey, this.spendPublicKey, account, addressIndex);
+    const serialized = dpk.serialize();
+
+    // DoublePublicKey serializes as 192 hex chars (96 bytes = 2 x 48-byte G1 points)
+    // First 96 chars = blinding key, second 96 chars = spending key
+    const spendingKeyHex = serialized.substring(96);
+
+    // The hashId is Hash160(spendingKey) - this is what calcKeyId computes for tx outputs
+    // When a sender creates an output for us, the D_prime derivation results in our spendingKey
+    const spendingKeyBytes = Buffer.from(spendingKeyHex, 'hex');
+    const hashIdBytes = this.hash160(spendingKeyBytes);
+    const hashIdHex = this.bytesToHex(hashIdBytes);
+    this.subAddresses.set(hashIdHex, id);
 
     return { subAddress, id };
   }
@@ -404,7 +418,7 @@ export class KeyManager {
 
   /**
    * Calculate hash ID from blinding and spending keys
-   * Note: This requires navio-blsct to provide hash calculation functions
+   * Uses HashId.generate() from navio-blsct
    * @param blindingKey - The blinding public key
    * @param spendingKey - The spending public key
    * @returns The hash ID (20 bytes)
@@ -414,22 +428,18 @@ export class KeyManager {
       throw new Error('View key not available');
     }
 
-    // Use calcKeyId from navio-blsct
-    // Reference: https://nav-io.github.io/libblsct-bindings/ts/functions/calcKeyId.html
-    const keyId = calcKeyId(blindingKey, spendingKey, this.viewKey);
+    // Use HashId.generate() from navio-blsct
+    // The view key needs to be a Scalar, which is what we have
+    const hashId = HashId.generate(blindingKey, spendingKey, this.viewKey);
 
-    // calcKeyId returns a Uint8Array (20 bytes for hash160)
-    // Convert to Uint8Array if needed
-    if (keyId instanceof Uint8Array) {
-      return keyId;
-    }
-    // If it returns something else, convert it
-    return new Uint8Array(keyId);
+    // HashId.serialize() returns a hex string, convert to bytes
+    const hashIdHex = hashId.serialize();
+    return Uint8Array.from(Buffer.from(hashIdHex, 'hex'));
   }
 
   /**
    * Calculate view tag for output detection
-   * Uses calcViewTag from navio-blsct
+   * Uses ViewTag from navio-blsct
    * @param blindingKey - The blinding public key
    * @returns The view tag (16-bit number)
    */
@@ -438,25 +448,30 @@ export class KeyManager {
       throw new Error('View key not available');
     }
 
-    // Use calcViewTag from navio-blsct
-    // Reference: https://nav-io.github.io/libblsct-bindings/ts/functions/calcViewTag.html
-    return new ViewTag(blindingKey, this.viewKey);
+    // ViewTag constructor computes the view tag from blinding key and view key
+    // The .value property contains the numeric view tag
+    const viewTagObj = new ViewTag(blindingKey, this.viewKey);
+    return viewTagObj.value;
   }
 
   /**
    * Calculate nonce for range proof recovery
    * Uses calcNonce from navio-blsct
    * @param blindingKey - The blinding public key
-   * @returns The nonce (public key)
+   * @returns The nonce (Point)
    */
-  calculateNonce(blindingKey: PublicKeyType): PublicKeyType {
+  calculateNonce(blindingKey: PublicKeyType): any {
     if (!this.viewKey) {
       throw new Error('View key not available');
     }
 
     // Use calcNonce from navio-blsct
-    // Reference: https://nav-io.github.io/libblsct-bindings/ts/functions/calcNonce.html
-    return calcNonce(blindingKey, this.viewKey);
+    // Need to pass .value() for the underlying SWIG objects
+    const result = calcNonce(blindingKey.value(), this.viewKey.value());
+    
+    // Wrap result in Point object
+    const { Point } = require('navio-blsct');
+    return new Point(result);
   }
 
   /**
@@ -491,7 +506,7 @@ export class KeyManager {
    */
   loadViewKey(viewKey: ViewKeyType): boolean {
     if (!this.fViewKeyDefined) {
-      this.viewKey = new Scalar(viewKey.value());
+      this.viewKey = Scalar.deserialize(viewKey.serialize());
       this.fViewKeyDefined = true;
       return true;
     }
@@ -636,7 +651,7 @@ export class KeyManager {
    */
   addViewKey(viewKey: ViewKeyType, publicKey: PublicKeyType): boolean {
     if (!this.fViewKeyDefined) {
-      this.viewKey = new Scalar(viewKey.value());
+      this.viewKey = Scalar.deserialize(viewKey.serialize());
       this.fViewKeyDefined = true;
       // In a database wallet, this would also save to database
       return true;
@@ -1129,7 +1144,7 @@ export class KeyManager {
       return false;
     }
 
-    // Check view tag
+    // Check view tag - fast filter for outputs not intended for us
     const calculatedViewTag = this.calculateViewTag(blindingKey);
     if (viewTag !== calculatedViewTag) {
       return false;

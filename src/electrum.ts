@@ -110,7 +110,12 @@ export class ElectrumError extends Error {
 }
 
 /**
- * Electrum Client - Connects to Electrum servers
+ * Electrum Client - Connects to Electrum servers.
+ * 
+ * Low-level client for the Electrum protocol. For most use cases,
+ * use NavioClient with the 'electrum' backend instead.
+ * 
+ * @category Protocol
  */
 export class ElectrumClient {
   private ws: any = null;
