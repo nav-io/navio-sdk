@@ -731,6 +731,28 @@ View the generated documentation in the `./docs` directory.
 
 ---
 
+## Examples
+
+### Web Wallet
+
+A basic browser-based wallet example is available in `examples/web-wallet/`:
+
+```bash
+cd examples/web-wallet
+npm install
+npm run dev
+```
+
+Features:
+- Create/restore HD wallet
+- Connect to Electrum server
+- Background synchronization
+- Balance and UTXO display
+
+See [examples/web-wallet/README.md](examples/web-wallet/README.md) for details.
+
+---
+
 ## License
 
 MIT

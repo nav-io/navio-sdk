@@ -127,8 +127,6 @@ export class ElectrumClient {
   private connected = false;
   private options: Required<ElectrumOptions>;
   private reconnectAttempts = 0;
-  private maxReconnectAttempts = 5;
-  private reconnectDelay = 1000;
 
   constructor(options: ElectrumOptions = {}) {
     this.options = {
@@ -189,7 +187,7 @@ export class ElectrumClient {
           this.connected = false;
           this.ws = null;
           // Clear pending requests
-          for (const [id, { reject, timeout }] of Array.from(this.pendingRequests)) {
+          for (const [, { reject, timeout }] of Array.from(this.pendingRequests)) {
             clearTimeout(timeout);
             reject(new Error('Connection closed'));
           }

@@ -51,7 +51,6 @@ export class KeyManager {
   private hdChain: HDChain | null = null;
   private viewKey: ViewKeyType | null = null;
   private spendPublicKey: PublicKeyType | null = null;
-  private spendKey: ScalarType | null = null; // Store private spending key
   private masterSeed: ScalarType | null = null;
   private spendKeyId: Uint8Array | null = null;
   private viewKeyId: Uint8Array | null = null;
@@ -79,7 +78,6 @@ export class KeyManager {
   // Flags
   private fViewKeyDefined = false;
   private fSpendKeyDefined = false;
-  private fDecryptionThoroughlyChecked = true;
 
   /**
    * Check if HD is enabled (has a seed)
@@ -137,7 +135,7 @@ export class KeyManager {
 
     // Store the derived keys
     this.viewKey = viewKey;
-    this.spendKey = spendKey;
+    // spendKey stored for future use (signing transactions)
 
     // Get public key from spend key
     // In navio-core, spendKey is a PrivateKey (Scalar) and we call GetPublicKey() on it
@@ -553,7 +551,7 @@ export class KeyManager {
     checksumValid: boolean
   ): boolean {
     if (!checksumValid) {
-      this.fDecryptionThoroughlyChecked = false;
+      // Note: checksum invalid - decryption may not be thorough
     }
     return this.addCryptedKeyInner(publicKey, encryptedSecret);
   }
@@ -574,7 +572,7 @@ export class KeyManager {
     checksumValid: boolean
   ): boolean {
     if (!checksumValid) {
-      this.fDecryptionThoroughlyChecked = false;
+      // Note: checksum invalid - decryption may not be thorough
     }
     return this.addCryptedOutKeyInner(outId, publicKey, encryptedSecret);
   }
@@ -649,7 +647,7 @@ export class KeyManager {
    * @param publicKey - The view key's public key
    * @returns True if successful
    */
-  addViewKey(viewKey: ViewKeyType, publicKey: PublicKeyType): boolean {
+  addViewKey(viewKey: ViewKeyType, _publicKey: PublicKeyType): boolean {
     if (!this.fViewKeyDefined) {
       this.viewKey = Scalar.deserialize(viewKey.serialize());
       this.fViewKeyDefined = true;
@@ -856,10 +854,6 @@ export class KeyManager {
     return Uint8Array.from(Buffer.from(publicKey.serialize(), 'hex'));
   }
 
-  private getViewKeyBytes(viewKey: ViewKeyType): Uint8Array {
-    // Get bytes from ViewKey
-    return Uint8Array.from(Buffer.from(viewKey.serialize(), 'hex'));
-  }
 
   private createScalarFromBytes(_bytes: Uint8Array): ScalarType {
     // Create Scalar from bytes
@@ -899,13 +893,6 @@ export class KeyManager {
       .join('');
   }
 
-  private hexToBytes(hex: string): Uint8Array {
-    const bytes = new Uint8Array(hex.length / 2);
-    for (let i = 0; i < hex.length; i += 2) {
-      bytes[i / 2] = parseInt(hex.substr(i, 2), 16);
-    }
-    return bytes;
-  }
 
   /**
    * Get the private spending key
@@ -1161,7 +1148,7 @@ export class KeyManager {
    * @param script - The script
    * @returns True if the script belongs to this wallet
    */
-  isMineByScript(script: Uint8Array): boolean {
+  isMineByScript(_script: Uint8Array): boolean {
     // This checks watch-only scripts
     // For in-memory KeyManager, we don't have watch-only support yet
     // Return false for now
@@ -1634,7 +1621,7 @@ export class KeyManager {
    * Replicates AddInactiveHDChain from keyman.cpp
    * @param chain - The HD chain to add
    */
-  addInactiveHDChain(chain: HDChain): void {
+  addInactiveHDChain(_chain: HDChain): void {
     // For in-memory KeyManager, we only support one active chain
     // This would be used in database wallet for tracking inactive chains
     // Not implemented for in-memory version
@@ -1657,8 +1644,8 @@ export class KeyManager {
    * @returns True if successful
    */
   extractSpendingKeyFromScript(
-    script: Uint8Array,
-    spendingKey: { value: PublicKeyType | null }
+    _script: Uint8Array,
+    _spendingKey: { value: PublicKeyType | null }
   ): boolean {
     // This extracts spending key from OP_BLSCHECKSIG script
     // For now, return false - needs script parsing implementation
@@ -1673,7 +1660,7 @@ export class KeyManager {
   /**
    * Check if public key is zero
    */
-  private isPublicKeyZero(publicKey: PublicKeyType): boolean {
+  private isPublicKeyZero(_publicKey: PublicKeyType): boolean {
     // Check if public key is zero/identity
     // This needs navio-blsct API - for now, return false
     // TODO: Implement when navio-blsct provides IsZero() method

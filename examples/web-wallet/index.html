@@ -1,0 +1,119 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Navio Web Wallet</title>
+  <link rel="stylesheet" href="/src/styles.css" />
+</head>
+<body>
+  <div id="app">
+    <header>
+      <h1>⚓ Navio Web Wallet</h1>
+      <p class="subtitle">Basic example using navio-sdk</p>
+    </header>
+
+    <main>
+      <!-- Wallet Setup Section -->
+      <section id="setup-section" class="card">
+        <h2>Wallet Setup</h2>
+        <div class="form-group">
+          <label for="network">Network:</label>
+          <select id="network">
+            <option value="testnet">Testnet</option>
+            <option value="mainnet">Mainnet</option>
+          </select>
+        </div>
+        <div class="form-group">
+          <label for="electrum-host">Electrum Host:</label>
+          <input type="text" id="electrum-host" value="localhost" />
+        </div>
+        <div class="form-group">
+          <label for="electrum-port">Electrum Port:</label>
+          <input type="number" id="electrum-port" value="50001" />
+        </div>
+        <div class="button-group">
+          <button id="create-wallet-btn" class="btn primary">Create New Wallet</button>
+          <button id="restore-wallet-btn" class="btn secondary">Restore from Seed</button>
+        </div>
+      </section>
+
+      <!-- Restore Section (hidden by default) -->
+      <section id="restore-section" class="card hidden">
+        <h2>Restore Wallet</h2>
+        <div class="form-group">
+          <label for="seed-input">Seed (hex):</label>
+          <textarea id="seed-input" rows="3" placeholder="Enter your seed hex..."></textarea>
+        </div>
+        <div class="form-group">
+          <label for="restore-height">Restore from height (optional):</label>
+          <input type="number" id="restore-height" placeholder="0" />
+        </div>
+        <div class="button-group">
+          <button id="confirm-restore-btn" class="btn primary">Restore</button>
+          <button id="cancel-restore-btn" class="btn secondary">Cancel</button>
+        </div>
+      </section>
+
+      <!-- Wallet Info Section (hidden by default) -->
+      <section id="wallet-section" class="card hidden">
+        <h2>Wallet Info</h2>
+        <div class="info-grid">
+          <div class="info-item">
+            <span class="label">Status:</span>
+            <span id="wallet-status" class="value">Disconnected</span>
+          </div>
+          <div class="info-item">
+            <span class="label">Network:</span>
+            <span id="wallet-network" class="value">-</span>
+          </div>
+          <div class="info-item">
+            <span class="label">Synced Height:</span>
+            <span id="wallet-height" class="value">-</span>
+          </div>
+          <div class="info-item">
+            <span class="label">Balance:</span>
+            <span id="wallet-balance" class="value highlight">0.00000000 NAV</span>
+          </div>
+        </div>
+        
+        <div class="wallet-address">
+          <label>Receive Address:</label>
+          <code id="receive-address">-</code>
+        </div>
+
+        <div class="seed-display">
+          <label>Seed (save this!):</label>
+          <code id="wallet-seed" class="seed">-</code>
+        </div>
+
+        <div class="button-group">
+          <button id="sync-btn" class="btn primary">Start Sync</button>
+          <button id="stop-sync-btn" class="btn secondary" disabled>Stop Sync</button>
+          <button id="disconnect-btn" class="btn danger">Disconnect</button>
+        </div>
+      </section>
+
+      <!-- UTXOs Section (hidden by default) -->
+      <section id="utxos-section" class="card hidden">
+        <h2>Unspent Outputs</h2>
+        <div id="utxos-list" class="utxos-list">
+          <p class="empty">No unspent outputs</p>
+        </div>
+      </section>
+
+      <!-- Log Section -->
+      <section id="log-section" class="card">
+        <h2>Activity Log</h2>
+        <div id="log" class="log"></div>
+      </section>
+    </main>
+
+    <footer>
+      <p>Navio SDK Web Wallet Example</p>
+    </footer>
+  </div>
+
+  <script type="module" src="/src/main.ts"></script>
+</body>
+</html>

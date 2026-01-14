@@ -89,9 +89,10 @@ export class WalletDB {
    * @param dbPath - Path to the database file (or name for in-memory)
    * @param createIfNotExists - Create database if it doesn't exist
    */
-  constructor(dbPath: string = ':memory:', createIfNotExists = true) {
+  constructor(dbPath: string = ':memory:', _createIfNotExists = true) {
     this.dbPath = dbPath;
     // Database will be opened when loadWallet, createWallet, or restoreWallet is called
+    // Note: _createIfNotExists reserved for future use
   }
 
   /**
@@ -436,7 +437,7 @@ export class WalletDB {
     // Load sub-address counters
     const counterResult = this.db.exec('SELECT * FROM sub_address_counter');
     if (counterResult.length > 0) {
-      for (const row of counterResult[0].values) {
+      for (const _row of counterResult[0].values) {
         // This would need to be stored in KeyManager
         // For now, we'll rely on the sub-addresses to reconstruct counters
       }
@@ -760,10 +761,6 @@ export class WalletDB {
   // ============================================================================
   // Serialization helpers
   // ============================================================================
-
-  private serializeScalar(scalar: any): string {
-    return scalar.serialize();
-  }
 
   private deserializeScalar(hex: string): any {
     const { Scalar } = require('navio-blsct');
