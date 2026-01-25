@@ -1,0 +1,31 @@
+name: Deploy Documentation
+
+on:
+  push:
+    branches:
+      - main  # Adjust to your default branch
+
+jobs:
+  build-and-deploy-docs:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+
+    - name: Set up Node.js
+      uses: actions/setup-node@v3
+      with:
+        node-version: '16'  # Match your project's Node.js version
+
+    - name: Install dependencies
+      run: npm install
+
+    - name: Generate docs
+      run: npm run docs:html  # Adjust if you want to use another docs script
+
+    - name: Deploy to GitHub Pages
+      uses: peaceiris/actions-gh-pages@v4
+      with:
+        github_token: ${{ secrets.GITHUB_TOKEN }}
+        publish_dir: ./docs  # Replace this with the actual output directory of Typedoc
