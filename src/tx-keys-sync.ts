@@ -13,6 +13,8 @@ import { ElectrumClient } from './electrum';
 import { WalletDB } from './wallet-db';
 import { KeyManager } from './key-manager';
 import type { BlockTransactionKeys, TransactionKeys } from './electrum';
+import * as blsctModule from 'navio-blsct';
+import { sha256 } from '@noble/hashes/sha256';
 
 /**
  * Sync state stored in database
@@ -155,7 +157,6 @@ export class TransactionKeysSync {
       getChainTip: async () => {
         const height = await client.getChainTipHeight();
         const header = await client.getBlockHeader(height);
-        const { sha256 } = require('@noble/hashes/sha256');
         const hash = Buffer.from(sha256(sha256(Buffer.from(header, 'hex')))).reverse().toString('hex');
         return { height, hash };
       },
@@ -199,13 +200,16 @@ export class TransactionKeysSync {
    * Loads sync state from database
    */
   async initialize(): Promise<void> {
-    // Ensure database is initialized
-    // Try to load wallet (will initialize DB if needed)
-    try {
-      this.keyManager = await this.walletDB.loadWallet();
-    } catch {
-      // If wallet doesn't exist, create it
-      this.keyManager = await this.walletDB.createWallet();
+    // Only load/create wallet if keyManager wasn't already set via setKeyManager()
+    if (!this.keyManager) {
+      // Ensure database is initialized
+      // Try to load wallet (will initialize DB if needed)
+      try {
+        this.keyManager = await this.walletDB.loadWallet();
+      } catch {
+        // If wallet doesn't exist, create it
+        this.keyManager = await this.walletDB.createWallet();
+      }
     }
 
     // Load sync state from database
@@ -699,7 +703,7 @@ export class TransactionKeysSync {
       }
 
       // Convert keys to PublicKey format if needed (they might be hex strings or serialized)
-      const { PublicKey } = require('navio-blsct');
+      const PublicKey = blsctModule.PublicKey;
       let blindingKeyObj: any = PublicKey.deserialize(blindingKey);
       let spendingKeyObj: any = PublicKey.deserialize(spendingKey);
 
@@ -711,7 +715,8 @@ export class TransactionKeysSync {
           const outputHex = await this.syncProvider.getTransactionOutput(outputHash);
 
           // Recover the amount from the range proof
-          const { RangeProof, AmountRecoveryReq } = require('navio-blsct');
+          const RangeProof = blsctModule.RangeProof;
+          const AmountRecoveryReq = blsctModule.AmountRecoveryReq;
           
           // Parse the output to get the range proof
           // The output format from Electrum/P2P is a CTxOut serialization
@@ -938,7 +943,6 @@ export class TransactionKeysSync {
    */
   private extractBlockHash(headerHex: string): string {
     // Block hash is double SHA256 of header, reversed for display
-    const { sha256 } = require('@noble/hashes/sha256');
     const headerBytes = Buffer.from(headerHex, 'hex');
     const hash = sha256(sha256(headerBytes));
     return Buffer.from(hash).reverse().toString('hex');

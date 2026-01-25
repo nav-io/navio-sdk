@@ -7,6 +7,13 @@
  * The library initialization may take a moment on first load.
  */
 
+// Polyfill Buffer for browser environment
+import { Buffer } from 'buffer';
+(window as any).Buffer = Buffer;
+
+// WASM asset URL (bundled by Vite) - used for locateFile
+import blsctWasmUrl from 'navio-blsct/wasm/blsct.wasm?url';
+
 // Type definitions for the UI elements
 interface WalletState {
   initialized: boolean;
@@ -59,6 +66,11 @@ const elements = {
 
 // Logging helper
 function log(message: string, type: 'info' | 'success' | 'warning' | 'error' = 'info') {
+  console.log('[log]', message, type);
+  if (!elements.log) {
+    console.error('Log element not found!');
+    return;
+  }
   const entry = document.createElement('div');
   entry.className = `log-entry ${type}`;
   const time = new Date().toLocaleTimeString();
@@ -75,9 +87,97 @@ function log(message: string, type: 'info' | 'success' | 'warning' | 'error' = '
 let NavioClient: any = null;
 let client: any = null;
 
+// WASM JS URL for script tag loading
+import blsctJsUrl from 'navio-blsct/wasm/blsct.js?url';
+
+/**
+ * Load the BlsctModule factory via script tag
+ * This is more reliable than dynamic import for CommonJS WASM modules
+ */
+async function loadBlsctFactory(): Promise<any> {
+  return new Promise((resolve, reject) => {
+    // Check if already loaded
+    if (typeof (window as any).BlsctModule === 'function') {
+      resolve((window as any).BlsctModule);
+      return;
+    }
+
+    const script = document.createElement('script');
+    script.src = blsctJsUrl;
+    script.onload = () => {
+      if (typeof (window as any).BlsctModule === 'function') {
+        resolve((window as any).BlsctModule);
+      } else {
+        reject(new Error('BlsctModule not found after script load'));
+      }
+    };
+    script.onerror = () => reject(new Error('Failed to load WASM script'));
+    document.head.appendChild(script);
+  });
+}
+
 async function loadSDK() {
   try {
     log('Loading navio-sdk...');
+    
+    // Step 1: Load the BlsctModule factory via script tag
+    // This is more reliable than dynamic import for CommonJS WASM modules
+    log('Loading WASM factory via script tag...');
+    await loadBlsctFactory();
+    console.log('BlsctModule factory set globally');
+    
+    // Step 2: Load navio-blsct - it will use the global BlsctModule factory
+    log('Loading navio-blsct...');
+    const blsct: any = await import('navio-blsct');
+    console.log('navio-blsct imported');
+    
+    // Load the module through the library's loader
+    log('Initializing WASM module...');
+    const wasmModule = await blsct.loadBlsctModule({
+      locateFile: (path: string) => {
+        if (path.endsWith('.wasm')) {
+          console.log('locateFile:', path, '->', blsctWasmUrl);
+          return blsctWasmUrl;
+        }
+        return path;
+      },
+    });
+    console.log('blsct.isModuleLoaded:', blsct.isModuleLoaded?.());
+    
+    // Ensure cryptoGetRandomValues is set on the module
+    // This is required for MCL's web crypto API (MCL_USE_WEB_CRYPTO_API)
+    if (!wasmModule.cryptoGetRandomValues && typeof crypto !== 'undefined' && crypto.getRandomValues) {
+      console.log('Adding cryptoGetRandomValues to WASM module');
+      wasmModule.cryptoGetRandomValues = (bufPtr: number, byteSize: number) => {
+        const buffer = wasmModule.HEAPU8.subarray(bufPtr, bufPtr + byteSize);
+        crypto.getRandomValues(buffer);
+      };
+    }
+    log('WASM module loaded', 'success');
+    
+    // Step 3: Verify with their Scalar class
+    log('Testing navio-blsct Scalar class...');
+    try {
+      const testScalar = new blsct.Scalar();
+      console.log('Scalar created:', testScalar);
+      console.log('Scalar serialize:', testScalar.serialize());
+      log('Scalar class works', 'success');
+    } catch (e) {
+      console.error('Scalar creation failed:', e);
+      console.error('Error type:', typeof e);
+      if (typeof e === 'number') {
+        console.log('This is a WASM exception pointer:', e);
+        // This error indicates the MCL/BLS library inside the WASM module
+        // didn't initialize correctly. This is a bug in the navio-blsct WASM build.
+        log('WASM crypto initialization failed. The navio-blsct WASM module needs to be rebuilt.', 'error');
+        throw new Error('WASM crypto library initialization failed (exception pointer: ' + e + '). ' +
+          'This is a bug in the navio-blsct package - the MCL/BLS library is not properly initialized. ' +
+          'Please rebuild navio-blsct or use a published version.');
+      }
+      throw new Error(`Scalar test failed: ${e}`);
+    }
+    
+    // Step 4: Load the SDK
     const sdk = await import('navio-sdk');
     NavioClient = sdk.NavioClient;
     log('SDK loaded successfully', 'success');
@@ -111,7 +211,7 @@ async function createWallet() {
         port: config.electrumPort,
         ssl: false,
       },
-      dbPath: ':memory:', // In-memory for web demo
+      walletDbPath: ':memory:', // In-memory for web demo
       createWalletIfNotExists: true,
     });
 
@@ -124,9 +224,10 @@ async function createWallet() {
     state.seed = seedKey ? seedKey.serialize() : null;
 
     showWalletUI();
-  } catch (error) {
+  } catch (error: any) {
+    console.error('Wallet creation error:', error);
+    console.error('Stack trace:', error?.stack);
     log(`Failed to create wallet: ${error}`, 'error');
-    console.error(error);
   }
 }
 
@@ -154,8 +255,8 @@ async function restoreWallet() {
         port: config.electrumPort,
         ssl: false,
       },
-      dbPath: ':memory:',
-      seed: seed,
+      walletDbPath: ':memory:',
+      restoreFromSeed: seed,
       restoreFromHeight: restoreHeight,
     });
 
@@ -200,8 +301,9 @@ async function updateWalletInfo() {
     elements.walletStatus.textContent = client.isConnected() ? 'Connected' : 'Disconnected';
     elements.walletHeight.textContent = client.getLastSyncedHeight().toString();
 
-    // Balance
-    const balanceNav = client.getBalanceNav();
+    // Balance - convert from satoshis (bigint) to NAV with 8 decimal places
+    const balanceSats = client.getBalanceNav();
+    const balanceNav = Number(balanceSats) / 1e8;
     elements.walletBalance.textContent = `${balanceNav.toFixed(8)} NAV`;
 
     // Seed
@@ -342,11 +444,14 @@ elements.disconnectBtn.addEventListener('click', disconnect);
 
 // Initialize
 async function init() {
+  console.log('init() called');
   log('Initializing web wallet...');
   const loaded = await loadSDK();
+  console.log('loadSDK result:', loaded);
   if (loaded) {
     log('Ready. Create a new wallet or restore from seed.', 'success');
   }
 }
 
+console.log('main.ts module executing...');
 init();

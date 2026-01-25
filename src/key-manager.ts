@@ -7,8 +7,8 @@
 
 import { sha256 } from '@noble/hashes/sha256';
 import { ripemd160 } from '@noble/hashes/ripemd160';
-// Import runtime values using require (for CommonJS compatibility)
-const blsctModule = require('navio-blsct');
+// Import from navio-blsct using ESM
+import * as blsctModule from 'navio-blsct';
 const Scalar = blsctModule.Scalar;
 const ChildKey = blsctModule.ChildKey;
 const ViewKey = blsctModule.ViewKey;
@@ -468,7 +468,7 @@ export class KeyManager {
     const result = calcNonce(blindingKey.value(), this.viewKey.value());
     
     // Wrap result in Point object
-    const { Point } = require('navio-blsct');
+    const Point = blsctModule.Point;
     return new Point(result);
   }
 

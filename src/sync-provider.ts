@@ -6,6 +6,7 @@
  */
 
 import type { BlockTransactionKeys, TransactionKeys } from './electrum';
+import { sha256 } from '@noble/hashes/sha256';
 
 /**
  * Block header information (for sync provider)
@@ -188,7 +189,6 @@ export abstract class BaseSyncProvider implements SyncProvider {
    * Block hash is double SHA256 of header, reversed for display
    */
   protected extractBlockHash(headerHex: string): string {
-    const { sha256 } = require('@noble/hashes/sha256');
     const headerBytes = Buffer.from(headerHex, 'hex');
     const hash = sha256(sha256(headerBytes));
     return Buffer.from(hash).reverse().toString('hex');

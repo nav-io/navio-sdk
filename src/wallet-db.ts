@@ -8,6 +8,7 @@
 
 import { KeyManager } from './key-manager';
 import type { HDChain, SubAddressIdentifier } from './key-manager.types';
+import * as blsctModule from 'navio-blsct';
 
 /**
  * Wallet output structure returned by getUnspentOutputs and getAllOutputs
@@ -45,7 +46,16 @@ async function loadSQL(): Promise<any> {
       const sqlJs = await import('sql.js');
       initSqlJs = sqlJs.default;
       SQL = await initSqlJs({
-        locateFile: (file: string) => `https://sql.js.org/dist/${file}`,
+        // Prefer explicit override, otherwise use CDN to avoid requiring a local wasm file
+        locateFile: (file: string) => {
+          if (file === 'sql-wasm.wasm') {
+            const override = (globalThis as any).NAVIO_SQL_WASM_URL;
+            if (typeof override === 'string' && override.length > 0) {
+              return override;
+            }
+          }
+          return `https://sql.js.org/dist/${file}`;
+        },
       });
     } else {
       // Node.js environment
@@ -763,7 +773,7 @@ export class WalletDB {
   // ============================================================================
 
   private deserializeScalar(hex: string): any {
-    const { Scalar } = require('navio-blsct');
+    const Scalar = blsctModule.Scalar;
     return Scalar.deserialize(hex);
   }
 
@@ -772,30 +782,9 @@ export class WalletDB {
   }
 
   private deserializeViewKey(hex: string): any {
-    const blsctModule = require('navio-blsct');
-    const ViewKey = blsctModule.ViewKey;
     const Scalar = blsctModule.Scalar;
     
-    if (!ViewKey) {
-      // Fallback: ViewKey might not be exported, return Scalar
-      // loadViewKey will convert it to Scalar internally anyway
-      return Scalar.deserialize(hex);
-    }
-    
-    // Try to deserialize as ViewKey first
-    if (ViewKey.deserialize) {
-      return ViewKey.deserialize(hex);
-    }
-    
-    // If ViewKey doesn't have deserialize, try creating from Scalar
-    // ViewKey might be constructible from Scalar or have a fromScalar method
-    const scalar = Scalar.deserialize(hex);
-    if (ViewKey.fromScalar) {
-      return ViewKey.fromScalar(scalar);
-    }
-    
-    // Last resort: return Scalar (loadViewKey converts ViewKey to Scalar anyway)
-    return scalar;
+    return Scalar.deserialize(hex);
   }
 
   private serializePublicKey(publicKey: any): string {
@@ -803,12 +792,13 @@ export class WalletDB {
   }
 
   private deserializePublicKey(hex: string): any {
-    const { PublicKey } = require('navio-blsct');
+    const PublicKey = blsctModule.PublicKey;
     return PublicKey.deserialize(hex);
   }
 
   private getPublicKeyFromViewKey(viewKey: any): any {
-    const { Scalar, PublicKey } = require('navio-blsct');
+    const Scalar = blsctModule.Scalar;
+    const PublicKey = blsctModule.PublicKey;
     const scalar = Scalar.deserialize(viewKey.serialize());
     return PublicKey.fromScalar(scalar);
   }

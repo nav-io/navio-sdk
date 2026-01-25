@@ -7,19 +7,56 @@
  * Based on electrumx server implementation and Navio-specific extensions
  */
 
+import { sha256 } from '@noble/hashes/sha256';
+import { ripemd160 } from '@noble/hashes/ripemd160';
+
 // Import WebSocket - use native WebSocket in browser, ws in Node.js
 let WebSocketClass: any;
+let isBrowserWebSocket = false;
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 if (typeof (globalThis as any).window !== 'undefined' && (globalThis as any).window?.WebSocket) {
   // Browser environment - use native WebSocket
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   WebSocketClass = (globalThis as any).window.WebSocket;
+  isBrowserWebSocket = true;
 } else {
   // Node.js environment - use ws library
   try {
     WebSocketClass = require('ws');
   } catch (error) {
     throw new Error('WebSocket not available. In Node.js, install ws: npm install ws');
+  }
+}
+
+/**
+ * Helper to attach WebSocket event handlers that works with both
+ * Node.js ws library (.on()) and browser WebSocket (.onX / addEventListener)
+ */
+function attachWebSocketHandler(
+  ws: any,
+  event: 'open' | 'message' | 'error' | 'close',
+  handler: (data?: any) => void
+): void {
+  if (isBrowserWebSocket) {
+    // Browser WebSocket uses onX properties or addEventListener
+    switch (event) {
+      case 'open':
+        ws.onopen = handler;
+        break;
+      case 'message':
+        // Browser WebSocket passes MessageEvent, extract data
+        ws.onmessage = (evt: MessageEvent) => handler(evt.data);
+        break;
+      case 'error':
+        ws.onerror = () => handler(new Error('WebSocket error'));
+        break;
+      case 'close':
+        ws.onclose = handler;
+        break;
+    }
+  } else {
+    // Node.js ws library uses .on()
+    ws.on(event, handler);
   }
 }
 
@@ -154,7 +191,7 @@ export class ElectrumClient {
       try {
         this.ws = new WebSocketClass(url);
 
-        this.ws.on('open', async () => {
+        attachWebSocketHandler(this.ws, 'open', async () => {
           this.connected = true;
           this.reconnectAttempts = 0;
 
@@ -167,23 +204,25 @@ export class ElectrumClient {
           }
         });
 
-        this.ws.on('message', (data: Buffer) => {
+        attachWebSocketHandler(this.ws, 'message', (data: Buffer | string) => {
           try {
-            const response = JSON.parse(data.toString());
+            // Handle both Buffer (Node.js) and string (browser) data
+            const dataStr = typeof data === 'string' ? data : data.toString();
+            const response = JSON.parse(dataStr);
             this.handleResponse(response);
           } catch (error) {
             console.error('Error parsing response:', error);
           }
         });
 
-        this.ws.on('error', (error: Error) => {
+        attachWebSocketHandler(this.ws, 'error', (error: Error) => {
           this.connected = false;
           if (this.reconnectAttempts === 0) {
             reject(error);
           }
         });
 
-        this.ws.on('close', () => {
+        attachWebSocketHandler(this.ws, 'close', () => {
           this.connected = false;
           this.ws = null;
           // Clear pending requests
@@ -329,8 +368,15 @@ export class ElectrumClient {
    * @returns Current chain tip height
    */
   async getChainTipHeight(): Promise<number> {
-    const header = await this.call('blockchain.headers.subscribe');
-    return header.height;
+    const response = await this.call('blockchain.headers.subscribe');
+    // Handle both formats: { height, hex } or just the height number
+    if (typeof response === 'number') {
+      return response;
+    }
+    if (response && typeof response.height === 'number') {
+      return response.height;
+    }
+    throw new Error(`Unexpected blockchain.headers.subscribe response: ${JSON.stringify(response)}`);
   }
 
   // ============================================================================
@@ -525,7 +571,6 @@ export class ElectrumClient {
   static calculateScriptHash(address: string): string {
     // This is a placeholder - actual implementation depends on address format
     // For Navio, this would need to handle BLS CT addresses
-    const { sha256, ripemd160 } = require('@noble/hashes');
     const hash = ripemd160(sha256(Buffer.from(address, 'utf-8')));
     // Reverse for Electrum protocol
     return Buffer.from(hash).reverse().toString('hex');

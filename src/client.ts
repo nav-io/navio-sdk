@@ -18,6 +18,7 @@ import { P2PSyncProvider } from './p2p-sync';
 import { P2PConnectionOptions } from './p2p-protocol';
 import { ElectrumSyncProvider } from './electrum-sync';
 import { BlsctChain, setChain } from 'navio-blsct';
+import { sha256 } from '@noble/hashes/sha256';
 
 /**
  * Network type for Navio
@@ -612,7 +613,6 @@ export class NavioClient {
    * Hash a block header to get block hash
    */
   private hashBlockHeader(headerHex: string): string {
-    const { sha256 } = require('@noble/hashes/sha256');
     const headerBytes = Buffer.from(headerHex, 'hex');
     const hash = sha256(sha256(headerBytes));
     return Buffer.from(hash).reverse().toString('hex');
