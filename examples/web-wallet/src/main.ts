@@ -19,12 +19,14 @@ interface WalletState {
   initialized: boolean;
   syncing: boolean;
   seed: string | null;
+  mnemonic: string | null;
 }
 
 const state: WalletState = {
   initialized: false,
   syncing: false,
   seed: null,
+  mnemonic: null,
 };
 
 // UI Elements
@@ -86,6 +88,7 @@ function log(message: string, type: 'info' | 'success' | 'warning' | 'error' = '
 // Dynamic import for navio-sdk (ESM)
 let NavioClient: any = null;
 let client: any = null;
+let blsctLib: any = null; // Reference to navio-blsct for address encoding
 
 // WASM JS URL for script tag loading
 import blsctJsUrl from 'navio-blsct/wasm/blsct.js?url';
@@ -177,6 +180,9 @@ async function loadSDK() {
       throw new Error(`Scalar test failed: ${e}`);
     }
     
+    // Store blsct reference for address encoding
+    blsctLib = blsct;
+    
     // Step 4: Load the SDK
     const sdk = await import('navio-sdk');
     NavioClient = sdk.NavioClient;
@@ -197,7 +203,16 @@ function getConfig() {
   };
 }
 
+let isCreatingWallet = false;
+
 async function createWallet() {
+  // Prevent multiple simultaneous wallet creations
+  if (isCreatingWallet) {
+    log('Wallet creation already in progress...', 'warning');
+    return;
+  }
+  isCreatingWallet = true;
+
   log('Creating new wallet...');
 
   const config = getConfig();
@@ -218,23 +233,25 @@ async function createWallet() {
     await client.initialize();
     log('Wallet created', 'success');
 
-    // Get the seed
+    // Get the seed and mnemonic
     const keyManager = client.getKeyManager();
-    const seedKey = keyManager.getMasterSeedKey();
-    state.seed = seedKey ? seedKey.serialize() : null;
+    state.seed = keyManager.getMasterSeedHex();
+    state.mnemonic = keyManager.getMnemonic();
 
     showWalletUI();
   } catch (error: any) {
     console.error('Wallet creation error:', error);
     console.error('Stack trace:', error?.stack);
     log(`Failed to create wallet: ${error}`, 'error');
+  } finally {
+    isCreatingWallet = false;
   }
 }
 
 async function restoreWallet() {
-  const seed = elements.seedInput.value.trim();
-  if (!seed) {
-    log('Please enter a seed', 'warning');
+  const input = elements.seedInput.value.trim();
+  if (!input) {
+    log('Please enter a seed or mnemonic', 'warning');
     return;
   }
 
@@ -242,12 +259,15 @@ async function restoreWallet() {
     ? parseInt(elements.restoreHeight.value, 10)
     : undefined;
 
-  log(`Restoring wallet from seed (height: ${restoreHeight || 'genesis'})...`);
+  // Detect if input is mnemonic (contains spaces) or hex seed
+  const isMnemonic = input.includes(' ');
+  
+  log(`Restoring wallet from ${isMnemonic ? 'mnemonic' : 'seed'} (height: ${restoreHeight || 'genesis'})...`);
 
   const config = getConfig();
 
   try {
-    client = new NavioClient({
+    const clientConfig: any = {
       network: config.network,
       backend: 'electrum',
       electrum: {
@@ -256,14 +276,25 @@ async function restoreWallet() {
         ssl: false,
       },
       walletDbPath: ':memory:',
-      restoreFromSeed: seed,
       restoreFromHeight: restoreHeight,
-    });
+    };
+
+    if (isMnemonic) {
+      clientConfig.restoreFromMnemonic = input;
+    } else {
+      clientConfig.restoreFromSeed = input;
+    }
+
+    client = new NavioClient(clientConfig);
 
     await client.initialize();
     log('Wallet restored', 'success');
 
-    state.seed = seed;
+    // Get the mnemonic from the restored wallet
+    const keyManager = client.getKeyManager();
+    state.seed = keyManager.getMasterSeedHex();
+    state.mnemonic = keyManager.getMnemonic();
+
     showWalletUI();
     hideRestoreUI();
   } catch (error) {
@@ -306,17 +337,24 @@ async function updateWalletInfo() {
     const balanceNav = Number(balanceSats) / 1e8;
     elements.walletBalance.textContent = `${balanceNav.toFixed(8)} NAV`;
 
-    // Seed
-    if (state.seed) {
+    // Mnemonic/Seed
+    if (state.mnemonic) {
+      elements.walletSeed.textContent = state.mnemonic;
+    } else if (state.seed) {
       elements.walletSeed.textContent = state.seed;
     }
 
-    // Receive address (using double public key as placeholder)
+    // Receive address (bech32m encoded)
     const keyManager = client.getKeyManager();
     if (keyManager) {
-      const dpk = keyManager.getDoublePublicKey();
-      if (dpk) {
-        elements.receiveAddress.textContent = dpk.getAddress(config.network);
+      try {
+        // Get bech32m encoded address using the KeyManager method
+        const network = config.network as 'mainnet' | 'testnet';
+        const address = keyManager.getSubAddressBech32m({ account: 0, address: 0 }, network);
+        elements.receiveAddress.textContent = address;
+      } catch (addrError) {
+        console.error('Error encoding address:', addrError);
+        elements.receiveAddress.textContent = 'Error encoding address';
       }
     }
 
@@ -425,6 +463,7 @@ async function disconnect() {
   client = null;
   state.initialized = false;
   state.seed = null;
+  state.mnemonic = null;
 
   elements.setupSection.classList.remove('hidden');
   elements.walletSection.classList.add('hidden');

@@ -10,7 +10,7 @@
         "preview": "vite preview"
     },
     "dependencies": {
-        "navio-blsct": "file:../../../libblsct-bindings/ffi/ts",
+        "navio-blsct": "^1.1.2",
         "navio-sdk": "file:../.."
     },
     "devDependencies": {

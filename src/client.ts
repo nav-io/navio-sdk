@@ -71,8 +71,11 @@ export interface NavioClientConfig {
   /** Restore wallet from seed (hex string) */
   restoreFromSeed?: string;
 
+  /** Restore wallet from mnemonic phrase (24 words) */
+  restoreFromMnemonic?: string;
+
   /**
-   * Block height to start scanning from when restoring a wallet from seed.
+   * Block height to start scanning from when restoring a wallet from seed or mnemonic.
    * This is the height when the wallet was originally created.
    * Setting this avoids scanning blocks before the wallet existed.
    *
@@ -236,6 +239,18 @@ export class NavioClient {
       // Restore from seed with user-provided height (or 0 to scan from genesis)
       this.keyManager = await this.walletDB.restoreWallet(
         this.config.restoreFromSeed,
+        this.config.restoreFromHeight
+      );
+
+      // Set KeyManager for sync manager (enables output detection)
+      this.syncManager.setKeyManager(this.keyManager);
+
+      // Connect to backend
+      await this.syncProvider.connect();
+    } else if (this.config.restoreFromMnemonic) {
+      // Restore from mnemonic with user-provided height (or 0 to scan from genesis)
+      this.keyManager = await this.walletDB.restoreWalletFromMnemonic(
+        this.config.restoreFromMnemonic,
         this.config.restoreFromHeight
       );
 

@@ -7,25 +7,37 @@
 
 import { sha256 } from '@noble/hashes/sha256';
 import { ripemd160 } from '@noble/hashes/ripemd160';
+import * as bip39 from '@scure/bip39';
+import { wordlist as englishWordlist } from '@scure/bip39/wordlists/english.js';
 // Import from navio-blsct using ESM
 import * as blsctModule from 'navio-blsct';
 const Scalar = blsctModule.Scalar;
 const ChildKey = blsctModule.ChildKey;
-const ViewKey = blsctModule.ViewKey;
 const PublicKey = blsctModule.PublicKey;
 const SubAddr = blsctModule.SubAddr;
 const SubAddrId = blsctModule.SubAddrId;
 const DoublePublicKey = blsctModule.DoublePublicKey;
+// Address encoding
+const Address = blsctModule.Address;
+const AddressEncoding = blsctModule.AddressEncoding;
+const setChain = blsctModule.setChain;
+const BlsctChain = blsctModule.BlsctChain;
 // Helper functions and classes
 const calcPrivSpendingKey = blsctModule.calcPrivSpendingKey;
 const recoverAmount = blsctModule.recoverAmount;
 const ViewTag = blsctModule.ViewTag;
 const HashId = blsctModule.HashId;
 const calcNonce = blsctModule.calcNonce;
+// Amount recovery helpers
+const getAmountRecoveryResultSize = blsctModule.getAmountRecoveryResultSize;
+const getAmountRecoveryResultIsSucc = blsctModule.getAmountRecoveryResultIsSucc;
+const getAmountRecoveryResultAmount = blsctModule.getAmountRecoveryResultAmount;
+const deleteAmountsRetVal = blsctModule.deleteAmountsRetVal;
 
 // Derive types from runtime values using typeof
 type ScalarType = InstanceType<typeof Scalar>;
-type ViewKeyType = InstanceType<typeof ViewKey>;
+// ViewKey is just a Scalar (derived via txKey.toViewKey())
+type ViewKeyType = ScalarType;
 type PublicKeyType = InstanceType<typeof PublicKey>;
 type SubAddrType = InstanceType<typeof SubAddr>;
 
@@ -238,6 +250,131 @@ export class KeyManager {
     return this.masterSeed;
   }
 
+  // ============================================================
+  // Mnemonic Support (BIP39)
+  // ============================================================
+
+  /**
+   * Generate a new random mnemonic phrase (24 words)
+   * @param strength - Entropy strength in bits (128=12 words, 160=15 words, 192=18 words, 224=21 words, 256=24 words)
+   * @returns A BIP39 mnemonic phrase
+   */
+  static generateMnemonic(strength: 128 | 160 | 192 | 224 | 256 = 256): string {
+    return bip39.generateMnemonic(englishWordlist, strength);
+  }
+
+  /**
+   * Validate a mnemonic phrase
+   * @param mnemonic - The mnemonic phrase to validate
+   * @returns True if the mnemonic is valid
+   */
+  static validateMnemonic(mnemonic: string): boolean {
+    return bip39.validateMnemonic(mnemonic, englishWordlist);
+  }
+
+  /**
+   * Convert a mnemonic phrase to seed bytes
+   * Uses BIP39 standard derivation with optional passphrase
+   * @param mnemonic - The mnemonic phrase
+   * @param passphrase - Optional passphrase for additional security
+   * @returns 64-byte seed derived from mnemonic
+   */
+  static mnemonicToSeedBytes(mnemonic: string, passphrase = ''): Uint8Array {
+    if (!KeyManager.validateMnemonic(mnemonic)) {
+      throw new Error('Invalid mnemonic phrase');
+    }
+    // BIP39 derives a 64-byte seed from mnemonic
+    return bip39.mnemonicToSeedSync(mnemonic, passphrase);
+  }
+
+  /**
+   * Convert a seed (Scalar) to a mnemonic phrase
+   * Note: This converts the 32-byte scalar to mnemonic using it as entropy
+   * @param seed - The seed Scalar
+   * @returns A 24-word mnemonic phrase
+   */
+  static seedToMnemonic(seed: ScalarType): string {
+    // Get the 32-byte seed value as entropy
+    // Pad to 64 hex chars (32 bytes) in case leading zeros are stripped
+    const seedHex = seed.serialize().padStart(64, '0');
+    const seedBytes = Buffer.from(seedHex, 'hex');
+    
+    if (seedBytes.length !== 32) {
+      throw new Error(`Invalid seed length: ${seedBytes.length}, expected 32 bytes`);
+    }
+    
+    // Convert entropy to mnemonic (32 bytes = 256 bits = 24 words)
+    return bip39.entropyToMnemonic(seedBytes, englishWordlist);
+  }
+
+  /**
+   * Convert a mnemonic phrase to a Scalar seed
+   * For direct entropy-based conversion (mnemonic as entropy, not BIP39 derivation)
+   * @param mnemonic - The mnemonic phrase
+   * @returns A Scalar seed
+   */
+  static mnemonicToScalar(mnemonic: string): ScalarType {
+    if (!KeyManager.validateMnemonic(mnemonic)) {
+      throw new Error('Invalid mnemonic phrase');
+    }
+    
+    // Convert mnemonic back to entropy (32 bytes for 24-word mnemonic)
+    const entropy = bip39.mnemonicToEntropy(mnemonic, englishWordlist);
+    const entropyHex = Buffer.from(entropy).toString('hex');
+    
+    // Create Scalar from entropy
+    return Scalar.deserialize(entropyHex);
+  }
+
+  /**
+   * Generate a new mnemonic and set it as the HD seed
+   * @param strength - Entropy strength in bits (default: 256 for 24 words)
+   * @returns The mnemonic phrase that can be used to recover this wallet
+   * @note The returned mnemonic is derived from the stored seed, which ensures
+   *       it will produce the same wallet when used for restoration. Due to BLS
+   *       Scalar normalization, this may differ from the initially generated entropy.
+   */
+  generateNewMnemonic(strength: 128 | 160 | 192 | 224 | 256 = 256): string {
+    const mnemonic = KeyManager.generateMnemonic(strength);
+    this.setHDSeedFromMnemonic(mnemonic);
+    // Return the mnemonic derived from the actual stored seed
+    // This ensures the returned mnemonic will always restore the same wallet
+    return this.getMnemonic();
+  }
+
+  /**
+   * Set the HD seed from a mnemonic phrase
+   * Uses direct entropy conversion (mnemonic words encode the seed directly)
+   * @param mnemonic - The mnemonic phrase
+   */
+  setHDSeedFromMnemonic(mnemonic: string): void {
+    const seed = KeyManager.mnemonicToScalar(mnemonic);
+    this.setHDSeed(seed);
+  }
+
+  /**
+   * Get the mnemonic phrase for the current seed
+   * @returns The mnemonic phrase for the current master seed
+   */
+  getMnemonic(): string {
+    if (!this.masterSeed) {
+      throw new Error('No master seed available');
+    }
+    return KeyManager.seedToMnemonic(this.masterSeed);
+  }
+
+  /**
+   * Get the master seed as a hex string
+   * @returns The master seed as a 64-character hex string (32 bytes)
+   */
+  getMasterSeedHex(): string {
+    if (!this.masterSeed) {
+      throw new Error('No master seed available');
+    }
+    // Pad to 64 hex chars (32 bytes) in case leading zeros are stripped
+    return this.masterSeed.serialize().padStart(64, '0');
+  }
+
   /**
    * Get the private view key
    * @returns The view key
@@ -279,6 +416,53 @@ export class KeyManager {
     // Generate sub-address using navio-blsct API
     // Based on docs: SubAddr.generate(viewKey, spendingPubKey, subAddrId)
     return SubAddr.generate(this.viewKey, this.spendPublicKey, subAddrId);
+  }
+
+  /**
+   * Get a bech32m encoded address string for the given sub-address identifier
+   * @param id - The sub-address identifier (defaults to account 0, address 0)
+   * @param network - The network type ('mainnet' or 'testnet', defaults to 'mainnet')
+   * @returns The bech32m encoded address string
+   * @example
+   * ```typescript
+   * const keyManager = new KeyManager();
+   * keyManager.setHDSeed(seed);
+   * 
+   * // Get mainnet address
+   * const mainnetAddress = keyManager.getSubAddressBech32m({ account: 0, address: 0 }, 'mainnet');
+   * 
+   * // Get testnet address  
+   * const testnetAddress = keyManager.getSubAddressBech32m({ account: 0, address: 0 }, 'testnet');
+   * ```
+   */
+  getSubAddressBech32m(
+    id: SubAddressIdentifier = { account: 0, address: 0 },
+    network: 'mainnet' | 'testnet' = 'mainnet'
+  ): string {
+    // Set the chain/network for proper HRP (Human Readable Part) encoding
+    const chain = network === 'mainnet' ? BlsctChain.Mainnet : BlsctChain.Testnet;
+    setChain(chain);
+
+    // Get the sub-address
+    const subAddress = this.getSubAddress(id);
+
+    // Get DoublePublicKey by deserializing the sub-address serialization
+    // This is the pattern used in navio-blsct test scripts
+    const serialized = subAddress.serialize();
+    const dpk = DoublePublicKey.deserialize(serialized);
+
+    // Encode as bech32m using navio-blsct Address.encode
+    const address = Address.encode(dpk, AddressEncoding.Bech32M);
+
+    // If address encoding failed (empty string), throw an error with context
+    if (!address || address.length === 0) {
+      throw new Error(
+        `Address encoding returned empty. This may indicate a navio-blsct WASM issue. ` +
+        `Serialized subAddress (${serialized.length} chars): ${serialized.substring(0, 32)}...`
+      );
+    }
+
+    return address;
   }
 
   /**
@@ -862,9 +1046,8 @@ export class KeyManager {
   }
 
   private createViewKeyFromBytes(_bytes: Uint8Array): ViewKeyType {
-    // Create ViewKey from bytes
-    // This would use ViewKey.fromBytes() or similar
-    return ViewKey.deserialize(this.bytesToHex(_bytes)); // Placeholder - needs actual API
+    // ViewKey is just a Scalar - deserialize from hex
+    return Scalar.deserialize(this.bytesToHex(_bytes));
   }
 
   private createPublicKeyFromBytes(_bytes: Uint8Array): PublicKeyType {
@@ -1312,20 +1495,34 @@ export class KeyManager {
 
     // Call navio-blsct recoverAmount
     // Reference: https://nav-io.github.io/libblsct-bindings/ts/functions/recoverAmount.html
-    const result = recoverAmount(recoveryRequests);
+    const rv = recoverAmount(recoveryRequests);
 
-    // Convert result to our format
-    // Need to check the actual return type from navio-blsct
-    if (result && result.success !== undefined) {
+    try {
+      // Parse the result using the navio-blsct API
+      const size = getAmountRecoveryResultSize(rv.value);
+      const amounts: bigint[] = [];
+      const indices: number[] = [];
+      let allSuccess = true;
+
+      for (let i = 0; i < size; i++) {
+        const isSucc = getAmountRecoveryResultIsSucc(rv.value, i);
+        if (isSucc) {
+          amounts.push(getAmountRecoveryResultAmount(rv.value, i));
+          indices.push(i);
+        } else {
+          allSuccess = false;
+        }
+      }
+
       return {
-        success: result.success,
-        amounts: result.amounts || [],
-        indices: result.indices || [],
+        success: allSuccess && amounts.length > 0,
+        amounts,
+        indices,
       };
+    } finally {
+      // Clean up the result
+      deleteAmountsRetVal(rv);
     }
-
-    // Fallback if result format is different
-    return { success: false, amounts: [], indices: [] };
   }
 
   /**
@@ -1365,18 +1562,34 @@ export class KeyManager {
     }
 
     // Call navio-blsct recoverAmount with provided nonce
-    const result = recoverAmount(recoveryRequests);
+    const rv = recoverAmount(recoveryRequests);
 
-    // Convert result to our format
-    if (result && result.success !== undefined) {
+    try {
+      // Parse the result using the navio-blsct API
+      const size = getAmountRecoveryResultSize(rv.value);
+      const amounts: bigint[] = [];
+      const indices: number[] = [];
+      let allSuccess = true;
+
+      for (let i = 0; i < size; i++) {
+        const isSucc = getAmountRecoveryResultIsSucc(rv.value, i);
+        if (isSucc) {
+          amounts.push(getAmountRecoveryResultAmount(rv.value, i));
+          indices.push(i);
+        } else {
+          allSuccess = false;
+        }
+      }
+
       return {
-        success: result.success,
-        amounts: result.amounts || [],
-        indices: result.indices || [],
+        success: allSuccess && amounts.length > 0,
+        amounts,
+        indices,
       };
+    } finally {
+      // Clean up the result
+      deleteAmountsRetVal(rv);
     }
-
-    return { success: false, amounts: [], indices: [] };
   }
 
   // ============================================================================

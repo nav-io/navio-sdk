@@ -124,7 +124,7 @@ export class TransactionKeysSync {
   private syncProvider: SyncProvider;
   private keyManager: KeyManager | null = null;
   private syncState: SyncState | null = null;
-  private blockHashRetention: number = 1000; // Keep last 1k block hashes by default
+  private blockHashRetention: number = 10000; // Keep last 10k block hashes by default
 
   /**
    * Create a new TransactionKeysSync instance
@@ -260,7 +260,7 @@ export class TransactionKeysSync {
       verifyHashes = true,
       saveInterval = 100,
       keepTxKeys = false,
-      blockHashRetention = 1000,
+      blockHashRetention = 10000,
     } = options;
 
     // Update retention setting
@@ -738,13 +738,11 @@ export class TransactionKeysSync {
               // Create recovery request
               const req = new AmountRecoveryReq(rangeProof, nonce);
               
-              // Recover the amount
-              // NOTE: navio-blsct 1.0.20 has a bug in recoverAmounts - this will fail
-              // until the library is updated. The output is still stored but with amount 0.
-              const results = rangeProof.recoverAmounts([req]);
+              // Recover the amount using static method
+              const results = RangeProof.recoverAmounts([req]);
               
               if (results.length > 0 && results[0].isSucc) {
-                recoveredAmount = results[0].amount;
+                recoveredAmount = Number(results[0].amount);
                 recoveredMemo = results[0].msg || null;
               }
             }

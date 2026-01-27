@@ -43,8 +43,8 @@ await client.initialize();
 
 // Sync transaction keys
 await client.sync({
-  onProgress: (height, tip, blocks, txKeys) => {
-    console.log(`Syncing: ${height}/${tip} (${blocks} blocks, ${txKeys} TX keys)`);
+  onProgress: (height, tip, blocks, txKeys, isReorg) => {
+    console.log(`Syncing: ${height}/${tip} (${blocks} blocks, ${txKeys} TX keys${isReorg ? ' [REORG]' : ''})`);
   },
 });
 
@@ -101,6 +101,7 @@ interface NavioClientConfig {
   // Wallet options
   createWalletIfNotExists?: boolean; // Create wallet if missing (default: false)
   restoreFromSeed?: string;          // Restore from seed (hex string)
+  restoreFromMnemonic?: string;      // Restore from BIP39 mnemonic (12-24 words)
   restoreFromHeight?: number;        // Block height when wallet was created (for restore)
   creationHeight?: number;           // Creation height for new wallets (default: chainTip - 100)
 }
@@ -166,6 +167,16 @@ Returns the last synced block height, or -1 if never synced.
 ##### `getSyncState(): SyncState`
 
 Returns current sync state with statistics.
+
+```typescript
+interface SyncState {
+  lastSyncedHeight: number;    // Last synced block height
+  lastSyncedHash: string;      // Last synced block hash
+  totalTxKeysSynced: number;   // Total transaction keys synced
+  lastSyncTime: number;        // Last sync timestamp (ms)
+  chainTipAtLastSync: number;  // Chain tip at last sync
+}
+```
 
 #### Background Sync
 
@@ -272,10 +283,6 @@ Check if client is connected to the backend.
 
 #### Connection
 
-##### `connect(): Promise<void>`
-
-Connect to the backend.
-
 ##### `disconnect(): Promise<void>`
 
 Disconnect from backend and close database.
@@ -300,11 +307,47 @@ const masterSeed = keyManager.getMasterSeedKey();
 console.log('Seed:', masterSeed.serialize()); // hex string
 ```
 
+#### Mnemonic Support (BIP39)
+
+```typescript
+// Generate a new 24-word mnemonic and set as seed
+const mnemonic = keyManager.generateNewMnemonic();
+console.log('Mnemonic:', mnemonic);
+// "abandon ability able about above absent absorb abstract absurd abuse access accident..."
+
+// Or generate mnemonic with different word counts
+const mnemonic12 = KeyManager.generateMnemonic(128); // 12 words
+const mnemonic24 = KeyManager.generateMnemonic(256); // 24 words (default)
+
+// Validate a mnemonic
+const isValid = KeyManager.validateMnemonic(mnemonic);
+console.log('Valid:', isValid); // true
+
+// Restore from mnemonic
+keyManager.setHDSeedFromMnemonic(mnemonic);
+
+// Get mnemonic from current seed (for backup)
+const backupMnemonic = keyManager.getMnemonic();
+console.log('Backup mnemonic:', backupMnemonic);
+
+// Static conversion methods
+const scalar = KeyManager.mnemonicToScalar(mnemonic); // Convert to Scalar
+const recovered = KeyManager.seedToMnemonic(scalar);  // Convert back to mnemonic
+```
+
 #### Sub-addresses
 
 ```typescript
 // Get sub-address by identifier
 const subAddr = keyManager.getSubAddress({ account: 0, address: 0 });
+
+// Get bech32m encoded address string (recommended)
+const address = keyManager.getSubAddressBech32m({ account: 0, address: 0 }, 'testnet');
+console.log('Address:', address); // tnav1... (Node.js) or hex fallback (browser)
+
+// Get mainnet address
+const mainnetAddress = keyManager.getSubAddressBech32m({ account: 0, address: 0 }, 'mainnet');
+console.log('Address:', mainnetAddress); // nav1...
 
 // Generate new sub-address
 const { subAddress, id } = keyManager.generateNewSubAddress(0); // account 0
@@ -314,6 +357,9 @@ keyManager.newSubAddressPool(0);  // Main account
 keyManager.newSubAddressPool(-1); // Change
 keyManager.newSubAddressPool(-2); // Staking
 ```
+
+> **Note:** In browser environments using navio-blsct WASM, bech32m encoding may fall back to hex
+> representation due to a known issue. This will be addressed in a future navio-blsct release.
 
 #### Output Detection
 
@@ -396,6 +442,7 @@ interface SyncProvider {
   isConnected(): boolean;
   
   getChainTipHeight(): Promise<number>;
+  getChainTip(): Promise<{ height: number; hash: string }>;
   getBlockHeader(height: number): Promise<string>;
   getBlockHeaders(startHeight: number, count: number): Promise<HeadersResult>;
   getBlockTransactionKeysRange(startHeight: number): Promise<TransactionKeysRangeResult>;
@@ -436,7 +483,7 @@ import { P2PSyncProvider } from 'navio-sdk';
 
 const provider = new P2PSyncProvider({
   host: 'localhost',
-  port: 33670,
+  port: 43670,  // testnet port (mainnet: 33670)
   network: 'testnet',
   debug: true,
 });
@@ -468,12 +515,9 @@ const keyManager = client.getKeyManager();
 const seed = keyManager.getMasterSeedKey();
 console.log('SAVE THIS SEED:', seed.serialize());
 
-// Get receiving address
-const { DoublePublicKey, Address, AddressEncoding } = require('navio-blsct');
-const subAddress = keyManager.getSubAddress({ account: 0, address: 0 });
-const dpk = DoublePublicKey.deserialize(subAddress.serialize());
-const address = Address.encode(dpk, AddressEncoding.Bech32M);
-console.log('Address:', address);
+// Get receiving address (bech32m encoded)
+const address = keyManager.getSubAddressBech32m({ account: 0, address: 0 }, 'testnet');
+console.log('Address:', address); // tnav1...
 ```
 
 ### Restore Wallet from Seed
@@ -483,6 +527,27 @@ const client = new NavioClient({
   walletDbPath: './restored-wallet.db',
   electrum: { host: 'localhost', port: 50005 },
   restoreFromSeed: 'your-seed-hex-string',
+  restoreFromHeight: 50000, // Block height when wallet was created
+  network: 'testnet',
+});
+
+await client.initialize();
+
+// Full sync from restoration height
+await client.sync({
+  onProgress: (height, tip) => {
+    console.log(`Syncing: ${height}/${tip}`);
+  },
+});
+```
+
+### Restore Wallet from Mnemonic
+
+```typescript
+const client = new NavioClient({
+  walletDbPath: './restored-wallet.db',
+  electrum: { host: 'localhost', port: 50005 },
+  restoreFromMnemonic: 'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon art',
   restoreFromHeight: 50000, // Block height when wallet was created
   network: 'testnet',
 });

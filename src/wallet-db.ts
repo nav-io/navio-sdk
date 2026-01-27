@@ -534,6 +534,39 @@ export class WalletDB {
   }
 
   /**
+   * Restore wallet from mnemonic phrase
+   * @param mnemonic - The BIP39 mnemonic phrase (12-24 words)
+   * @param creationHeight - Optional block height to start scanning from (for faster restore)
+   * @returns The restored KeyManager instance
+   */
+  async restoreWalletFromMnemonic(mnemonic: string, creationHeight?: number): Promise<KeyManager> {
+    await this.initDatabase();
+
+    const keyManager = new KeyManager();
+
+    // Set seed from mnemonic
+    keyManager.setHDSeedFromMnemonic(mnemonic);
+
+    // Initialize sub-address pools
+    keyManager.newSubAddressPool(0);
+    keyManager.newSubAddressPool(-1);
+    keyManager.newSubAddressPool(-2);
+
+    // Save to database
+    await this.saveWallet(keyManager);
+
+    // Save wallet metadata with restore height
+    await this.saveWalletMetadata({
+      creationHeight: creationHeight ?? 0,
+      creationTime: Date.now(),
+      restoredFromSeed: true,
+    });
+
+    this.keyManager = keyManager;
+    return keyManager;
+  }
+
+  /**
    * Save wallet metadata to database
    */
   private async saveWalletMetadata(metadata: {
