@@ -50,6 +50,10 @@ jobs:
             echo "exists=false" >> $GITHUB_OUTPUT
           fi
 
+      - name: Install build dependencies
+        if: steps.check_version.outputs.exists == 'false'
+        run: sudo apt-get update && sudo apt-get install -y build-essential
+
       - name: Install dependencies
         if: steps.check_version.outputs.exists == 'false'
         run: npm ci

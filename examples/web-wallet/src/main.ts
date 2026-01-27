@@ -36,6 +36,8 @@ const elements = {
   network: document.getElementById('network') as HTMLSelectElement,
   electrumHost: document.getElementById('electrum-host') as HTMLInputElement,
   electrumPort: document.getElementById('electrum-port') as HTMLInputElement,
+  walletPassword: document.getElementById('wallet-password') as HTMLInputElement,
+  walletPasswordConfirm: document.getElementById('wallet-password-confirm') as HTMLInputElement,
   createWalletBtn: document.getElementById('create-wallet-btn')!,
   restoreWalletBtn: document.getElementById('restore-wallet-btn')!,
 
@@ -56,7 +58,24 @@ const elements = {
   walletSeed: document.getElementById('wallet-seed')!,
   syncBtn: document.getElementById('sync-btn')!,
   stopSyncBtn: document.getElementById('stop-sync-btn')!,
+  lockBtn: document.getElementById('lock-btn')!,
   disconnectBtn: document.getElementById('disconnect-btn')!,
+
+  // Unlock Dialog
+  unlockSection: document.getElementById('unlock-section')!,
+  unlockPassword: document.getElementById('unlock-password') as HTMLInputElement,
+  unlockError: document.getElementById('unlock-error')!,
+  confirmUnlockBtn: document.getElementById('confirm-unlock-btn')!,
+  cancelUnlockBtn: document.getElementById('cancel-unlock-btn')!,
+
+  // Change Password Dialog
+  changePasswordSection: document.getElementById('change-password-section')!,
+  oldPassword: document.getElementById('old-password') as HTMLInputElement,
+  newPassword: document.getElementById('new-password') as HTMLInputElement,
+  newPasswordConfirm: document.getElementById('new-password-confirm') as HTMLInputElement,
+  changePasswordError: document.getElementById('change-password-error')!,
+  confirmChangePasswordBtn: document.getElementById('confirm-change-password-btn')!,
+  cancelChangePasswordBtn: document.getElementById('cancel-change-password-btn')!,
 
   // UTXOs
   utxosSection: document.getElementById('utxos-section')!,
@@ -204,6 +223,7 @@ function getConfig() {
 }
 
 let isCreatingWallet = false;
+let walletPassword: string | null = null;
 
 async function createWallet() {
   // Prevent multiple simultaneous wallet creations
@@ -211,6 +231,16 @@ async function createWallet() {
     log('Wallet creation already in progress...', 'warning');
     return;
   }
+
+  // Validate password if provided
+  const password = elements.walletPassword?.value || '';
+  const passwordConfirm = elements.walletPasswordConfirm?.value || '';
+
+  if (password && password !== passwordConfirm) {
+    log('Passwords do not match', 'error');
+    return;
+  }
+
   isCreatingWallet = true;
 
   log('Creating new wallet...');
@@ -237,6 +267,14 @@ async function createWallet() {
     const keyManager = client.getKeyManager();
     state.seed = keyManager.getMasterSeedHex();
     state.mnemonic = keyManager.getMnemonic();
+
+    // Set password if provided
+    if (password) {
+      log('Encrypting wallet with password...', 'info');
+      await keyManager.setPassword(password);
+      walletPassword = password;
+      log('Wallet encrypted', 'success');
+    }
 
     showWalletUI();
   } catch (error: any) {
@@ -320,6 +358,144 @@ function showWalletUI() {
 
   state.initialized = true;
   updateWalletInfo();
+  updateLockButton();
+}
+
+// ============================================================================
+// Lock/Unlock Functions
+// ============================================================================
+
+function updateLockButton() {
+  if (!client) return;
+
+  const keyManager = client.getKeyManager();
+  const isEncrypted = keyManager.isEncrypted();
+
+  if (isEncrypted) {
+    elements.lockBtn.classList.remove('hidden');
+    if (keyManager.isUnlocked()) {
+      elements.lockBtn.textContent = 'Lock Wallet';
+    } else {
+      elements.lockBtn.textContent = 'Unlock Wallet';
+    }
+  } else {
+    elements.lockBtn.classList.add('hidden');
+  }
+}
+
+function showUnlockDialog() {
+  elements.unlockSection.classList.remove('hidden');
+  elements.unlockPassword.value = '';
+  elements.unlockError.classList.add('hidden');
+  elements.unlockPassword.focus();
+}
+
+function hideUnlockDialog() {
+  elements.unlockSection.classList.add('hidden');
+  elements.unlockPassword.value = '';
+}
+
+async function handleUnlock() {
+  if (!client) return;
+
+  const password = elements.unlockPassword.value;
+  if (!password) {
+    elements.unlockError.textContent = 'Please enter your password';
+    elements.unlockError.classList.remove('hidden');
+    return;
+  }
+
+  try {
+    const keyManager = client.getKeyManager();
+    const success = await keyManager.unlock(password);
+
+    if (success) {
+      walletPassword = password;
+      log('Wallet unlocked', 'success');
+      hideUnlockDialog();
+      updateLockButton();
+    } else {
+      elements.unlockError.textContent = 'Incorrect password';
+      elements.unlockError.classList.remove('hidden');
+    }
+  } catch (error) {
+    elements.unlockError.textContent = `Unlock failed: ${error}`;
+    elements.unlockError.classList.remove('hidden');
+  }
+}
+
+function handleLock() {
+  if (!client) return;
+
+  const keyManager = client.getKeyManager();
+
+  if (keyManager.isUnlocked()) {
+    keyManager.lock();
+    walletPassword = null;
+    log('Wallet locked', 'info');
+    updateLockButton();
+  } else {
+    showUnlockDialog();
+  }
+}
+
+function showChangePasswordDialog() {
+  elements.changePasswordSection.classList.remove('hidden');
+  elements.oldPassword.value = '';
+  elements.newPassword.value = '';
+  elements.newPasswordConfirm.value = '';
+  elements.changePasswordError.classList.add('hidden');
+  elements.oldPassword.focus();
+}
+
+function hideChangePasswordDialog() {
+  elements.changePasswordSection.classList.add('hidden');
+  elements.oldPassword.value = '';
+  elements.newPassword.value = '';
+  elements.newPasswordConfirm.value = '';
+}
+
+async function handleChangePassword() {
+  if (!client) return;
+
+  const oldPassword = elements.oldPassword.value;
+  const newPassword = elements.newPassword.value;
+  const newPasswordConfirm = elements.newPasswordConfirm.value;
+
+  if (!oldPassword) {
+    elements.changePasswordError.textContent = 'Please enter your current password';
+    elements.changePasswordError.classList.remove('hidden');
+    return;
+  }
+
+  if (!newPassword) {
+    elements.changePasswordError.textContent = 'Please enter a new password';
+    elements.changePasswordError.classList.remove('hidden');
+    return;
+  }
+
+  if (newPassword !== newPasswordConfirm) {
+    elements.changePasswordError.textContent = 'New passwords do not match';
+    elements.changePasswordError.classList.remove('hidden');
+    return;
+  }
+
+  try {
+    const keyManager = client.getKeyManager();
+    const success = await keyManager.changePassword(oldPassword, newPassword);
+
+    if (success) {
+      walletPassword = newPassword;
+      log('Password changed successfully', 'success');
+      hideChangePasswordDialog();
+    } else {
+      elements.changePasswordError.textContent = 'Current password is incorrect';
+      elements.changePasswordError.classList.remove('hidden');
+    }
+  } catch (error) {
+    elements.changePasswordError.textContent = `Failed to change password: ${error}`;
+    elements.changePasswordError.classList.remove('hidden');
+  }
 }
 
 async function updateWalletInfo() {
@@ -480,6 +656,20 @@ elements.cancelRestoreBtn.addEventListener('click', hideRestoreUI);
 elements.syncBtn.addEventListener('click', startSync);
 elements.stopSyncBtn.addEventListener('click', stopSync);
 elements.disconnectBtn.addEventListener('click', disconnect);
+
+// Lock/Unlock event listeners
+elements.lockBtn?.addEventListener('click', handleLock);
+elements.confirmUnlockBtn?.addEventListener('click', handleUnlock);
+elements.cancelUnlockBtn?.addEventListener('click', hideUnlockDialog);
+elements.confirmChangePasswordBtn?.addEventListener('click', handleChangePassword);
+elements.cancelChangePasswordBtn?.addEventListener('click', hideChangePasswordDialog);
+
+// Allow Enter key to submit unlock password
+elements.unlockPassword?.addEventListener('keypress', (e) => {
+  if (e.key === 'Enter') {
+    handleUnlock();
+  }
+});
 
 // Initialize
 async function init() {

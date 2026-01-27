@@ -304,6 +304,17 @@ export class WalletDB {
       )
     `);
 
+    // Encryption metadata table (for wallet password protection)
+    this.db.run(`
+      CREATE TABLE IF NOT EXISTS encryption_metadata (
+        id INTEGER PRIMARY KEY,
+        is_encrypted INTEGER NOT NULL DEFAULT 0,
+        salt TEXT,
+        verification_hash TEXT,
+        encryption_version INTEGER NOT NULL DEFAULT 1
+      )
+    `);
+
     // Wallet outputs table (UTXOs)
     this.db.run(`
       CREATE TABLE IF NOT EXISTS wallet_outputs (
@@ -974,5 +985,311 @@ export class WalletDB {
     stmt.free();
 
     return outputs;
+  }
+
+  // ============================================================================
+  // Encryption Methods
+  // ============================================================================
+
+  /**
+   * Check if the database has encryption enabled
+   * @returns True if encryption is enabled
+   */
+  isEncrypted(): boolean {
+    if (!this.isOpen) {
+      return false;
+    }
+
+    const stmt = this.db.prepare('SELECT is_encrypted FROM encryption_metadata WHERE id = 0');
+    if (stmt.step()) {
+      const result = (stmt.getAsObject().is_encrypted as number) === 1;
+      stmt.free();
+      return result;
+    }
+    stmt.free();
+    return false;
+  }
+
+  /**
+   * Save encryption metadata to the database
+   * @param salt - Hex-encoded salt
+   * @param verificationHash - Hex-encoded password verification hash
+   */
+  saveEncryptionMetadata(salt: string, verificationHash: string): void {
+    if (!this.isOpen) {
+      throw new Error('Database not initialized');
+    }
+
+    // Insert or update encryption metadata
+    this.db.run(`
+      INSERT OR REPLACE INTO encryption_metadata (id, is_encrypted, salt, verification_hash, encryption_version)
+      VALUES (0, 1, ?, ?, 1)
+    `, [salt, verificationHash]);
+  }
+
+  /**
+   * Load encryption metadata from the database
+   * @returns Encryption metadata or null if not encrypted
+   */
+  getEncryptionMetadata(): { salt: string; verificationHash: string } | null {
+    if (!this.isOpen) {
+      throw new Error('Database not initialized');
+    }
+
+    const stmt = this.db.prepare(`
+      SELECT salt, verification_hash FROM encryption_metadata WHERE id = 0 AND is_encrypted = 1
+    `);
+
+    if (stmt.step()) {
+      const row = stmt.getAsObject();
+      stmt.free();
+      if (row.salt && row.verification_hash) {
+        return {
+          salt: row.salt as string,
+          verificationHash: row.verification_hash as string,
+        };
+      }
+    }
+    stmt.free();
+    return null;
+  }
+
+  /**
+   * Save an encrypted key to the database
+   * @param keyId - Key identifier (hex)
+   * @param publicKey - Public key (hex)
+   * @param encryptedSecret - Encrypted secret (JSON string)
+   */
+  saveEncryptedKey(keyId: string, publicKey: string, encryptedSecret: string): void {
+    if (!this.isOpen) {
+      throw new Error('Database not initialized');
+    }
+
+    this.db.run(`
+      INSERT OR REPLACE INTO crypted_keys (key_id, public_key, encrypted_secret)
+      VALUES (?, ?, ?)
+    `, [keyId, publicKey, encryptedSecret]);
+  }
+
+  /**
+   * Load an encrypted key from the database
+   * @param keyId - Key identifier (hex)
+   * @returns Encrypted key data or null if not found
+   */
+  getEncryptedKey(keyId: string): { publicKey: string; encryptedSecret: string } | null {
+    if (!this.isOpen) {
+      throw new Error('Database not initialized');
+    }
+
+    const stmt = this.db.prepare(`
+      SELECT public_key, encrypted_secret FROM crypted_keys WHERE key_id = ?
+    `);
+    stmt.bind([keyId]);
+
+    if (stmt.step()) {
+      const row = stmt.getAsObject();
+      stmt.free();
+      return {
+        publicKey: row.public_key as string,
+        encryptedSecret: row.encrypted_secret as string,
+      };
+    }
+    stmt.free();
+    return null;
+  }
+
+  /**
+   * Get all encrypted keys from the database
+   * @returns Array of encrypted key data
+   */
+  getAllEncryptedKeys(): Array<{ keyId: string; publicKey: string; encryptedSecret: string }> {
+    if (!this.isOpen) {
+      throw new Error('Database not initialized');
+    }
+
+    const stmt = this.db.prepare('SELECT key_id, public_key, encrypted_secret FROM crypted_keys');
+    const keys: Array<{ keyId: string; publicKey: string; encryptedSecret: string }> = [];
+
+    while (stmt.step()) {
+      const row = stmt.getAsObject();
+      keys.push({
+        keyId: row.key_id as string,
+        publicKey: row.public_key as string,
+        encryptedSecret: row.encrypted_secret as string,
+      });
+    }
+    stmt.free();
+
+    return keys;
+  }
+
+  /**
+   * Save an encrypted output key to the database
+   * @param outId - Output identifier (hex)
+   * @param publicKey - Public key (hex)
+   * @param encryptedSecret - Encrypted secret (JSON string)
+   */
+  saveEncryptedOutKey(outId: string, publicKey: string, encryptedSecret: string): void {
+    if (!this.isOpen) {
+      throw new Error('Database not initialized');
+    }
+
+    this.db.run(`
+      INSERT OR REPLACE INTO crypted_out_keys (out_id, public_key, encrypted_secret)
+      VALUES (?, ?, ?)
+    `, [outId, publicKey, encryptedSecret]);
+  }
+
+  /**
+   * Load an encrypted output key from the database
+   * @param outId - Output identifier (hex)
+   * @returns Encrypted output key data or null if not found
+   */
+  getEncryptedOutKey(outId: string): { publicKey: string; encryptedSecret: string } | null {
+    if (!this.isOpen) {
+      throw new Error('Database not initialized');
+    }
+
+    const stmt = this.db.prepare(`
+      SELECT public_key, encrypted_secret FROM crypted_out_keys WHERE out_id = ?
+    `);
+    stmt.bind([outId]);
+
+    if (stmt.step()) {
+      const row = stmt.getAsObject();
+      stmt.free();
+      return {
+        publicKey: row.public_key as string,
+        encryptedSecret: row.encrypted_secret as string,
+      };
+    }
+    stmt.free();
+    return null;
+  }
+
+  /**
+   * Get all encrypted output keys from the database
+   * @returns Array of encrypted output key data
+   */
+  getAllEncryptedOutKeys(): Array<{ outId: string; publicKey: string; encryptedSecret: string }> {
+    if (!this.isOpen) {
+      throw new Error('Database not initialized');
+    }
+
+    const stmt = this.db.prepare('SELECT out_id, public_key, encrypted_secret FROM crypted_out_keys');
+    const keys: Array<{ outId: string; publicKey: string; encryptedSecret: string }> = [];
+
+    while (stmt.step()) {
+      const row = stmt.getAsObject();
+      keys.push({
+        outId: row.out_id as string,
+        publicKey: row.public_key as string,
+        encryptedSecret: row.encrypted_secret as string,
+      });
+    }
+    stmt.free();
+
+    return keys;
+  }
+
+  /**
+   * Delete plaintext keys (after encryption)
+   * This removes the unencrypted keys from the database
+   */
+  deletePlaintextKeys(): void {
+    if (!this.isOpen) {
+      throw new Error('Database not initialized');
+    }
+
+    this.db.run('DELETE FROM keys');
+    this.db.run('DELETE FROM out_keys');
+  }
+
+  /**
+   * Export the database as an encrypted binary blob
+   * Uses the encryption module to encrypt the entire SQLite database
+   * 
+   * @param password - Password to encrypt the export
+   * @returns Encrypted database bytes
+   */
+  async exportEncrypted(password: string): Promise<Uint8Array> {
+    if (!this.isOpen) {
+      throw new Error('Database not initialized');
+    }
+
+    // Import encryption functions
+    const { encryptDatabase } = await import('./crypto');
+
+    // Export the raw database
+    const dbBuffer = this.db.export();
+
+    // Encrypt the database
+    const encrypted = await encryptDatabase(new Uint8Array(dbBuffer), password);
+
+    return encrypted;
+  }
+
+  /**
+   * Load a database from an encrypted binary blob
+   * 
+   * @param encryptedData - Encrypted database bytes
+   * @param password - Password to decrypt
+   * @param dbPath - Path for the new database instance
+   * @returns New WalletDB instance with decrypted data
+   */
+  static async loadEncrypted(
+    encryptedData: Uint8Array,
+    password: string,
+    dbPath = ':memory:'
+  ): Promise<WalletDB> {
+    // Import decryption function
+    const { decryptDatabase, isEncryptedDatabase } = await import('./crypto');
+
+    // Check if it's actually encrypted
+    if (!isEncryptedDatabase(encryptedData)) {
+      throw new Error('Data does not appear to be an encrypted database');
+    }
+
+    // Decrypt the database
+    const decryptedBuffer = await decryptDatabase(encryptedData, password);
+
+    // Create new WalletDB instance
+    const walletDb = new WalletDB(dbPath);
+
+    // Load SQL.js
+    const SQL = await loadSQL();
+
+    // Create database from decrypted buffer
+    walletDb.db = new SQL.Database(decryptedBuffer);
+    walletDb.isOpen = true;
+
+    return walletDb;
+  }
+
+  /**
+   * Get the raw database bytes (unencrypted)
+   * @returns Database bytes
+   */
+  export(): Uint8Array {
+    if (!this.isOpen) {
+      throw new Error('Database not initialized');
+    }
+
+    return new Uint8Array(this.db.export());
+  }
+
+  /**
+   * Load a database from raw bytes
+   * 
+   * @param data - Raw database bytes
+   * @param dbPath - Path for the new database instance
+   * @returns New WalletDB instance
+   */
+  static async loadFromBytes(data: Uint8Array, dbPath = ':memory:'): Promise<WalletDB> {
+    const walletDb = new WalletDB(dbPath);
+    const SQL = await loadSQL();
+    walletDb.db = new SQL.Database(data);
+    walletDb.isOpen = true;
+    return walletDb;
   }
 }

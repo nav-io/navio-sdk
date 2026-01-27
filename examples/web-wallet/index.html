@@ -32,6 +32,14 @@
           <label for="electrum-port">Electrum Port:</label>
           <input type="number" id="electrum-port" value="50005" />
         </div>
+        <div class="form-group">
+          <label for="wallet-password">Wallet Password (optional):</label>
+          <input type="password" id="wallet-password" placeholder="Leave empty for no encryption" />
+        </div>
+        <div class="form-group">
+          <label for="wallet-password-confirm">Confirm Password:</label>
+          <input type="password" id="wallet-password-confirm" placeholder="Confirm password" />
+        </div>
         <div class="button-group">
           <button id="create-wallet-btn" class="btn primary">Create New Wallet</button>
           <button id="restore-wallet-btn" class="btn secondary">Restore from Seed</button>
@@ -90,7 +98,49 @@
         <div class="button-group">
           <button id="sync-btn" class="btn primary">Start Sync</button>
           <button id="stop-sync-btn" class="btn secondary" disabled>Stop Sync</button>
+          <button id="lock-btn" class="btn secondary hidden">Lock Wallet</button>
           <button id="disconnect-btn" class="btn danger">Disconnect</button>
+        </div>
+      </section>
+
+      <!-- Unlock Dialog (hidden by default) -->
+      <section id="unlock-section" class="card hidden modal-overlay">
+        <div class="modal">
+          <h2>Unlock Wallet</h2>
+          <p>Enter your password to unlock the wallet.</p>
+          <div class="form-group">
+            <label for="unlock-password">Password:</label>
+            <input type="password" id="unlock-password" placeholder="Enter wallet password" />
+          </div>
+          <div id="unlock-error" class="error-message hidden"></div>
+          <div class="button-group">
+            <button id="confirm-unlock-btn" class="btn primary">Unlock</button>
+            <button id="cancel-unlock-btn" class="btn secondary">Cancel</button>
+          </div>
+        </div>
+      </section>
+
+      <!-- Change Password Dialog (hidden by default) -->
+      <section id="change-password-section" class="card hidden modal-overlay">
+        <div class="modal">
+          <h2>Change Password</h2>
+          <div class="form-group">
+            <label for="old-password">Current Password:</label>
+            <input type="password" id="old-password" placeholder="Enter current password" />
+          </div>
+          <div class="form-group">
+            <label for="new-password">New Password:</label>
+            <input type="password" id="new-password" placeholder="Enter new password" />
+          </div>
+          <div class="form-group">
+            <label for="new-password-confirm">Confirm New Password:</label>
+            <input type="password" id="new-password-confirm" placeholder="Confirm new password" />
+          </div>
+          <div id="change-password-error" class="error-message hidden"></div>
+          <div class="button-group">
+            <button id="confirm-change-password-btn" class="btn primary">Change Password</button>
+            <button id="cancel-change-password-btn" class="btn secondary">Cancel</button>
+          </div>
         </div>
       </section>
 

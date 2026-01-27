@@ -4,10 +4,12 @@ A basic web wallet example demonstrating how to use `navio-sdk` in a browser env
 
 ## Features
 
-- Create new wallet
-- Restore wallet from seed
+- Create new wallet with optional password protection
+- Restore wallet from seed or mnemonic
+- Wallet encryption with lock/unlock support
 - Background sync with Electrum backend
 - Display balance and UTXOs
+- Bech32m encoded receiving addresses
 - Real-time activity log
 
 ## Prerequisites
@@ -74,5 +76,22 @@ The example demonstrates:
 - Dynamic import of navio-sdk (ESM)
 - NavioClient initialization with Electrum backend
 - Wallet creation and restoration
+- Password-based wallet encryption (Argon2id + AES-256-GCM)
+- Lock/unlock workflow for encrypted wallets
 - Background sync with callbacks
 - Balance and UTXO display
+- Bech32m address encoding
+
+## Wallet Encryption
+
+The web wallet supports optional password-based encryption:
+
+1. **Creating Encrypted Wallet**: Enter a password when creating a new wallet
+2. **Locking**: Click "Lock Wallet" to secure the wallet when not in use
+3. **Unlocking**: Enter your password to unlock and access the wallet
+
+When a wallet is encrypted:
+- Private keys are encrypted with AES-256-GCM
+- The encryption key is derived from your password using Argon2id
+- The wallet can be locked (password cleared from memory)
+- Unlocking requires the correct password

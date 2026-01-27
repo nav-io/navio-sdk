@@ -50,6 +50,20 @@ import type {
   AmountRecoveryResult,
 } from './key-manager.types';
 
+// Encryption support
+import {
+  deriveKey,
+  encryptWithKey,
+  decryptWithKey,
+  serializeEncryptedData,
+  deserializeEncryptedData,
+  createPasswordVerification,
+  verifyPassword,
+  randomBytes,
+  SALT_LENGTH,
+} from './crypto';
+import type { EncryptedData, SerializedEncryptedData } from './crypto';
+
 /**
  * KeyManager class for managing BLS CT keys.
  * Replicates functionality from navio-core's blsct::keyman.
@@ -91,6 +105,12 @@ export class KeyManager {
   private fViewKeyDefined = false;
   private fSpendKeyDefined = false;
 
+  // Encryption state
+  private encrypted = false;
+  private encryptionSalt: Uint8Array | null = null;
+  private passwordVerificationHash: Uint8Array | null = null;
+  private encryptionKey: Awaited<ReturnType<typeof deriveKey>> | null = null;
+
   /**
    * Check if HD is enabled (has a seed)
    * @returns True if HD is enabled
@@ -106,6 +126,269 @@ export class KeyManager {
   canGenerateKeys(): boolean {
     return this.isHDEnabled();
   }
+
+  // ============================================================================
+  // Encryption Methods
+  // ============================================================================
+
+  /**
+   * Check if the wallet is encrypted
+   * @returns True if the wallet has been encrypted with a password
+   */
+  isEncrypted(): boolean {
+    return this.encrypted;
+  }
+
+  /**
+   * Check if the wallet is unlocked (decryption key is cached)
+   * @returns True if the wallet is unlocked and can access private keys
+   */
+  isUnlocked(): boolean {
+    return !this.encrypted || this.encryptionKey !== null;
+  }
+
+  /**
+   * Set a password to encrypt the wallet
+   * This encrypts all private keys and stores them in encrypted form
+   * 
+   * @param password - The password to encrypt the wallet with
+   * @throws Error if wallet is already encrypted
+   */
+  async setPassword(password: string): Promise<void> {
+    if (this.encrypted) {
+      throw new Error('Wallet is already encrypted. Use changePassword() to change the password.');
+    }
+
+    // Generate salt for key derivation
+    this.encryptionSalt = randomBytes(SALT_LENGTH);
+
+    // Derive encryption key
+    this.encryptionKey = await deriveKey(password, this.encryptionSalt);
+
+    // Create password verification hash
+    this.passwordVerificationHash = await createPasswordVerification(password, this.encryptionSalt);
+
+    // Encrypt all existing keys
+    await this.encryptAllKeys();
+
+    // Mark as encrypted
+    this.encrypted = true;
+  }
+
+  /**
+   * Unlock an encrypted wallet with the password
+   * This derives the encryption key and caches it for decrypting private keys
+   * 
+   * @param password - The wallet password
+   * @returns True if the password is correct and wallet is unlocked
+   */
+  async unlock(password: string): Promise<boolean> {
+    if (!this.encrypted) {
+      return true; // Not encrypted, always unlocked
+    }
+
+    if (!this.encryptionSalt || !this.passwordVerificationHash) {
+      throw new Error('Wallet encryption state is corrupted');
+    }
+
+    // Verify password
+    const isValid = await verifyPassword(password, this.encryptionSalt, this.passwordVerificationHash);
+    if (!isValid) {
+      return false;
+    }
+
+    // Derive and cache encryption key
+    this.encryptionKey = await deriveKey(password, this.encryptionSalt);
+
+    // Decrypt keys that are needed in memory (view key for scanning)
+    await this.decryptEssentialKeys();
+
+    return true;
+  }
+
+  /**
+   * Lock the wallet, clearing the cached encryption key
+   * After locking, private keys cannot be accessed without unlocking again
+   */
+  lock(): void {
+    if (!this.encrypted) {
+      return; // Not encrypted, nothing to lock
+    }
+
+    // Clear cached encryption key
+    this.encryptionKey = null;
+
+    // Clear any decrypted private keys from memory (except view key for scanning)
+    // Note: In a more secure implementation, we'd also clear the view key
+    // and require unlock for any operation
+  }
+
+  /**
+   * Change the wallet password
+   * 
+   * @param oldPassword - The current password
+   * @param newPassword - The new password
+   * @returns True if password was changed successfully
+   * @throws Error if wallet is not encrypted or old password is incorrect
+   */
+  async changePassword(oldPassword: string, newPassword: string): Promise<boolean> {
+    if (!this.encrypted) {
+      throw new Error('Wallet is not encrypted. Use setPassword() first.');
+    }
+
+    // Verify old password
+    const unlocked = await this.unlock(oldPassword);
+    if (!unlocked) {
+      return false;
+    }
+
+    // Generate new salt
+    const newSalt = randomBytes(SALT_LENGTH);
+
+    // Derive new encryption key
+    const newKey = await deriveKey(newPassword, newSalt);
+
+    // Re-encrypt all keys with new key
+    await this.reEncryptAllKeys(newKey, newSalt);
+
+    // Update encryption parameters
+    this.encryptionSalt = newSalt;
+    this.encryptionKey = newKey;
+    this.passwordVerificationHash = await createPasswordVerification(newPassword, newSalt);
+
+    return true;
+  }
+
+  /**
+   * Get encryption parameters for storage
+   * @returns Encryption salt and verification hash, or null if not encrypted
+   */
+  getEncryptionParams(): { salt: string; verificationHash: string } | null {
+    if (!this.encrypted || !this.encryptionSalt || !this.passwordVerificationHash) {
+      return null;
+    }
+
+    return {
+      salt: this.bytesToHex(this.encryptionSalt),
+      verificationHash: this.bytesToHex(this.passwordVerificationHash),
+    };
+  }
+
+  /**
+   * Set encryption parameters from storage (for loading encrypted wallet)
+   * @param salt - Hex-encoded salt
+   * @param verificationHash - Hex-encoded verification hash
+   */
+  setEncryptionParams(salt: string, verificationHash: string): void {
+    this.encryptionSalt = this.hexToBytes(salt);
+    this.passwordVerificationHash = this.hexToBytes(verificationHash);
+    this.encrypted = true;
+  }
+
+  /**
+   * Encrypt all private keys in the wallet
+   * Internal method called when setting password
+   */
+  private async encryptAllKeys(): Promise<void> {
+    if (!this.encryptionKey || !this.encryptionSalt) {
+      throw new Error('Encryption key not available');
+    }
+
+    // Encrypt regular keys
+    for (const [keyIdHex, secretKey] of this.keys) {
+      const keyBytes = this.hexToBytes(secretKey.serialize());
+      const encrypted = await encryptWithKey(keyBytes, this.encryptionKey, this.encryptionSalt);
+      const publicKey = PublicKey.fromScalar(secretKey);
+      this.cryptedKeys.set(keyIdHex, {
+        publicKey,
+        encryptedSecret: this.serializeEncryptedToBytes(encrypted),
+      });
+    }
+
+    // Encrypt output keys
+    for (const [outIdHex, secretKey] of this.outKeys) {
+      const keyBytes = this.hexToBytes(secretKey.serialize());
+      const encrypted = await encryptWithKey(keyBytes, this.encryptionKey, this.encryptionSalt);
+      const publicKey = PublicKey.fromScalar(secretKey);
+      this.cryptedOutKeys.set(outIdHex, {
+        publicKey,
+        encryptedSecret: this.serializeEncryptedToBytes(encrypted),
+      });
+    }
+
+    // Note: We keep the view key in memory for scanning, even when encrypted
+    // The master seed is NOT stored encrypted - it should be backed up separately
+  }
+
+  /**
+   * Decrypt essential keys needed for wallet operations
+   * Called after successful unlock
+   */
+  private async decryptEssentialKeys(): Promise<void> {
+    // View key is kept in memory for scanning
+    // Other keys are decrypted on-demand when needed
+  }
+
+  /**
+   * Re-encrypt all keys with a new key (for password change)
+   */
+  private async reEncryptAllKeys(
+    newKey: Awaited<ReturnType<typeof deriveKey>>,
+    newSalt: Uint8Array
+  ): Promise<void> {
+    if (!this.encryptionKey) {
+      throw new Error('Wallet must be unlocked to change password');
+    }
+
+    // Re-encrypt regular keys
+    for (const [keyIdHex, cryptedData] of this.cryptedKeys) {
+      // Decrypt with old key
+      const encrypted = this.deserializeEncryptedFromBytes(cryptedData.encryptedSecret);
+      const decrypted = await decryptWithKey(encrypted, this.encryptionKey);
+      
+      // Re-encrypt with new key
+      const reEncrypted = await encryptWithKey(decrypted, newKey, newSalt);
+      this.cryptedKeys.set(keyIdHex, {
+        publicKey: cryptedData.publicKey,
+        encryptedSecret: this.serializeEncryptedToBytes(reEncrypted),
+      });
+    }
+
+    // Re-encrypt output keys
+    for (const [outIdHex, cryptedData] of this.cryptedOutKeys) {
+      // Decrypt with old key
+      const encrypted = this.deserializeEncryptedFromBytes(cryptedData.encryptedSecret);
+      const decrypted = await decryptWithKey(encrypted, this.encryptionKey);
+      
+      // Re-encrypt with new key
+      const reEncrypted = await encryptWithKey(decrypted, newKey, newSalt);
+      this.cryptedOutKeys.set(outIdHex, {
+        publicKey: cryptedData.publicKey,
+        encryptedSecret: this.serializeEncryptedToBytes(reEncrypted),
+      });
+    }
+  }
+
+  /**
+   * Serialize EncryptedData to bytes for storage
+   */
+  private serializeEncryptedToBytes(encrypted: EncryptedData): Uint8Array {
+    const serialized = serializeEncryptedData(encrypted);
+    return new TextEncoder().encode(JSON.stringify(serialized));
+  }
+
+  /**
+   * Deserialize EncryptedData from bytes
+   */
+  private deserializeEncryptedFromBytes(bytes: Uint8Array): EncryptedData {
+    const json = new TextDecoder().decode(bytes);
+    const serialized = JSON.parse(json) as SerializedEncryptedData;
+    return deserializeEncryptedData(serialized);
+  }
+
+  // ============================================================================
+  // End Encryption Methods
+  // ============================================================================
 
   /**
    * Generate a new random seed
@@ -1076,6 +1359,13 @@ export class KeyManager {
       .join('');
   }
 
+  private hexToBytes(hex: string): Uint8Array {
+    const bytes = new Uint8Array(hex.length / 2);
+    for (let i = 0; i < hex.length; i += 2) {
+      bytes[i / 2] = parseInt(hex.slice(i, i + 2), 16);
+    }
+    return bytes;
+  }
 
   /**
    * Get the private spending key

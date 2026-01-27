@@ -5,6 +5,7 @@ TypeScript SDK for interacting with the Navio blockchain. Provides wallet manage
 ## Features
 
 - **Wallet Management** - HD key derivation with BLS CT support
+- **Wallet Encryption** - Password-based encryption with Argon2id + AES-256-GCM
 - **Dual Sync Backends** - Electrum protocol or direct P2P node connections
 - **Automatic Output Detection** - BLSCT output scanning with view tag optimization
 - **Amount Recovery** - Decrypt confidential transaction amounts
@@ -377,6 +378,38 @@ const hashId = keyManager.calculateHashId(blindingKey, spendingKey);
 const nonce = keyManager.calculateNonce(blindingKey);
 ```
 
+#### Wallet Encryption
+
+The KeyManager supports password-based encryption using Argon2id for key derivation and AES-256-GCM for encryption.
+
+```typescript
+// Check encryption status
+const isEncrypted = keyManager.isEncrypted();
+const isUnlocked = keyManager.isUnlocked();
+
+// Set a password (encrypts the wallet)
+await keyManager.setPassword('my-secure-password');
+
+// Lock the wallet (clears cached encryption key)
+keyManager.lock();
+
+// Unlock the wallet
+const success = await keyManager.unlock('my-secure-password');
+if (!success) {
+  console.log('Wrong password');
+}
+
+// Change password
+const changed = await keyManager.changePassword('old-password', 'new-password');
+
+// Get encryption parameters (for database storage)
+const params = keyManager.getEncryptionParams();
+// { salt: 'hex...', verificationHash: 'hex...' }
+
+// Restore encryption state from database
+keyManager.setEncryptionParams(params.salt, params.verificationHash);
+```
+
 ---
 
 ### WalletDB
@@ -425,6 +458,50 @@ const utxos = await walletDB.getUnspentOutputs();
 
 // Get all outputs
 const outputs = await walletDB.getAllOutputs();
+```
+
+#### Database Encryption
+
+The WalletDB supports full database encryption for secure backup and export.
+
+```typescript
+// Export database as encrypted blob
+const encryptedData = await walletDB.exportEncrypted('backup-password');
+// encryptedData is a Uint8Array that can be saved to file
+
+// Load database from encrypted blob
+const restoredDb = await WalletDB.loadEncrypted(encryptedData, 'backup-password');
+
+// Check if a buffer is an encrypted database
+import { isEncryptedDatabase } from 'navio-sdk';
+const isEncrypted = isEncryptedDatabase(someBuffer);
+
+// Export unencrypted database (for backup without password)
+const rawData = walletDB.export();
+
+// Load from raw bytes
+const db = await WalletDB.loadFromBytes(rawData);
+```
+
+#### Encryption Metadata
+
+```typescript
+// Check if encryption is enabled
+const isEncrypted = walletDB.isEncrypted();
+
+// Save encryption metadata
+walletDB.saveEncryptionMetadata(salt, verificationHash);
+
+// Get encryption metadata
+const metadata = walletDB.getEncryptionMetadata();
+// { salt: 'hex...', verificationHash: 'hex...' } or null
+
+// Get/save encrypted keys
+walletDB.saveEncryptedKey(keyId, publicKey, encryptedSecret);
+const key = walletDB.getEncryptedKey(keyId);
+
+// Delete plaintext keys after encryption
+walletDB.deletePlaintextKeys();
 ```
 
 ---
@@ -672,6 +749,77 @@ for (const utxo of utxos) {
 }
 ```
 
+### Encrypt Wallet with Password
+
+```typescript
+import { NavioClient } from 'navio-sdk';
+
+const client = new NavioClient({
+  walletDbPath: './secure-wallet.db',
+  electrum: { host: 'localhost', port: 50005 },
+  createWalletIfNotExists: true,
+  network: 'testnet',
+});
+
+await client.initialize();
+
+// Set a password to encrypt the wallet
+const keyManager = client.getKeyManager();
+await keyManager.setPassword('my-secure-password');
+console.log('Wallet encrypted:', keyManager.isEncrypted()); // true
+
+// The wallet is now encrypted but unlocked
+console.log('Wallet unlocked:', keyManager.isUnlocked()); // true
+
+// Lock the wallet (recommended when not in use)
+keyManager.lock();
+console.log('Wallet unlocked:', keyManager.isUnlocked()); // false
+
+// Unlock to use
+const success = await keyManager.unlock('my-secure-password');
+console.log('Unlock successful:', success); // true
+```
+
+### Export Encrypted Backup
+
+```typescript
+// Export encrypted database for backup
+const walletDb = client.getWalletDB();
+const encryptedBackup = await walletDb.exportEncrypted('backup-password');
+
+// Save to file (Node.js)
+const fs = require('fs');
+fs.writeFileSync('wallet-backup.enc', encryptedBackup);
+
+// Or download in browser
+const blob = new Blob([encryptedBackup], { type: 'application/octet-stream' });
+const url = URL.createObjectURL(blob);
+const a = document.createElement('a');
+a.href = url;
+a.download = 'wallet-backup.enc';
+a.click();
+```
+
+### Restore from Encrypted Backup
+
+```typescript
+import { WalletDB } from 'navio-sdk';
+
+// Load encrypted backup
+const fs = require('fs');
+const encryptedData = fs.readFileSync('wallet-backup.enc');
+
+// Decrypt and load
+const walletDb = await WalletDB.loadEncrypted(
+  new Uint8Array(encryptedData),
+  'backup-password'
+);
+
+// Load the wallet
+const keyManager = await walletDb.loadWallet();
+console.log('Wallet restored');
+```
+
 ---
 
 ## Database Schema
@@ -682,12 +830,15 @@ The wallet database includes the following tables:
 |-------|-------------|
 | `keys` | Key pairs for transactions |
 | `out_keys` | Output-specific keys |
+| `crypted_keys` | Encrypted key pairs (when password set) |
+| `crypted_out_keys` | Encrypted output keys (when password set) |
 | `view_key` | View key for output detection |
 | `spend_key` | Spending public key |
 | `hd_chain` | HD chain information |
 | `sub_addresses` | Sub-address mappings |
 | `wallet_outputs` | Wallet UTXOs with amounts |
 | `wallet_metadata` | Wallet creation info |
+| `encryption_metadata` | Encryption parameters (salt, verification hash) |
 | `tx_keys` | Transaction keys (optional) |
 | `block_hashes` | Block hashes for reorg detection |
 | `sync_state` | Synchronization state |
@@ -752,12 +903,14 @@ npm install
 npm run build
 
 # Run tests
+npm run test              # Run all unit tests (vitest)
 npm run test:keymanager   # KeyManager tests
 npm run test:walletdb     # WalletDB tests
 npm run test:electrum     # Electrum client tests
 npm run test:client       # Full client tests (Electrum)
 npm run test:p2p          # P2P protocol tests
 npm run test:client:p2p   # Full client tests (P2P)
+npm run test:encryption   # Encryption module tests
 
 # Generate documentation
 npm run docs              # HTML docs in ./docs
@@ -773,6 +926,52 @@ npm run lint:fix
 # Analyze database size
 npm run analyze:db
 ```
+
+---
+
+### Encryption Module
+
+The SDK includes a low-level encryption module for password-based encryption.
+
+```typescript
+import {
+  encrypt,
+  decrypt,
+  deriveKey,
+  serializeEncryptedData,
+  deserializeEncryptedData,
+  createPasswordVerification,
+  verifyPassword,
+  randomBytes,
+} from 'navio-sdk';
+
+// Encrypt arbitrary data
+const plaintext = new TextEncoder().encode('secret data');
+const encrypted = await encrypt(plaintext, 'password');
+
+// Decrypt data
+const decrypted = await decrypt(encrypted, 'password');
+console.log(new TextDecoder().decode(decrypted)); // 'secret data'
+
+// Serialize for storage (converts to base64 strings)
+const serialized = serializeEncryptedData(encrypted);
+const json = JSON.stringify(serialized);
+
+// Deserialize from storage
+const parsed = JSON.parse(json);
+const deserialized = deserializeEncryptedData(parsed);
+
+// Password verification (for UI feedback)
+const salt = randomBytes(16);
+const hash = await createPasswordVerification('password', salt);
+const isValid = await verifyPassword('password', salt, hash);
+```
+
+**Security Properties:**
+- **Key Derivation**: Argon2id with 64MB memory, 3 iterations, 4 parallelism
+- **Encryption**: AES-256-GCM (authenticated encryption)
+- **Random IV**: 12 bytes per encryption (never reused)
+- **Random Salt**: 16 bytes per password derivation
 
 ---
 
