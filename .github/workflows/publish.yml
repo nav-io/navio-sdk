@@ -69,10 +69,6 @@ jobs:
       - name: Publish to npm with provenance
         if: steps.check_version.outputs.exists == 'false'
         run: npm publish --access public --provenance
-        env:
-          # Uses OIDC trusted publishing if configured on npm
-          # Falls back to NPM_TOKEN secret if set
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
       - name: Create GitHub Release
         if: steps.check_version.outputs.exists == 'false'
