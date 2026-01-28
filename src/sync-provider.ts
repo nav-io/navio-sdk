@@ -55,6 +55,21 @@ export interface ChainTip {
 }
 
 /**
+ * Block header notification from subscription
+ */
+export interface BlockHeaderNotification {
+  /** Block height */
+  height: number;
+  /** Block header hex (80 bytes) */
+  hex: string;
+}
+
+/**
+ * Block header subscription callback
+ */
+export type BlockHeaderCallback = (header: BlockHeaderNotification) => void;
+
+/**
  * Sync provider options
  */
 export interface SyncProviderOptions {
@@ -161,6 +176,37 @@ export interface SyncProvider {
    * @returns Raw transaction hex or verbose object
    */
   getRawTransaction(txHash: string, verbose?: boolean): Promise<string | unknown>;
+
+  // ============================================================================
+  // Optional Subscription Methods (not all providers support these)
+  // ============================================================================
+
+  /**
+   * Subscribe to new block headers (optional)
+   * Not all providers support real-time subscriptions.
+   * 
+   * @param callback - Callback invoked for each new block
+   * @returns The initial/current block header
+   */
+  subscribeBlockHeaders?(callback: BlockHeaderCallback): Promise<BlockHeaderNotification>;
+
+  /**
+   * Unsubscribe a specific block header callback (optional)
+   * 
+   * @param callback - The callback to remove (same reference as subscribeBlockHeaders)
+   * @returns True if callback was found and removed
+   */
+  unsubscribeBlockHeaders?(callback: BlockHeaderCallback): boolean;
+
+  /**
+   * Unsubscribe all block header callbacks (optional)
+   */
+  unsubscribeAllBlockHeaders?(): void;
+
+  /**
+   * Check if there are active block header subscriptions (optional)
+   */
+  hasBlockHeaderSubscriptions?(): boolean;
 }
 
 /**

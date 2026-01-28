@@ -151,6 +151,10 @@ export class NavioClient {
   private isSyncInProgress = false;
   private lastKnownBalance: bigint = 0n;
 
+  // Block header subscription callback (for unsubscribe)
+  private blockHeaderCallback: ((header: { height: number; hex: string }) => void) | null = null;
+  private usingSubscriptions = false;
+
   /**
    * Create a new NavioClient instance
    * @param config - Client configuration
@@ -417,7 +421,36 @@ export class NavioClient {
     // Perform initial sync to tip
     await this.performBackgroundSync();
 
-    // Start polling
+    // Try to use subscriptions if available (Electrum backend supports this)
+    if (this.syncProvider.subscribeBlockHeaders) {
+      try {
+        // Create callback for block notifications
+        this.blockHeaderCallback = async (_header: { height: number; hex: string }) => {
+          // New block received - trigger sync
+          await this.performBackgroundSync();
+        };
+
+        // Subscribe to block headers
+        await this.syncProvider.subscribeBlockHeaders(this.blockHeaderCallback);
+        this.usingSubscriptions = true;
+
+        // Still use polling as backup, but with longer interval when using subscriptions
+        // This handles cases where subscription notifications might be missed
+        const backupInterval = Math.max(this.backgroundSyncOptions.pollInterval! * 3, 30000);
+        this.backgroundSyncTimer = setInterval(async () => {
+          await this.performBackgroundSync();
+        }, backupInterval);
+
+        return;
+      } catch (error) {
+        // Subscription failed, fall back to polling
+        console.warn('Block header subscription failed, falling back to polling:', error);
+        this.usingSubscriptions = false;
+        this.blockHeaderCallback = null;
+      }
+    }
+
+    // Polling-based sync (for P2P backend or when subscriptions fail)
     this.backgroundSyncTimer = setInterval(async () => {
       await this.performBackgroundSync();
     }, this.backgroundSyncOptions.pollInterval!);
@@ -427,10 +460,19 @@ export class NavioClient {
    * Stop background synchronization.
    */
   stopBackgroundSync(): void {
+    // Stop polling timer
     if (this.backgroundSyncTimer) {
       clearInterval(this.backgroundSyncTimer);
       this.backgroundSyncTimer = null;
     }
+
+    // Unsubscribe from block headers if using subscriptions
+    if (this.usingSubscriptions && this.blockHeaderCallback && this.syncProvider.unsubscribeBlockHeaders) {
+      this.syncProvider.unsubscribeBlockHeaders(this.blockHeaderCallback);
+    }
+
+    this.blockHeaderCallback = null;
+    this.usingSubscriptions = false;
     this.isBackgroundSyncing = false;
     this.backgroundSyncOptions = null;
   }
@@ -441,6 +483,16 @@ export class NavioClient {
    */
   isBackgroundSyncActive(): boolean {
     return this.isBackgroundSyncing;
+  }
+
+  /**
+   * Check if background sync is using real-time subscriptions.
+   * When true, the client receives instant notifications on new blocks.
+   * When false, the client uses polling at the configured interval.
+   * @returns True if using subscriptions
+   */
+  isUsingSubscriptions(): boolean {
+    return this.usingSubscriptions;
   }
 
   /**

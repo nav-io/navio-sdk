@@ -80,7 +80,7 @@
         "@noble/hashes": "^1.3.3",
         "@scure/bip39": "^2.0.1",
         "hash-wasm": "^4.12.0",
-        "navio-blsct": "^1.1.3",
+        "navio-blsct": "^1.1.4",
         "sql.js": "^1.10.3",
         "ws": "^8.18.3"
     }

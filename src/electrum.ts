@@ -13,6 +13,30 @@ import { ripemd160 } from '@noble/hashes/ripemd160';
 // Import WebSocket - use native WebSocket in browser, ws in Node.js
 let WebSocketClass: any;
 let isBrowserWebSocket = false;
+
+// Allow overriding WebSocket class for testing
+let webSocketOverride: any = null;
+
+/**
+ * Set a custom WebSocket class for testing purposes.
+ * Call with null to restore default behavior.
+ * @internal
+ */
+export function setWebSocketClass(wsClass: any): void {
+  webSocketOverride = wsClass;
+}
+
+/**
+ * Get the current WebSocket class being used
+ * @internal
+ */
+export function getWebSocketClass(): any {
+  if (webSocketOverride) {
+    return webSocketOverride;
+  }
+  return WebSocketClass;
+}
+
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 if (typeof (globalThis as any).window !== 'undefined' && (globalThis as any).window?.WebSocket) {
   // Browser environment - use native WebSocket
@@ -147,6 +171,21 @@ export class ElectrumError extends Error {
 }
 
 /**
+ * Block header notification from subscription
+ */
+export interface BlockHeaderNotification {
+  /** Block height */
+  height: number;
+  /** Block header hex (80 bytes) */
+  hex: string;
+}
+
+/**
+ * Subscription callback type
+ */
+export type SubscriptionCallback = (params: any) => void;
+
+/**
  * Electrum Client - Connects to Electrum servers.
  * 
  * Low-level client for the Electrum protocol. For most use cases,
@@ -164,6 +203,13 @@ export class ElectrumClient {
   private connected = false;
   private options: Required<ElectrumOptions>;
   private reconnectAttempts = 0;
+
+  /**
+   * Subscription callbacks map
+   * Key: subscription method name (e.g., 'blockchain.headers.subscribe')
+   * Value: Set of callbacks to invoke when notification is received
+   */
+  private subscriptionCallbacks = new Map<string, Set<SubscriptionCallback>>();
 
   constructor(options: ElectrumOptions = {}) {
     this.options = {
@@ -189,7 +235,8 @@ export class ElectrumClient {
       const url = `${protocol}://${this.options.host}:${this.options.port}`;
 
       try {
-        this.ws = new WebSocketClass(url);
+        const WsClass = getWebSocketClass();
+        this.ws = new WsClass(url);
 
         attachWebSocketHandler(this.ws, 'open', async () => {
           this.connected = true;
@@ -231,6 +278,8 @@ export class ElectrumClient {
             reject(new Error('Connection closed'));
           }
           this.pendingRequests.clear();
+          // Clear subscription callbacks on disconnect
+          this.subscriptionCallbacks.clear();
         });
       } catch (error) {
         reject(error);
@@ -242,6 +291,14 @@ export class ElectrumClient {
    * Handle incoming response from server
    */
   private handleResponse(response: any): void {
+    // Handle subscription notifications (has method, no id or id is null)
+    // Electrum sends notifications like: {"method": "blockchain.headers.subscribe", "params": [...]}
+    if (response.method && response.params !== undefined && response.id === undefined) {
+      this.handleNotification(response.method, response.params);
+      return;
+    }
+
+    // Handle request/response messages
     if (response.id !== undefined && this.pendingRequests.has(response.id)) {
       const { resolve, reject, timeout } = this.pendingRequests.get(response.id)!;
       clearTimeout(timeout);
@@ -256,6 +313,24 @@ export class ElectrumClient {
         reject(error);
       } else {
         resolve(response.result);
+      }
+    }
+  }
+
+  /**
+   * Handle subscription notification from server
+   * @param method - Subscription method name
+   * @param params - Notification parameters
+   */
+  private handleNotification(method: string, params: any): void {
+    const callbacks = this.subscriptionCallbacks.get(method);
+    if (callbacks) {
+      for (const callback of callbacks) {
+        try {
+          callback(params);
+        } catch (error) {
+          console.error(`Error in subscription callback for ${method}:`, error);
+        }
       }
     }
   }
@@ -303,6 +378,8 @@ export class ElectrumClient {
    * Disconnect from the server
    */
   disconnect(): void {
+    // Clear subscription callbacks before closing
+    this.subscriptionCallbacks.clear();
     if (this.ws) {
       this.ws.close();
       this.ws = null;
@@ -353,14 +430,64 @@ export class ElectrumClient {
 
   /**
    * Subscribe to block headers
+   * Registers a callback that will be invoked for each new block.
+   * The callback receives block header notifications with height and hex.
+   * 
    * @param callback - Callback function for new headers
+   * @returns The initial header (current chain tip)
    */
-  async subscribeBlockHeaders(callback: (header: any) => void): Promise<void> {
-    // Electrum protocol uses notifications for subscriptions
-    // This would need to be implemented with notification handling
-    // For now, return the initial header
-    const header = await this.call('blockchain.headers.subscribe');
-    callback(header);
+  async subscribeBlockHeaders(callback: (header: BlockHeaderNotification) => void): Promise<BlockHeaderNotification> {
+    const method = 'blockchain.headers.subscribe';
+
+    // Register the callback for ongoing notifications
+    if (!this.subscriptionCallbacks.has(method)) {
+      this.subscriptionCallbacks.set(method, new Set());
+    }
+    this.subscriptionCallbacks.get(method)!.add(callback);
+
+    // Subscribe and get initial header
+    const result = await this.call(method);
+
+    // Normalize the response to BlockHeaderNotification format
+    const header: BlockHeaderNotification = {
+      height: result.height,
+      hex: result.hex,
+    };
+
+    return header;
+  }
+
+  /**
+   * Unsubscribe from block headers
+   * Removes a previously registered callback.
+   * 
+   * @param callback - The callback to remove (must be the same reference)
+   * @returns True if callback was found and removed
+   */
+  unsubscribeBlockHeaders(callback: (header: BlockHeaderNotification) => void): boolean {
+    const method = 'blockchain.headers.subscribe';
+    const callbacks = this.subscriptionCallbacks.get(method);
+    if (callbacks) {
+      return callbacks.delete(callback);
+    }
+    return false;
+  }
+
+  /**
+   * Remove all block header subscription callbacks
+   */
+  unsubscribeAllBlockHeaders(): void {
+    const method = 'blockchain.headers.subscribe';
+    this.subscriptionCallbacks.delete(method);
+  }
+
+  /**
+   * Check if there are active block header subscriptions
+   */
+  hasBlockHeaderSubscriptions(): boolean {
+    const method = 'blockchain.headers.subscribe';
+    const callbacks = this.subscriptionCallbacks.get(method);
+    return callbacks !== undefined && callbacks.size > 0;
   }
 
   /**

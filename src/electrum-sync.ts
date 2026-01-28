@@ -5,7 +5,7 @@
  * This is a wrapper around ElectrumClient that provides the standardized sync interface.
  */
 
-import { BaseSyncProvider, BlockHeadersResult, ChainTip, SyncProviderOptions } from './sync-provider';
+import { BaseSyncProvider, BlockHeadersResult, ChainTip, SyncProviderOptions, BlockHeaderNotification, BlockHeaderCallback } from './sync-provider';
 import { ElectrumClient, ElectrumOptions, BlockTransactionKeys, TransactionKeys } from './electrum';
 
 /**
@@ -174,11 +174,43 @@ export class ElectrumSyncProvider extends BaseSyncProvider {
     return this.client.getServerVersion();
   }
 
+  // ============================================================================
+  // Subscription Methods (implements optional SyncProvider interface)
+  // ============================================================================
+
   /**
    * Subscribe to block headers
+   * Registers a callback that will be invoked for each new block.
+   * 
+   * @param callback - Callback for new block headers
+   * @returns The initial/current block header
    */
-  async subscribeBlockHeaders(callback: (header: any) => void): Promise<void> {
+  async subscribeBlockHeaders(callback: BlockHeaderCallback): Promise<BlockHeaderNotification> {
     return this.client.subscribeBlockHeaders(callback);
+  }
+
+  /**
+   * Unsubscribe a specific block header callback
+   * 
+   * @param callback - The callback to remove
+   * @returns True if callback was found and removed
+   */
+  unsubscribeBlockHeaders(callback: BlockHeaderCallback): boolean {
+    return this.client.unsubscribeBlockHeaders(callback);
+  }
+
+  /**
+   * Unsubscribe all block header callbacks
+   */
+  unsubscribeAllBlockHeaders(): void {
+    this.client.unsubscribeAllBlockHeaders();
+  }
+
+  /**
+   * Check if there are active block header subscriptions
+   */
+  hasBlockHeaderSubscriptions(): boolean {
+    return this.client.hasBlockHeaderSubscriptions();
   }
 
   /**
