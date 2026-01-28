@@ -9,6 +9,7 @@
 
 import { sha256 } from '@noble/hashes/sha256';
 import { ripemd160 } from '@noble/hashes/ripemd160';
+import type { BlockHeaderNotification } from './sync-provider';
 
 // Import WebSocket - use native WebSocket in browser, ws in Node.js
 let WebSocketClass: any;
@@ -170,15 +171,7 @@ export class ElectrumError extends Error {
   }
 }
 
-/**
- * Block header notification from subscription
- */
-export interface BlockHeaderNotification {
-  /** Block height */
-  height: number;
-  /** Block header hex (80 bytes) */
-  hex: string;
-}
+
 
 /**
  * Subscription callback type
