@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { ElectrumClient, BlockHeaderNotification, setWebSocketClass } from './electrum';
+import { ElectrumClient, setWebSocketClass } from './electrum';
+import type { BlockHeaderNotification } from './sync-provider';
 
 // Mock WebSocket for testing
 class MockWebSocket {
