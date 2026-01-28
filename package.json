@@ -52,6 +52,10 @@
     ],
     "author": "",
     "license": "MIT",
+    "repository": {
+        "type": "git",
+        "url": "https://github.com/nav-io/navio-sdk"
+    },
     "devDependencies": {
         "@types/node": "^20.10.0",
         "@types/sql.js": "^1.4.8",
