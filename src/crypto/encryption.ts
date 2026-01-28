@@ -8,7 +8,7 @@
 
 /// <reference lib="dom" />
 
-import argon2 from 'argon2-browser';
+import { argon2id } from 'hash-wasm';
 
 // Type aliases for Web Crypto API (works in both browser and Node.js)
 type WebCrypto = typeof globalThis.crypto;
@@ -54,11 +54,10 @@ export interface SerializedEncryptedData {
  * Using recommended settings for sensitive data protection
  */
 const ARGON2_PARAMS = {
-  type: argon2.ArgonType.Argon2id,
-  memory: 65536, // 64 MB
+  memorySize: 65536, // 64 MB (hash-wasm uses memorySize instead of memory)
   iterations: 3,
   parallelism: 4,
-  hashLen: 32, // 256 bits for AES-256
+  hashLength: 32, // 256 bits for AES-256 (hash-wasm uses hashLength instead of hashLen)
 };
 
 /**
@@ -117,21 +116,24 @@ export function randomBytes(length: number): Uint8Array {
  */
 export async function deriveKey(password: string, salt: Uint8Array): Promise<WebCryptoKey> {
   // Use Argon2id to derive key material from password
-  const result = await argon2.hash({
-    pass: password,
+  const hashHex = await argon2id({
+    password: password,
     salt: salt,
-    type: ARGON2_PARAMS.type,
-    mem: ARGON2_PARAMS.memory,
-    time: ARGON2_PARAMS.iterations,
+    memorySize: ARGON2_PARAMS.memorySize,
+    iterations: ARGON2_PARAMS.iterations,
     parallelism: ARGON2_PARAMS.parallelism,
-    hashLen: ARGON2_PARAMS.hashLen,
+    hashLength: ARGON2_PARAMS.hashLength,
+    outputType: 'hex',
   });
+
+  // Convert hex string to Uint8Array
+  const hashBytes = hexToBytes(hashHex);
 
   // Import the derived key material as an AES-GCM key
   const crypto = getCrypto();
   const key = await crypto.subtle.importKey(
     'raw',
-    toBufferSource(result.hash),
+    toBufferSource(hashBytes),
     { name: 'AES-GCM', length: 256 },
     false, // not extractable
     ['encrypt', 'decrypt']
@@ -149,17 +151,17 @@ export async function deriveKey(password: string, salt: Uint8Array): Promise<Web
  * @returns 32 bytes of derived key material
  */
 export async function deriveKeyBytes(password: string, salt: Uint8Array): Promise<Uint8Array> {
-  const result = await argon2.hash({
-    pass: password,
+  const hashHex = await argon2id({
+    password: password,
     salt: salt,
-    type: ARGON2_PARAMS.type,
-    mem: ARGON2_PARAMS.memory,
-    time: ARGON2_PARAMS.iterations,
+    memorySize: ARGON2_PARAMS.memorySize,
+    iterations: ARGON2_PARAMS.iterations,
     parallelism: ARGON2_PARAMS.parallelism,
-    hashLen: ARGON2_PARAMS.hashLen,
+    hashLength: ARGON2_PARAMS.hashLength,
+    outputType: 'hex',
   });
 
-  return result.hash;
+  return hexToBytes(hashHex);
 }
 
 /**
@@ -434,7 +436,18 @@ export async function verifyPassword(
   return result === 0;
 }
 
-// Utility functions for base64 encoding/decoding
+// Utility functions for encoding/decoding
+
+/**
+ * Convert hex string to bytes
+ */
+function hexToBytes(hex: string): Uint8Array {
+  const bytes = new Uint8Array(hex.length / 2);
+  for (let i = 0; i < bytes.length; i++) {
+    bytes[i] = parseInt(hex.substr(i * 2, 2), 16);
+  }
+  return bytes;
+}
 
 /**
  * Convert bytes to base64 string
