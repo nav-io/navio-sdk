@@ -207,7 +207,7 @@ export class KeyManager {
   }
 
   /**
-   * Lock the wallet, clearing the cached encryption key
+   * Lock the wallet, clearing the cached encryption key and unencrypted keys
    * After locking, private keys cannot be accessed without unlocking again
    */
   lock(): void {
@@ -218,9 +218,12 @@ export class KeyManager {
     // Clear cached encryption key
     this.encryptionKey = null;
 
-    // Clear any decrypted private keys from memory (except view key for scanning)
-    // Note: In a more secure implementation, we'd also clear the view key
-    // and require unlock for any operation
+    // Clear unencrypted private keys from memory
+    // These are stored encrypted in cryptedKeys/cryptedOutKeys
+    this.keys.clear();
+    this.outKeys.clear();
+
+    // Note: View key is kept in memory for scanning (read-only operations)
   }
 
   /**
@@ -286,6 +289,24 @@ export class KeyManager {
   }
 
   /**
+   * Get key storage statistics (for testing/debugging)
+   * @returns Object with counts of plain and encrypted keys
+   */
+  getKeyStats(): {
+    plainKeys: number;
+    plainOutKeys: number;
+    encryptedKeys: number;
+    encryptedOutKeys: number;
+  } {
+    return {
+      plainKeys: this.keys.size,
+      plainOutKeys: this.outKeys.size,
+      encryptedKeys: this.cryptedKeys.size,
+      encryptedOutKeys: this.cryptedOutKeys.size,
+    };
+  }
+
+  /**
    * Encrypt all private keys in the wallet
    * Internal method called when setting password
    */
@@ -315,6 +336,10 @@ export class KeyManager {
         encryptedSecret: this.serializeEncryptedToBytes(encrypted),
       });
     }
+
+    // Clear unencrypted keys from memory - they are now stored encrypted
+    this.keys.clear();
+    this.outKeys.clear();
 
     // Note: We keep the view key in memory for scanning, even when encrypted
     // The master seed is NOT stored encrypted - it should be backed up separately
