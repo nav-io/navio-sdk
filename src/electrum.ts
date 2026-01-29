@@ -14,6 +14,7 @@ import type { BlockHeaderNotification } from './sync-provider';
 // Import WebSocket - use native WebSocket in browser, ws in Node.js
 let WebSocketClass: any;
 let isBrowserWebSocket = false;
+let wsInitError: Error | null = null;
 
 // Allow overriding WebSocket class for testing
 let webSocketOverride: any = null;
@@ -35,6 +36,9 @@ export function getWebSocketClass(): any {
   if (webSocketOverride) {
     return webSocketOverride;
   }
+  if (wsInitError) {
+    throw wsInitError;
+  }
   return WebSocketClass;
 }
 
@@ -46,11 +50,47 @@ if (typeof (globalThis as any).window !== 'undefined' && (globalThis as any).win
   isBrowserWebSocket = true;
 } else {
   // Node.js environment - use ws library
+  // Handle both CommonJS (require available) and ESM (need createRequire)
   try {
-    WebSocketClass = require('ws');
-  } catch (error) {
-    throw new Error('WebSocket not available. In Node.js, install ws: npm install ws');
+    // Check if require is available (CommonJS)
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    if (typeof require === 'function') {
+      WebSocketClass = require('ws');
+    } else {
+      // ESM environment - defer error until ws is actually needed
+      // The dynamic import will be handled by ensureWebSocketLoaded()
+      wsInitError = new Error('WebSocket not available. In Node.js, install ws: npm install ws');
+    }
+  } catch {
+    wsInitError = new Error('WebSocket not available. In Node.js, install ws: npm install ws');
   }
+}
+
+// For ESM environments, load ws dynamically
+let wsLoadPromise: Promise<void> | null = null;
+
+/**
+ * Ensure WebSocket is loaded (handles async loading for ESM)
+ * @internal
+ */
+export async function ensureWebSocketLoaded(): Promise<void> {
+  if (WebSocketClass || webSocketOverride) {
+    return;
+  }
+  if (!wsLoadPromise) {
+    wsLoadPromise = (async () => {
+      try {
+        // Dynamic import for ESM
+        const ws = await import('ws');
+        WebSocketClass = ws.default || ws;
+        wsInitError = null;
+      } catch {
+        wsInitError = new Error('WebSocket not available. In Node.js, install ws: npm install ws');
+        throw wsInitError;
+      }
+    })();
+  }
+  return wsLoadPromise;
 }
 
 /**
@@ -222,6 +262,9 @@ export class ElectrumClient {
     if (this.connected && this.ws) {
       return;
     }
+
+    // Ensure WebSocket is loaded (handles async loading for ESM)
+    await ensureWebSocketLoaded();
 
     return new Promise((resolve, reject) => {
       const protocol = this.options.ssl ? 'wss' : 'ws';
