@@ -4,7 +4,7 @@
 
 ```bash
 # Clone the repository
-git clone https://github.com/navio/navio-sdk.git
+git clone https://github.com/nav-io/navio-sdk.git
 cd navio-sdk
 
 # Install dependencies
@@ -166,6 +166,8 @@ npm run test:electrum
 npm run test:client
 npm run test:p2p
 npm run test:client:p2p
+npm run test:encryption
+npm run test:tx-keys-sync
 ```
 
 ## Project Structure
@@ -183,6 +185,9 @@ navio-sdk/
 │   ├── electrum-sync.ts   # ElectrumSyncProvider class
 │   ├── p2p-protocol.ts    # P2PClient class
 │   ├── p2p-sync.ts        # P2PSyncProvider class
+│   ├── database-adapter.ts # Cross-platform SQLite adapter
+│   ├── adapters/          # Database adapters (node, indexeddb)
+│   ├── crypto/            # Encryption module (Argon2id + AES-256-GCM)
 │   ├── types.ts           # Shared types
 │   └── *.types.ts         # Type definitions
 ├── scripts/               # Test and utility scripts

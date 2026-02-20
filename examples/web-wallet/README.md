@@ -14,7 +14,7 @@ A basic web wallet example demonstrating how to use `navio-sdk` in a browser env
 
 ## Prerequisites
 
-- Node.js 16+
+- Node.js 20+
 - An Electrum server running (default: localhost:50001)
 
 ## Setup

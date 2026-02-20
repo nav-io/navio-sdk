@@ -75,6 +75,9 @@ interface NavioClientConfig {
   // Required
   walletDbPath: string;              // Path to wallet database file
 
+  // Database adapter (auto-detected if not specified)
+  databaseAdapter?: 'indexeddb' | 'browser' | 'better-sqlite3';
+
   // Backend selection (default: 'electrum')
   backend?: 'electrum' | 'p2p';
 
@@ -281,6 +284,70 @@ Returns the configured network.
 ##### `isConnected(): boolean`
 
 Check if client is connected to the backend.
+
+#### Transaction Creation
+
+##### `sendTransaction(options: SendTransactionOptions): Promise<SendTransactionResult>`
+
+Build and broadcast a confidential transaction. Selects UTXOs, constructs a BLSCT confidential transaction with change, and broadcasts via the connected backend.
+
+```typescript
+interface SendTransactionOptions {
+  address: string;                   // Destination address (bech32m encoded)
+  amount: bigint;                    // Amount to send in satoshis
+  memo?: string;                     // Optional memo
+  subtractFeeFromAmount?: boolean;   // Subtract fee from amount (default: false)
+  tokenId?: string | null;           // Token ID (null for NAV)
+}
+
+interface SendTransactionResult {
+  txId: string;                      // Transaction ID (hex)
+  rawTx: string;                     // Serialized transaction (hex)
+  fee: bigint;                       // Fee paid in satoshis
+  inputCount: number;                // Inputs used
+  outputCount: number;               // Outputs created (including change)
+}
+```
+
+```typescript
+const result = await client.sendTransaction({
+  address: 'tnav1...',
+  amount: 100_000_000n, // 1 NAV
+  memo: 'Payment',
+});
+console.log('Sent tx:', result.txId);
+console.log('Fee:', Number(result.fee) / 1e8, 'NAV');
+```
+
+##### `broadcastRawTransaction(rawTx: string): Promise<string>`
+
+Broadcast a pre-built raw transaction hex via the connected backend. Returns the transaction hash.
+
+#### Chain & Metadata
+
+##### `getChainTip(): Promise<{ height: number; hash: string }>`
+
+Get the current chain tip from the backend.
+
+##### `getCreationHeight(): Promise<number>`
+
+Get the wallet creation height (block height to start scanning from).
+
+##### `setCreationHeight(height: number): Promise<void>`
+
+Set the wallet creation height.
+
+##### `getWalletMetadata(): Promise<WalletMetadata | null>`
+
+Get wallet metadata including creation height, creation time, and version.
+
+##### `getConfig(): NavioClientConfig`
+
+Get the current client configuration.
+
+##### `isUsingSubscriptions(): boolean`
+
+Check if background sync is using real-time block header subscriptions (Electrum) vs polling (P2P).
 
 #### Connection
 
@@ -591,6 +658,12 @@ interface SyncProvider {
   getTransactionOutput(outputHash: string): Promise<string>;
   broadcastTransaction(rawTx: string): Promise<string>;
   getRawTransaction(txHash: string, verbose?: boolean): Promise<string | any>;
+
+  // Optional subscription methods (Electrum only)
+  subscribeBlockHeaders?(callback: BlockHeaderCallback): Promise<BlockHeaderNotification>;
+  unsubscribeBlockHeaders?(callback: BlockHeaderCallback): boolean;
+  unsubscribeAllBlockHeaders?(): void;
+  hasBlockHeaderSubscriptions?(): boolean;
 }
 ```
 
@@ -791,6 +864,38 @@ process.on('SIGINT', async () => {
 });
 ```
 
+### Send a Transaction
+
+```typescript
+import { NavioClient } from 'navio-sdk';
+
+const client = new NavioClient({
+  walletDbPath: './wallet.db',
+  electrum: { host: 'localhost', port: 50005 },
+  network: 'testnet',
+});
+
+await client.initialize();
+
+// Send 1 NAV
+const result = await client.sendTransaction({
+  address: 'tnav1...',
+  amount: 100_000_000n, // 1 NAV in satoshis
+  memo: 'Coffee payment',
+});
+
+console.log('Transaction ID:', result.txId);
+console.log('Fee:', Number(result.fee) / 1e8, 'NAV');
+console.log('Inputs:', result.inputCount, 'Outputs:', result.outputCount);
+
+// Send with fee subtracted from amount
+const result2 = await client.sendTransaction({
+  address: 'tnav1...',
+  amount: 50_000_000n,
+  subtractFeeFromAmount: true,
+});
+```
+
 ### Query Wallet Outputs
 
 ```typescript
@@ -976,13 +1081,17 @@ npm run test:client       # Full client tests (Electrum)
 npm run test:p2p          # P2P protocol tests
 npm run test:client:p2p   # Full client tests (P2P)
 npm run test:encryption   # Encryption module tests
+npm run test:tx-keys-sync # Transaction keys sync tests
 
 # Generate documentation
-npm run docs              # HTML docs in ./docs
-npm run docs:md           # Markdown docs in ./docs/api
+npm run docs              # Markdown docs (default, via typedoc)
+npm run docs:html         # HTML docs
 
 # Type checking
 npm run typecheck
+
+# Formatting
+npm run format
 
 # Linting
 npm run lint
@@ -1042,9 +1151,9 @@ const isValid = await verifyPassword('password', salt, hash);
 
 ## Known Limitations
 
-1. **Amount Recovery**: The `navio-blsct` library v1.0.20 has a bug in `RangeProof.recoverAmounts()`. Outputs are detected and stored but amounts show as 0 until the library is updated.
+1. **Token Support**: Token transfers are tracked but not fully implemented for spending.
 
-2. **Token Support**: Token transfers are tracked but not fully implemented for spending.
+2. **Browser bech32m**: In browser environments using navio-blsct WASM, bech32m address encoding may fall back to hex representation.
 
 ---
 
