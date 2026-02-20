@@ -7,9 +7,27 @@ export * from './types';
 export * from './key-manager';
 export * from './key-manager.types';
 export * from './wallet-db';
+export * from './wallet-db.interface';
 export * from './electrum';
 export * from './tx-keys-sync';
 export * from './crypto';
+
+// Database Adapters (cross-platform SQLite)
+export {
+  createDatabaseAdapter,
+  detectEnvironment,
+  isOpfsAvailable,
+  isWorkerAvailable,
+  type IDatabaseAdapter,
+  type IPreparedStatement,
+  type QueryResult,
+  type RowObject,
+  type DatabaseAdapterType,
+  type DatabaseAdapterOptions,
+} from './database-adapter';
+
+// IndexedDB Adapter (browser, no WASM)
+export { IndexedDBWalletDB } from './adapters/indexeddb-wallet-db';
 
 // Sync Provider Architecture
 export * from './sync-provider';

@@ -10,27 +10,13 @@
 
 import { SyncProvider } from './sync-provider';
 import { ElectrumClient } from './electrum';
-import { WalletDB } from './wallet-db';
 import { KeyManager } from './key-manager';
 import type { BlockTransactionKeys, TransactionKeys } from './electrum';
+import type { IWalletDB, SyncState } from './wallet-db.interface';
 import * as blsctModule from 'navio-blsct';
 import { sha256 } from '@noble/hashes/sha256';
 
-/**
- * Sync state stored in database
- */
-export interface SyncState {
-  /** Last synced block height */
-  lastSyncedHeight: number;
-  /** Last synced block hash */
-  lastSyncedHash: string;
-  /** Total transaction keys synced */
-  totalTxKeysSynced: number;
-  /** Last sync timestamp */
-  lastSyncTime: number;
-  /** Chain tip at last sync */
-  chainTipAtLastSync: number;
-}
+export type { SyncState } from './wallet-db.interface';
 
 /**
  * Sync progress callback
@@ -120,18 +106,18 @@ export interface ReorganizationInfo {
  * @category Sync
  */
 export class TransactionKeysSync {
-  private walletDB: WalletDB;
+  private walletDB: IWalletDB;
   private syncProvider: SyncProvider;
   private keyManager: KeyManager | null = null;
   private syncState: SyncState | null = null;
-  private blockHashRetention: number = 10000; // Keep last 10k block hashes by default
+  private blockHashRetention: number = 10000;
 
   /**
    * Create a new TransactionKeysSync instance
-   * @param walletDB - The wallet database
+   * @param walletDB - The wallet database (WalletDB or IndexedDBWalletDB)
    * @param provider - A SyncProvider or ElectrumClient instance
    */
-  constructor(walletDB: WalletDB, provider: SyncProvider | ElectrumClient) {
+  constructor(walletDB: IWalletDB, provider: SyncProvider | ElectrumClient) {
     this.walletDB = walletDB;
 
     // Support both SyncProvider and legacy ElectrumClient
@@ -308,71 +294,68 @@ export class TransactionKeysSync {
     let blocksProcessed = 0;
     let lastSaveHeight = syncStartHeight - 1;
 
-    // Sync in batches - server will return as many blocks as fit in max_send
-    // We keep fetching until we reach the end height
-    while (currentHeight <= syncEndHeight) {
-      // Fetch transaction keys - server will return maximum possible blocks
-      const rangeResult = await this.syncProvider.getBlockTransactionKeysRange(currentHeight);
+    // Pipeline: prefetch the next batch of tx keys + headers while
+    // processing the current batch, eliminating the ~2s pause between batches.
 
-      // Batch fetch all block headers for this batch
-      const blockHeights = rangeResult.blocks
-        .filter(block => block.height <= syncEndHeight)
-        .map(block => block.height);
+    // Kick off the first tx keys fetch
+    let pendingRangePromise: Promise<{ blocks: BlockTransactionKeys[]; nextHeight: number }> | null =
+      this.syncProvider.getBlockTransactionKeysRange(currentHeight);
 
-      let blockHeadersMap: Map<number, string> = new Map();
-      if (blockHeights.length > 0 && verifyHashes) {
-        // Fetch headers in batch using getBlockHeaders
-        const firstHeight = blockHeights[0];
-        const count = blockHeights.length;
-        const headersResult = await this.syncProvider.getBlockHeaders(firstHeight, count);
+    while (currentHeight <= syncEndHeight && pendingRangePromise) {
+      // Await the current batch (already in flight)
+      const rangeResult = await pendingRangePromise;
+      pendingRangePromise = null;
 
-        // Parse concatenated hex string - each header is 80 bytes (160 hex chars)
-        const headerSize = 160; // 80 bytes * 2 hex chars per byte
-        const hex = headersResult.hex;
+      const blocksToProcess = rangeResult.blocks.filter(b => b.height <= syncEndHeight);
+      if (blocksToProcess.length === 0) break;
 
-        // Map headers by height
-        for (let i = 0; i < count && i * headerSize < hex.length; i++) {
-          const height = firstHeight + i;
-          const headerStart = i * headerSize;
-          const headerEnd = headerStart + headerSize;
-          const headerHex = hex.substring(headerStart, headerEnd);
-          blockHeadersMap.set(height, headerHex);
-        }
+      const firstHeight = blocksToProcess[0].height;
+      const lastHeight = blocksToProcess[blocksToProcess.length - 1].height;
+      const nextBatchHeight = rangeResult.nextHeight;
+
+      // Safety check to prevent infinite loops
+      if (nextBatchHeight <= rangeResult.blocks[rangeResult.blocks.length - 1]?.height) {
+        throw new Error(
+          `Server did not advance next_height properly. Current: ${nextBatchHeight}, Last block: ${rangeResult.blocks[rangeResult.blocks.length - 1]?.height}`
+        );
       }
 
-      // Process each block in the batch
-      for (const block of rangeResult.blocks) {
-        if (block.height > syncEndHeight) {
-          break;
-        }
+      // Immediately start prefetching the NEXT batch of tx keys so it
+      // downloads in parallel with our processing of the current batch.
+      if (nextBatchHeight <= syncEndHeight) {
+        pendingRangePromise = this.syncProvider.getBlockTransactionKeysRange(nextBatchHeight);
+      }
 
-        // Get block header and hash (from batch or fetch individually if not verifying)
-        let blockHash: string;
-        if (verifyHashes && blockHeadersMap.has(block.height)) {
-          const blockHeader = blockHeadersMap.get(block.height)!;
-          blockHash = this.extractBlockHash(blockHeader);
-        } else if (verifyHashes) {
-          // Fallback: fetch individual header if not in batch
-          const blockHeader = await this.syncProvider.getBlockHeader(block.height);
-          blockHash = this.extractBlockHash(blockHeader);
-        } else {
-          // If not verifying, we can skip header fetch for now
-          // But we still need a hash for storage - use a placeholder or fetch minimal
-          // For now, let's fetch it but this could be optimized further
-          const blockHeader = await this.syncProvider.getBlockHeader(block.height);
-          blockHash = this.extractBlockHash(blockHeader);
-        }
+      // Header pipeline: one-ahead prefetch so the next chunk loads while we process the current one
+      const CS = TransactionKeysSync.HEADER_CHUNK_SIZE;
+      let chunkStart = firstHeight;
+      let currentHeaders = await this.fetchHeaderChunk(chunkStart, CS);
+      let nextChunkStart = chunkStart + CS;
+      let nextHeadersPromise: Promise<Map<number, string>> | null =
+        nextChunkStart <= lastHeight ? this.fetchHeaderChunk(nextChunkStart, CS) : null;
 
-        // Verify block hash if requested
+      let lastBlockHash = '';
+      // Process each block using the current chunk; when we cross into the next chunk, swap and prefetch
+      for (const block of blocksToProcess) {
+        if (!currentHeaders.has(block.height) && nextHeadersPromise) {
+          currentHeaders = await nextHeadersPromise;
+          nextHeadersPromise = null;
+          chunkStart = nextChunkStart;
+          nextChunkStart = chunkStart + CS;
+          if (nextChunkStart <= lastHeight) {
+            nextHeadersPromise = this.fetchHeaderChunk(nextChunkStart, CS);
+          }
+        }
+        const headerHex = currentHeaders.get(block.height)!;
+        const blockHash = this.extractBlockHash(headerHex);
+        lastBlockHash = blockHash;
+
         if (verifyHashes) {
-          // Store block hash for future verification (pass chainTip to avoid repeated fetches)
           await this.storeBlockHash(block.height, blockHash, chainTip);
 
-          // Check for reorganization
           if (this.syncState && block.height <= this.syncState.lastSyncedHeight) {
             const storedHash = await this.getStoredBlockHash(block.height);
             if (storedHash && storedHash !== blockHash) {
-              // Reorganization detected
               const reorgInfo: ReorganizationInfo = {
                 height: block.height,
                 oldHash: storedHash,
@@ -391,14 +374,11 @@ export class TransactionKeysSync {
             }
           }
         } else {
-          // Still store block hash even if not verifying (pass chainTip to avoid repeated fetches)
           await this.storeBlockHash(block.height, blockHash, chainTip);
         }
 
-        // Store transaction keys for this block
         const txKeysCount = await this.storeBlockTransactionKeys(block, blockHash, keepTxKeys);
 
-        // Check for spent outputs in this block's transactions
         if (this.keyManager) {
           await this.processBlockForSpentOutputs(block, blockHash);
         }
@@ -406,50 +386,27 @@ export class TransactionKeysSync {
         totalTxKeysSynced += txKeysCount;
         blocksProcessed++;
 
-        // Progress callback
         if (onProgress) {
           onProgress(block.height, syncEndHeight, blocksProcessed, totalTxKeysSynced, false);
         }
       }
 
-      // Update sync state after processing batch
-      if (rangeResult.blocks.length > 0) {
-        const lastBlock = rangeResult.blocks[rangeResult.blocks.length - 1];
-        let lastBlockHash: string;
+      // Update sync state after processing batch (lastBlockHash was set in the loop)
+      const lastBlock = blocksToProcess[blocksToProcess.length - 1];
+      await this.updateSyncState({
+        lastSyncedHeight: lastBlock.height,
+        lastSyncedHash: lastBlockHash,
+        totalTxKeysSynced: (this.syncState?.totalTxKeysSynced ?? 0) + totalTxKeysSynced,
+        lastSyncTime: Date.now(),
+        chainTipAtLastSync: chainTip,
+      });
 
-        if (blockHeadersMap.has(lastBlock.height)) {
-          const lastBlockHeader = blockHeadersMap.get(lastBlock.height)!;
-          lastBlockHash = this.extractBlockHash(lastBlockHeader);
-        } else {
-          // Fallback: fetch if not in batch
-          const lastBlockHeader = await this.syncProvider.getBlockHeader(lastBlock.height);
-          lastBlockHash = this.extractBlockHash(lastBlockHeader);
-        }
-
-        await this.updateSyncState({
-          lastSyncedHeight: lastBlock.height,
-          lastSyncedHash: lastBlockHash,
-          totalTxKeysSynced: (this.syncState?.totalTxKeysSynced ?? 0) + totalTxKeysSynced,
-          lastSyncTime: Date.now(),
-          chainTipAtLastSync: chainTip,
-        });
-
-        // Save database periodically if saveInterval is set
-        if (saveInterval > 0 && lastBlock.height - lastSaveHeight >= saveInterval) {
-          await this.walletDB.saveDatabase();
-          lastSaveHeight = lastBlock.height;
-        }
+      if (saveInterval > 0 && lastBlock.height - lastSaveHeight >= saveInterval) {
+        await this.walletDB.saveDatabase();
+        lastSaveHeight = lastBlock.height;
       }
 
-      // Move to next batch (server tells us where to continue)
-      currentHeight = rangeResult.nextHeight;
-
-      // Safety check to prevent infinite loops
-      if (currentHeight <= rangeResult.blocks[rangeResult.blocks.length - 1]?.height) {
-        throw new Error(
-          `Server did not advance next_height properly. Current: ${currentHeight}, Last block: ${rangeResult.blocks[rangeResult.blocks.length - 1]?.height}`
-        );
-      }
+      currentHeight = nextBatchHeight;
     }
 
     // Final save after sync completes to ensure state is persisted
@@ -534,39 +491,16 @@ export class TransactionKeysSync {
   ): Promise<void> {
     for (const txKeys of block.txKeys) {
       const txHash = txKeys.txHash || '';
-      if (!txHash) {
-        continue;
-      }
+      if (!txHash) continue;
 
-      // Transaction keys structure may contain inputs
-      // Inputs reference outputs by outputHash
       const keys = txKeys.keys || {};
       const inputs = keys?.inputs || keys?.vin || [];
 
       if (Array.isArray(inputs)) {
         for (const input of inputs) {
           const outputHash = input?.outputHash || input?.output_hash || input?.prevout?.hash;
-
-          if (outputHash) {
-            // Check if we own this output
-            const db = this.walletDB.getDatabase();
-            const stmt = db.prepare(
-              'SELECT output_hash FROM wallet_outputs WHERE output_hash = ? AND is_spent = 0'
-            );
-            stmt.bind([outputHash]);
-
-            if (stmt.step()) {
-              // We own this output, mark it as spent
-              const updateStmt = db.prepare(
-                `UPDATE wallet_outputs 
-                 SET is_spent = 1, spent_tx_hash = ?, spent_block_height = ?
-                 WHERE output_hash = ?`
-              );
-              updateStmt.run([txHash, block.height, outputHash]);
-              updateStmt.free();
-            }
-
-            stmt.free();
+          if (outputHash && await this.walletDB.isOutputUnspent(outputHash)) {
+            await this.walletDB.markOutputSpent(outputHash, txHash, block.height);
           }
         }
       }
@@ -579,34 +513,11 @@ export class TransactionKeysSync {
    * @param endHeight - End height to revert to
    */
   private async revertBlocks(startHeight: number, endHeight: number): Promise<void> {
-    // Delete transaction keys for reverted blocks
-    const db = this.walletDB.getDatabase();
-
     for (let height = startHeight; height <= endHeight; height++) {
-      // Delete transaction keys for this block
-      const stmt = db.prepare('DELETE FROM tx_keys WHERE block_height = ?');
-      stmt.run([height]);
-      stmt.free();
-
-      // Revert wallet outputs: delete outputs created in this block and unspend outputs spent in this block
-      // Delete outputs created in this block
-      const deleteOutputsStmt = db.prepare('DELETE FROM wallet_outputs WHERE block_height = ?');
-      deleteOutputsStmt.run([height]);
-      deleteOutputsStmt.free();
-
-      // Unspend outputs that were spent in this block
-      const unspendStmt = db.prepare(
-        `UPDATE wallet_outputs 
-         SET is_spent = 0, spent_tx_hash = NULL, spent_block_height = NULL
-         WHERE spent_block_height = ?`
-      );
-      unspendStmt.run([height]);
-      unspendStmt.free();
-
-      // Delete block hash
-      const hashStmt = db.prepare('DELETE FROM block_hashes WHERE height = ?');
-      hashStmt.run([height]);
-      hashStmt.free();
+      await this.walletDB.deleteTxKeysByHeight(height);
+      await this.walletDB.deleteOutputsByHeight(height);
+      await this.walletDB.unspendOutputsBySpentHeight(height);
+      await this.walletDB.deleteBlockHash(height);
     }
   }
 
@@ -622,37 +533,27 @@ export class TransactionKeysSync {
     blockHash: string,
     keepTxKeys: boolean = false
   ): Promise<number> {
-    const db = this.walletDB.getDatabase();
-
     let count = 0;
 
+    if (block.height <= 100005 || block.height % 5000 === 0) {
+      console.log(`[tx-keys-sync] storeBlockTransactionKeys: height=${block.height}, txKeys count=${block.txKeys.length}, keyManager=${!!this.keyManager}`);
+    }
+
     for (const txKeys of block.txKeys) {
-      // Extract txHash from keys if not provided
-      // The keys structure from electrumx may contain the tx hash
       let txHash = txKeys.txHash;
       if (!txHash && txKeys.keys && typeof txKeys.keys === 'object') {
-        // Try to extract hash from keys object
         txHash = (txKeys.keys as any).txHash || (txKeys.keys as any).hash || '';
       }
-
-      // If still no hash, generate a placeholder (shouldn't happen in production)
       if (!txHash) {
         txHash = `block_${block.height}_tx_${count}`;
       }
 
-      // Process outputs if KeyManager is available (before storing keys)
       if (this.keyManager) {
         await this.processTransactionKeys(txHash, txKeys.keys, block.height, blockHash);
       }
 
-      // Store transaction keys only if keepTxKeys is true
-      // After processing, we don't need them anymore - wallet outputs are stored separately
       if (keepTxKeys) {
-        const stmt = db.prepare(
-          'INSERT OR REPLACE INTO tx_keys (tx_hash, block_height, keys_data) VALUES (?, ?, ?)'
-        );
-        stmt.run([txHash, block.height, JSON.stringify(txKeys.keys)]);
-        stmt.free();
+        await this.walletDB.saveTxKeys(txHash, block.height, JSON.stringify(txKeys.keys));
       }
 
       count++;
@@ -675,7 +576,13 @@ export class TransactionKeysSync {
     _blockHash: string
   ): Promise<void> {
     if (!this.keyManager) {
+      console.log(`[tx-keys-sync] processTransactionKeys called but keyManager is null`);
       return;
+    }
+
+    // Log raw keys structure for first few blocks to understand format
+    if (blockHeight <= 100005 || blockHeight % 5000 === 0) {
+      console.log(`[tx-keys-sync] processTransactionKeys: height=${blockHeight}, keys type=${typeof keys}, isArray=${Array.isArray(keys)}, structure:`, JSON.stringify(keys).slice(0, 500));
     }
 
     // Transaction keys structure: { outputs: [{ blindingKey, spendingKey, viewTag, outputHash, ... }, ...] }
@@ -683,7 +590,12 @@ export class TransactionKeysSync {
     const outputs = keys[1]?.outputs || keys[1]?.vout || [];
 
     if (!Array.isArray(outputs)) {
+      console.log(`[tx-keys-sync] outputs is not array, keys[1]:`, JSON.stringify(keys[1]).slice(0, 300));
       return;
+    }
+
+    if (outputs.length > 0) {
+      console.log(`[tx-keys-sync] height=${blockHeight}, txHash=${txHash}, ${outputs.length} outputs, first:`, JSON.stringify(outputs[0]).slice(0, 300));
     }
 
     for (let outputIndex = 0; outputIndex < outputs.length; outputIndex++) {
@@ -697,7 +609,7 @@ export class TransactionKeysSync {
 
       if (!blindingKey || !spendingKey || viewTag === undefined || !outputHash) {
         console.warn(
-          `Invalid output keys: blindingKey: ${blindingKey}, spendingKey: ${spendingKey}, viewTag: ${viewTag}, outputHash: ${outputHash}, blockHeight: ${blockHeight}`
+          `[tx-keys-sync] Invalid output keys at height ${blockHeight}: blindingKey=${!!blindingKey}, spendingKey=${!!spendingKey}, viewTag=${viewTag}, outputHash=${!!outputHash}. Raw keys:`, JSON.stringify(outputKeys).slice(0, 300)
         );
         continue;
       }
@@ -709,18 +621,20 @@ export class TransactionKeysSync {
 
       // Check if output belongs to wallet
       const isMine = this.keyManager.isMineByKeys(blindingKeyObj, spendingKeyObj, viewTag);
+      if (blockHeight >= 100000 && outputs.length > 0) {
+        console.log(`[tx-keys-sync] isMine check: height=${blockHeight}, outputIndex=${outputIndex}, viewTag=${viewTag}, isMine=${isMine}`);
+      }
       if (isMine) {
+        console.log(`[tx-keys-sync] OUTPUT IS MINE at height ${blockHeight}, txHash=${txHash}, outputHash=${outputHash}`);
         // Fetch output data from backend
         try {
           const outputHex = await this.syncProvider.getTransactionOutput(outputHash);
+          console.log(`[tx-keys-sync] Got output hex, length=${outputHex.length}`);
 
           // Recover the amount from the range proof
           const RangeProof = blsctModule.RangeProof;
           const AmountRecoveryReq = blsctModule.AmountRecoveryReq;
           
-          // Parse the output to get the range proof
-          // The output format from Electrum/P2P is a CTxOut serialization
-          // We need to extract the range proof and recover the amount
           let recoveredAmount = 0;
           let recoveredMemo: string | null = null;
           let tokenIdHex: string | null = null;
@@ -728,18 +642,23 @@ export class TransactionKeysSync {
           try {
             // Calculate the nonce (shared secret) for amount recovery
             const nonce = this.keyManager.calculateNonce(blindingKeyObj);
+            console.log(`[tx-keys-sync] Nonce calculated, type=${typeof nonce}, constructor=${nonce?.constructor?.name}`);
             
             // Parse the range proof from the output data
             const rangeProofResult = this.extractRangeProofFromOutput(outputHex);
+            console.log(`[tx-keys-sync] Range proof extracted: hasProof=${!!rangeProofResult.rangeProofHex}, proofLen=${rangeProofResult.rangeProofHex?.length}, tokenId=${rangeProofResult.tokenIdHex}`);
             
             if (rangeProofResult.rangeProofHex) {
               const rangeProof = RangeProof.deserialize(rangeProofResult.rangeProofHex);
+              console.log(`[tx-keys-sync] Range proof deserialized, type=${rangeProof?.constructor?.name}`);
               
               // Create recovery request
               const req = new AmountRecoveryReq(rangeProof, nonce);
+              console.log(`[tx-keys-sync] AmountRecoveryReq created`);
               
               // Recover the amount using static method
               const results = RangeProof.recoverAmounts([req]);
+              console.log(`[tx-keys-sync] Recovery results: count=${results.length}, isSucc=${results[0]?.isSucc}, amount=${results[0]?.amount}, msg=${results[0]?.msg}`);
               
               if (results.length > 0 && results[0].isSucc) {
                 recoveredAmount = Number(results[0].amount);
@@ -748,10 +667,14 @@ export class TransactionKeysSync {
             }
             
             tokenIdHex = rangeProofResult.tokenIdHex;
-          } catch {
-            // Amount recovery failed (likely navio-blsct library bug)
-            // Output is still stored with amount 0 - will be recoverable when library is fixed
+          } catch (amountError) {
+            console.warn(
+              `[tx-keys-sync] Amount recovery FAILED for output ${outputHash} at height ${blockHeight}:`,
+              amountError
+            );
           }
+          
+          console.log(`[tx-keys-sync] STORING output: amount=${recoveredAmount}, memo=${recoveredMemo}`);
 
           // Store output as spendable with recovered amount
           await this.storeWalletOutput(
@@ -877,22 +800,6 @@ export class TransactionKeysSync {
     }
   }
 
-  /**
-   * Store wallet output in database
-   * @param outputHash - Output hash
-   * @param txHash - Transaction hash
-   * @param outputIndex - Output index
-   * @param blockHeight - Block height
-   * @param outputData - Serialized output data (hex)
-   * @param amount - Recovered amount in satoshis
-   * @param memo - Recovered memo/message
-   * @param tokenId - Token ID (hex)
-   * @param blindingKey - Blinding public key (hex)
-   * @param spendingKey - Spending public key (hex)
-   * @param isSpent - Whether output is spent
-   * @param spentTxHash - Transaction hash that spent this output (if spent)
-   * @param spentBlockHeight - Block height where output was spent (if spent)
-   */
   private async storeWalletOutput(
     outputHash: string,
     txHash: string,
@@ -908,30 +815,11 @@ export class TransactionKeysSync {
     spentTxHash: string | null,
     spentBlockHeight: number | null
   ): Promise<void> {
-    const db = this.walletDB.getDatabase();
-
-    const stmt = db.prepare(
-      `INSERT OR REPLACE INTO wallet_outputs 
-       (output_hash, tx_hash, output_index, block_height, output_data, amount, memo, token_id, blinding_key, spending_key, is_spent, spent_tx_hash, spent_block_height, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-    );
-    stmt.run([
-      outputHash,
-      txHash,
-      outputIndex,
-      blockHeight,
-      outputData,
-      amount,
-      memo,
-      tokenId,
-      blindingKey,
-      spendingKey,
-      isSpent ? 1 : 0,
-      spentTxHash,
-      spentBlockHeight,
-      Date.now(),
-    ]);
-    stmt.free();
+    await this.walletDB.storeWalletOutput({
+      outputHash, txHash, outputIndex, blockHeight, outputData,
+      amount, memo, tokenId, blindingKey, spendingKey,
+      isSpent, spentTxHash, spentBlockHeight,
+    });
   }
 
   /**
@@ -946,25 +834,36 @@ export class TransactionKeysSync {
     return Buffer.from(hash).reverse().toString('hex');
   }
 
+  private static readonly HEADER_CHUNK_SIZE = 2016;
+
+  /**
+   * Fetch a chunk of block headers and return them as a map of height -> header hex.
+   * Electrum servers cap responses at ~2016 headers, so callers should request
+   * in chunks of that size.
+   */
+  private async fetchHeaderChunk(
+    startHeight: number,
+    count: number
+  ): Promise<Map<number, string>> {
+    const map = new Map<number, string>();
+    const headersResult = await this.syncProvider.getBlockHeaders(startHeight, count);
+    const headerSize = 160; // 80 bytes * 2 hex chars
+    const hex = headersResult.hex;
+    const returned = Math.min(headersResult.count, count);
+
+    for (let i = 0; i < returned && i * headerSize < hex.length; i++) {
+      map.set(startHeight + i, hex.substring(i * headerSize, (i + 1) * headerSize));
+    }
+    return map;
+  }
+
   /**
    * Get stored block hash from database
    * @param height - Block height
    * @returns Block hash or null if not found
    */
   private async getStoredBlockHash(height: number): Promise<string | null> {
-    const db = this.walletDB.getDatabase();
-
-    const stmt = db.prepare('SELECT hash FROM block_hashes WHERE height = ?');
-    stmt.bind([height]);
-
-    if (stmt.step()) {
-      const row = stmt.getAsObject();
-      stmt.free();
-      return row.hash as string;
-    }
-
-    stmt.free();
-    return null;
+    return this.walletDB.getBlockHash(height);
   }
 
   /**
@@ -975,31 +874,15 @@ export class TransactionKeysSync {
    * @param chainTip - Current chain tip (optional, to avoid repeated fetches)
    */
   private async storeBlockHash(height: number, hash: string, chainTip?: number): Promise<void> {
-    const db = this.walletDB.getDatabase();
-
-    // If retention is enabled (non-zero), only store recent block hashes
     if (this.blockHashRetention > 0) {
-      // Get chain tip if not provided
       const currentChainTip = chainTip ?? (await this.syncProvider.getChainTipHeight());
       const retentionStart = Math.max(0, currentChainTip - this.blockHashRetention + 1);
-
-      // Only store if within retention window
-      if (height < retentionStart) {
-        return; // Skip storing old block hashes
-      }
-
-      // Periodically clean up old block hashes outside retention window
-      // Only do this occasionally to avoid overhead (every 100 blocks)
+      if (height < retentionStart) return;
       if (height % 100 === 0) {
-        const cleanupStmt = db.prepare('DELETE FROM block_hashes WHERE height < ?');
-        cleanupStmt.run([retentionStart]);
-        cleanupStmt.free();
+        await this.walletDB.deleteBlockHashesBefore(retentionStart);
       }
     }
-
-    const stmt = db.prepare('INSERT OR REPLACE INTO block_hashes (height, hash) VALUES (?, ?)');
-    stmt.run([height, hash]);
-    stmt.free();
+    await this.walletDB.saveBlockHash(height, hash);
   }
 
   /**
@@ -1007,25 +890,7 @@ export class TransactionKeysSync {
    * @returns Sync state or null if not found
    */
   private async loadSyncState(): Promise<SyncState | null> {
-    try {
-      const db = this.walletDB.getDatabase();
-
-      const result = db.exec('SELECT * FROM sync_state LIMIT 1');
-      if (result.length > 0 && result[0].values.length > 0) {
-        const row = result[0].values[0];
-        return {
-          lastSyncedHeight: row[1] as number,
-          lastSyncedHash: row[2] as string,
-          totalTxKeysSynced: row[3] as number,
-          lastSyncTime: row[4] as number,
-          chainTipAtLastSync: row[5] as number,
-        };
-      }
-
-      return null;
-    } catch {
-      return null;
-    }
+    return this.walletDB.loadSyncState();
   }
 
   /**
@@ -1033,8 +898,6 @@ export class TransactionKeysSync {
    * @param state - Sync state to update
    */
   private async updateSyncState(state: Partial<SyncState>): Promise<void> {
-    const db = this.walletDB.getDatabase();
-
     const currentState = this.syncState || {
       lastSyncedHeight: -1,
       lastSyncedHash: '',
@@ -1042,27 +905,8 @@ export class TransactionKeysSync {
       lastSyncTime: 0,
       chainTipAtLastSync: 0,
     };
-
-    const newState: SyncState = {
-      ...currentState,
-      ...state,
-    };
-
-    // Use id = 0 for the single sync state row
-    const stmt = db.prepare(
-      `INSERT OR REPLACE INTO sync_state 
-       (id, last_synced_height, last_synced_hash, total_tx_keys_synced, last_sync_time, chain_tip_at_last_sync)
-       VALUES (0, ?, ?, ?, ?, ?)`
-    );
-    stmt.run([
-      newState.lastSyncedHeight,
-      newState.lastSyncedHash,
-      newState.totalTxKeysSynced,
-      newState.lastSyncTime,
-      newState.chainTipAtLastSync,
-    ]);
-    stmt.free();
-
+    const newState: SyncState = { ...currentState, ...state };
+    await this.walletDB.saveSyncState(newState);
     this.syncState = newState;
   }
 
@@ -1072,23 +916,7 @@ export class TransactionKeysSync {
    * @returns Transaction keys or null if not found
    */
   async getTransactionKeys(txHash: string): Promise<any | null> {
-    try {
-      const db = this.walletDB.getDatabase();
-
-      const stmt = db.prepare('SELECT keys_data FROM tx_keys WHERE tx_hash = ?');
-      stmt.bind([txHash]);
-
-      if (stmt.step()) {
-        const row = stmt.getAsObject();
-        stmt.free();
-        return JSON.parse(row.keys_data as string);
-      }
-
-      stmt.free();
-      return null;
-    } catch {
-      return null;
-    }
+    return this.walletDB.getTxKeys(txHash);
   }
 
   /**
@@ -1097,36 +925,15 @@ export class TransactionKeysSync {
    * @returns Array of transaction keys
    */
   async getBlockTransactionKeys(height: number): Promise<TransactionKeys[]> {
-    try {
-      const db = this.walletDB.getDatabase();
-
-      const result = db.exec('SELECT tx_hash, keys_data FROM tx_keys WHERE block_height = ?', [
-        height,
-      ]);
-      if (result.length > 0) {
-        return result[0].values.map((row: any[]) => ({
-          txHash: row[0] as string,
-          keys: JSON.parse(row[1] as string),
-        }));
-      }
-
-      return [];
-    } catch {
-      return [];
-    }
+    const entries = await this.walletDB.getTxKeysByHeight(height);
+    return entries.map((e) => ({ txHash: e.txHash, keys: e.keys }));
   }
 
   /**
    * Reset sync state (for testing or full resync)
    */
   async resetSyncState(): Promise<void> {
-    const db = this.walletDB.getDatabase();
-
-    // Delete all sync state
-    db.run('DELETE FROM sync_state');
-    db.run('DELETE FROM tx_keys');
-    db.run('DELETE FROM block_hashes');
-
+    await this.walletDB.clearSyncData();
     this.syncState = null;
   }
 }

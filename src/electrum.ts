@@ -7,8 +7,8 @@
  * Based on electrumx server implementation and Navio-specific extensions
  */
 
-import { sha256 } from '@noble/hashes/sha256';
-import { ripemd160 } from '@noble/hashes/ripemd160';
+import { sha256 } from '@noble/hashes/sha2';
+import { ripemd160 } from '@noble/hashes/legacy';
 import type { BlockHeaderNotification } from './sync-provider';
 
 // Import WebSocket - use native WebSocket in browser, ws in Node.js
@@ -238,6 +238,13 @@ export class ElectrumClient {
   private reconnectAttempts = 0;
 
   /**
+   * Cached chain tip from blockchain.headers.subscribe.
+   * Updated via subscription notifications so we don't re-subscribe on every call.
+   */
+  private cachedChainTip: { height: number; hex: string } | null = null;
+  private chainTipSubscribed = false;
+
+  /**
    * Subscription callbacks map
    * Key: subscription method name (e.g., 'blockchain.headers.subscribe')
    * Value: Set of callbacks to invoke when notification is received
@@ -307,8 +314,9 @@ export class ElectrumClient {
 
         attachWebSocketHandler(this.ws, 'close', () => {
           this.connected = false;
+          this.chainTipSubscribed = false;
+          this.cachedChainTip = null;
           this.ws = null;
-          // Clear pending requests
           for (const [, { reject, timeout }] of Array.from(this.pendingRequests)) {
             clearTimeout(timeout);
             reject(new Error('Connection closed'));
@@ -414,8 +422,9 @@ export class ElectrumClient {
    * Disconnect from the server
    */
   disconnect(): void {
-    // Clear subscription callbacks before closing
     this.subscriptionCallbacks.clear();
+    this.cachedChainTip = null;
+    this.chainTipSubscribed = false;
     if (this.ws) {
       this.ws.close();
       this.ws = null;
@@ -475,22 +484,16 @@ export class ElectrumClient {
   async subscribeBlockHeaders(callback: (header: BlockHeaderNotification) => void): Promise<BlockHeaderNotification> {
     const method = 'blockchain.headers.subscribe';
 
-    // Register the callback for ongoing notifications
+    // Ensure we have an active subscription (sends RPC only once)
+    await this.ensureChainTipSubscription();
+
+    // Register the caller's callback for ongoing notifications
     if (!this.subscriptionCallbacks.has(method)) {
       this.subscriptionCallbacks.set(method, new Set());
     }
     this.subscriptionCallbacks.get(method)!.add(callback);
 
-    // Subscribe and get initial header
-    const result = await this.call(method);
-
-    // Normalize the response to BlockHeaderNotification format
-    const header: BlockHeaderNotification = {
-      height: result.height,
-      hex: result.hex,
-    };
-
-    return header;
+    return { height: this.cachedChainTip!.height, hex: this.cachedChainTip!.hex };
   }
 
   /**
@@ -531,15 +534,43 @@ export class ElectrumClient {
    * @returns Current chain tip height
    */
   async getChainTipHeight(): Promise<number> {
-    const response = await this.call('blockchain.headers.subscribe');
-    // Handle both formats: { height, hex } or just the height number
+    if (!this.chainTipSubscribed) {
+      await this.ensureChainTipSubscription();
+    }
+    return this.cachedChainTip!.height;
+  }
+
+  /**
+   * Subscribe to chain tip once and cache the result.
+   * Subsequent calls to getChainTipHeight() return the cached value,
+   * which is kept up-to-date via subscription notifications.
+   */
+  private async ensureChainTipSubscription(): Promise<void> {
+    if (this.chainTipSubscribed) return;
+
+    const method = 'blockchain.headers.subscribe';
+    const response = await this.call(method);
+
     if (typeof response === 'number') {
-      return response;
+      this.cachedChainTip = { height: response, hex: '' };
+    } else if (response && typeof response.height === 'number') {
+      this.cachedChainTip = { height: response.height, hex: response.hex || '' };
+    } else {
+      throw new Error(`Unexpected blockchain.headers.subscribe response: ${JSON.stringify(response)}`);
     }
-    if (response && typeof response.height === 'number') {
-      return response.height;
+
+    // Register an internal callback to keep the cache updated
+    if (!this.subscriptionCallbacks.has(method)) {
+      this.subscriptionCallbacks.set(method, new Set());
     }
-    throw new Error(`Unexpected blockchain.headers.subscribe response: ${JSON.stringify(response)}`);
+    this.subscriptionCallbacks.get(method)!.add((params: any) => {
+      const header = Array.isArray(params) ? params[0] : params;
+      if (header && typeof header.height === 'number') {
+        this.cachedChainTip = { height: header.height, hex: header.hex || '' };
+      }
+    });
+
+    this.chainTipSubscribed = true;
   }
 
   // ============================================================================
@@ -587,7 +618,13 @@ export class ElectrumClient {
 
         if (Array.isArray(blockData)) {
           for (const txKeyData of blockData) {
-            if (typeof txKeyData === 'object' && txKeyData !== null) {
+            if (Array.isArray(txKeyData) && txKeyData.length >= 2) {
+              // Server format: [txHash, {vin: [], vout: [...]}]
+              txKeys.push({
+                txHash: txKeyData[0] || '',
+                keys: txKeyData,
+              });
+            } else if (typeof txKeyData === 'object' && txKeyData !== null) {
               // Check if it's already in our format
               if ('txHash' in txKeyData && 'keys' in txKeyData) {
                 txKeys.push({

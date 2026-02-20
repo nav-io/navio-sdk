@@ -69,12 +69,13 @@ describe('TransactionKeysSync', () => {
 
   beforeEach(async () => {
     // Create in-memory database
-    walletDB = new WalletDB(':memory:');
+    walletDB = new WalletDB();
+    await walletDB.open(':memory:');
     await walletDB.createWallet(0);
   });
 
   afterEach(async () => {
-    walletDB.close();
+    await walletDB.close();
   });
 
   describe('spent output detection', () => {
@@ -84,15 +85,15 @@ describe('TransactionKeysSync', () => {
       await syncManager.initialize();
 
       // Insert a test output into the database
-      const db = walletDB.getDatabase();
-      db.run(`
+      const db = walletDB.getAdapter();
+      await db.run(`
         INSERT INTO wallet_outputs 
         (output_hash, tx_hash, output_index, block_height, output_data, amount, is_spent, created_at)
         VALUES ('test-output-hash', 'test-tx-hash', 0, 50, 'test-data', 1000000, 0, ?)
       `, [Date.now()]);
 
       // Verify output exists and is unspent
-      const beforeResult = db.exec("SELECT is_spent FROM wallet_outputs WHERE output_hash = 'test-output-hash'");
+      const beforeResult = await db.exec("SELECT is_spent FROM wallet_outputs WHERE output_hash = 'test-output-hash'");
       expect(beforeResult[0].values[0][0]).toBe(0);
 
       // Create a block with transaction that spends our output
@@ -125,7 +126,7 @@ describe('TransactionKeysSync', () => {
       await newSyncManager.sync({ startHeight: 60, endHeight: 60, verifyHashes: false });
 
       // Verify output is now spent
-      const afterResult = db.exec("SELECT is_spent, spent_tx_hash, spent_block_height FROM wallet_outputs WHERE output_hash = 'test-output-hash'");
+      const afterResult = await db.exec("SELECT is_spent, spent_tx_hash, spent_block_height FROM wallet_outputs WHERE output_hash = 'test-output-hash'");
       expect(afterResult[0].values[0][0]).toBe(1); // is_spent
       expect(afterResult[0].values[0][1]).toBe('spending-tx-hash'); // spent_tx_hash
       expect(afterResult[0].values[0][2]).toBe(60); // spent_block_height
@@ -137,8 +138,8 @@ describe('TransactionKeysSync', () => {
       await syncManager.initialize();
 
       // Insert a test output
-      const db = walletDB.getDatabase();
-      db.run(`
+      const db = walletDB.getAdapter();
+      await db.run(`
         INSERT INTO wallet_outputs 
         (output_hash, tx_hash, output_index, block_height, output_data, amount, is_spent, created_at)
         VALUES ('unspent-output-hash', 'test-tx-hash', 0, 50, 'test-data', 1000000, 0, ?)
@@ -169,7 +170,7 @@ describe('TransactionKeysSync', () => {
       await newSyncManager.sync({ startHeight: 60, endHeight: 60, verifyHashes: false });
 
       // Verify output is still unspent
-      const result = db.exec("SELECT is_spent FROM wallet_outputs WHERE output_hash = 'unspent-output-hash'");
+      const result = await db.exec("SELECT is_spent FROM wallet_outputs WHERE output_hash = 'unspent-output-hash'");
       expect(result[0].values[0][0]).toBe(0);
     });
   });
@@ -185,15 +186,15 @@ describe('TransactionKeysSync', () => {
       syncManager = new TransactionKeysSync(walletDB, syncProvider);
       await syncManager.initialize();
 
-      const db = walletDB.getDatabase();
+      const db = walletDB.getAdapter();
 
       // Store a DIFFERENT hash at height 60 than what the server will provide
       // When extractBlockHash is called on 'ff'.repeat(80), it will produce a different hash
-      db.run('INSERT INTO block_hashes (height, hash) VALUES (?, ?)', [60, 'original-hash-at-60-different-from-server']);
+      await db.run('INSERT INTO block_hashes (height, hash) VALUES (?, ?)', [60, 'original-hash-at-60-different-from-server']);
 
       // Update sync state to indicate we synced up to height 60
       // The sync will check reorganization at lastSyncedHeight (60)
-      db.run(`
+      await db.run(`
         INSERT OR REPLACE INTO sync_state (id, last_synced_height, last_synced_hash, total_tx_keys_synced, last_sync_time, chain_tip_at_last_sync)
         VALUES (0, 60, 'some-hash', 0, ?, 100)
       `, [Date.now()]);
@@ -220,10 +221,10 @@ describe('TransactionKeysSync', () => {
       syncManager = new TransactionKeysSync(walletDB, syncProvider);
       await syncManager.initialize();
 
-      const db = walletDB.getDatabase();
+      const db = walletDB.getAdapter();
       
       // Insert outputs at different heights
-      db.run(`
+      await db.run(`
         INSERT INTO wallet_outputs 
         (output_hash, tx_hash, output_index, block_height, output_data, amount, is_spent, created_at)
         VALUES 
@@ -233,28 +234,28 @@ describe('TransactionKeysSync', () => {
       `, [Date.now(), Date.now(), Date.now()]);
 
       // Store sync state at height 60
-      db.run(`
+      await db.run(`
         INSERT OR REPLACE INTO sync_state (id, last_synced_height, last_synced_hash, total_tx_keys_synced, last_sync_time, chain_tip_at_last_sync)
         VALUES (0, 60, 'hash-60', 100, ?, 60)
       `, [Date.now()]);
 
       // Store block hashes
-      db.run('INSERT INTO block_hashes (height, hash) VALUES (50, ?), (55, ?), (60, ?)', ['hash-50', 'hash-55', 'hash-60']);
+      await db.run('INSERT INTO block_hashes (height, hash) VALUES (50, ?), (55, ?), (60, ?)', ['hash-50', 'hash-55', 'hash-60']);
 
       // Verify all outputs exist
-      let result = db.exec('SELECT COUNT(*) FROM wallet_outputs');
+      let result = await db.exec('SELECT COUNT(*) FROM wallet_outputs');
       expect(result[0].values[0][0]).toBe(3);
 
       // Simulate reorg by directly calling revertBlocks (we access it via sync with handleReorg)
       // For this test, let's directly manipulate like revertBlocks would
-      db.run('DELETE FROM wallet_outputs WHERE block_height >= 55');
-      db.run('DELETE FROM block_hashes WHERE height >= 55');
+      await db.run('DELETE FROM wallet_outputs WHERE block_height >= 55');
+      await db.run('DELETE FROM block_hashes WHERE height >= 55');
 
       // Verify outputs at height >= 55 are deleted
-      result = db.exec('SELECT COUNT(*) FROM wallet_outputs');
+      result = await db.exec('SELECT COUNT(*) FROM wallet_outputs');
       expect(result[0].values[0][0]).toBe(1);
 
-      result = db.exec("SELECT output_hash FROM wallet_outputs");
+      result = await db.exec("SELECT output_hash FROM wallet_outputs");
       expect(result[0].values[0][0]).toBe('output-at-50');
     });
 
@@ -263,29 +264,29 @@ describe('TransactionKeysSync', () => {
       syncManager = new TransactionKeysSync(walletDB, syncProvider);
       await syncManager.initialize();
 
-      const db = walletDB.getDatabase();
+      const db = walletDB.getAdapter();
       
       // Insert an output that was spent at height 55
-      db.run(`
+      await db.run(`
         INSERT INTO wallet_outputs 
         (output_hash, tx_hash, output_index, block_height, output_data, amount, is_spent, spent_tx_hash, spent_block_height, created_at)
         VALUES ('spent-output', 'original-tx', 0, 40, 'data', 1000000, 1, 'spending-tx', 55, ?)
       `, [Date.now()]);
 
       // Verify output is spent
-      let result = db.exec("SELECT is_spent, spent_block_height FROM wallet_outputs WHERE output_hash = 'spent-output'");
+      let result = await db.exec("SELECT is_spent, spent_block_height FROM wallet_outputs WHERE output_hash = 'spent-output'");
       expect(result[0].values[0][0]).toBe(1); // is_spent
       expect(result[0].values[0][1]).toBe(55); // spent_block_height
 
       // Simulate revert of blocks >= 55 (like revertBlocks does)
-      db.run(`
+      await db.run(`
         UPDATE wallet_outputs 
         SET is_spent = 0, spent_tx_hash = NULL, spent_block_height = NULL
         WHERE spent_block_height >= 55
       `);
 
       // Verify output is now unspent
-      result = db.exec("SELECT is_spent, spent_tx_hash, spent_block_height FROM wallet_outputs WHERE output_hash = 'spent-output'");
+      result = await db.exec("SELECT is_spent, spent_tx_hash, spent_block_height FROM wallet_outputs WHERE output_hash = 'spent-output'");
       expect(result[0].values[0][0]).toBe(0); // is_spent
       expect(result[0].values[0][1]).toBeNull(); // spent_tx_hash
       expect(result[0].values[0][2]).toBeNull(); // spent_block_height

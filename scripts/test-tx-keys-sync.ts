@@ -79,11 +79,13 @@ Example:
     console.log('Initializing Wallet DB and Electrum Client');
     console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n');
 
-    const walletDB = new WalletDB(dbPath);
+    const dbExists = fs.existsSync(dbPath);
+    const walletDB = new WalletDB();
+    await walletDB.open(dbPath);
 
     // Create or load wallet
     let keyManager;
-    if (!fs.existsSync(dbPath)) {
+    if (!dbExists) {
       keyManager = await walletDB.createWallet();
       console.log('✓ Created new wallet');
     } else {
@@ -97,8 +99,8 @@ Example:
     let address = Address.encode(dpk, AddressEncoding.Bech32M);
     console.log('address', address);
 
-    // Initialize Electrum client
-    const electrumClient = new ElectrumClient({ host, port, ssl });
+    // Initialize Electrum client with generous timeout for large batch fetches
+    const electrumClient = new ElectrumClient({ host, port, ssl, timeout: 120000 });
     await electrumClient.connect();
     console.log(`✓ Connected to Electrum server at ${host}:${port}\n`);
 
@@ -201,7 +203,7 @@ Example:
 
     // Cleanup
     electrumClient.disconnect();
-    walletDB.close();
+    await walletDB.close();
 
     console.log('═══════════════════════════════════════════════════════════');
     console.log('  All Tests Completed Successfully!');

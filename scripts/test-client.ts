@@ -18,12 +18,13 @@ async function main() {
 
   // Parse command line arguments
   const args = process.argv.slice(2);
-  let host = 'localhost';
+  let host = 'testnet.nav.io';
   let port = 50005;
   let ssl = false;
   let dbPath = path.join(__dirname, '../test-client-wallet.db');
   let createWallet = true;
-  let restoreSeed: string | undefined;
+  let restoreValue: string | undefined;
+  let restoreIsMnemonic = false;
   let creationHeight: number | undefined;
   let cleanDb = false;
   let pollInterval = 10000; // Default 10 seconds
@@ -45,9 +46,17 @@ async function main() {
       case '--create':
         createWallet = true;
         break;
-      case '--restore':
-        restoreSeed = args[++i];
+      case '--restore': {
+        // Collect all words until the next flag (supports both hex seeds and mnemonic phrases)
+        const words: string[] = [];
+        while (i + 1 < args.length && !args[i + 1].startsWith('--')) {
+          words.push(args[++i]);
+        }
+        restoreValue = words.join(' ');
+        // Detect mnemonic vs hex seed: hex seeds are a single word of hex chars
+        restoreIsMnemonic = words.length > 1 || !/^[0-9a-fA-F]+$/.test(restoreValue);
         break;
+      }
       case '--from-height':
         creationHeight = parseInt(args[++i], 10);
         break;
@@ -68,7 +77,7 @@ Options:
   --ssl                Use SSL/TLS connection
   --db <path>          Wallet database path (default: test-client-wallet.db)
   --create             Create new wallet if it doesn't exist
-  --restore <seed>     Restore wallet from seed (hex string)
+  --restore <seed>     Restore wallet from seed (hex) or mnemonic phrase
   --from-height <n>    Start syncing from height n (for new or restored wallets)
   --clean              Delete existing wallet DB before starting
   --poll <seconds>     Background sync poll interval (default: 10)
@@ -77,21 +86,20 @@ Options:
 Example:
   tsx scripts/test-client.ts --host localhost --port 50005 --create
   tsx scripts/test-client.ts --clean --from-height 0  # Full sync from genesis
-  tsx scripts/test-client.ts --clean --restore <seed> --from-height 50000
+  tsx scripts/test-client.ts --clean --restore <seed-hex> --from-height 50000
+  tsx scripts/test-client.ts --clean --restore word1 word2 ... word24 --from-height 50000
     `);
         process.exit(0);
     }
   }
 
-  // Clean up existing DB if requested
+  // Clean up existing DB if requested (including WAL/SHM journal files)
   if (cleanDb) {
     const fs = await import('fs');
-    try {
-      fs.unlinkSync(dbPath);
-      console.log(`Deleted existing wallet: ${dbPath}\n`);
-    } catch {
-      // File doesn't exist, that's fine
+    for (const suffix of ['', '-wal', '-shm']) {
+      try { fs.unlinkSync(dbPath + suffix); } catch { /* ignore */ }
     }
+    console.log(`Deleted existing wallet: ${dbPath}\n`);
   }
 
   let client: NavioClient | null = null;
@@ -111,10 +119,10 @@ Example:
       },
       createWalletIfNotExists: createWallet,
       network: 'testnet',
-      restoreFromSeed: restoreSeed,
-      // Use creationHeight for new wallets, restoreFromHeight for restored wallets
-      creationHeight: restoreSeed ? undefined : creationHeight,
-      restoreFromHeight: restoreSeed ? creationHeight : undefined,
+      restoreFromSeed: restoreIsMnemonic ? undefined : restoreValue,
+      restoreFromMnemonic: restoreIsMnemonic ? restoreValue : undefined,
+      creationHeight: restoreValue ? undefined : creationHeight,
+      restoreFromHeight: restoreValue ? creationHeight : undefined,
     });
 
     console.log(`Wallet DB: ${dbPath}`);

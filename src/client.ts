@@ -9,21 +9,130 @@
  * - Key management
  */
 
-import { WalletDB } from './wallet-db';
+import { WalletDB, WalletDBOptions } from './wallet-db';
 import { ElectrumClient, ElectrumOptions } from './electrum';
 import { TransactionKeysSync, SyncOptions, BackgroundSyncOptions } from './tx-keys-sync';
 import { KeyManager } from './key-manager';
+import type { IWalletDB, WalletOutput } from './wallet-db.interface';
 import { SyncProvider } from './sync-provider';
 import { P2PSyncProvider } from './p2p-sync';
 import { P2PConnectionOptions } from './p2p-protocol';
 import { ElectrumSyncProvider } from './electrum-sync';
+import * as blsctModule from 'navio-blsct';
 import { BlsctChain, setChain } from 'navio-blsct';
 import { sha256 } from '@noble/hashes/sha256';
+import type { DatabaseAdapterType } from './database-adapter';
+
+const {
+  Scalar, PublicKey, SubAddr,
+  Address, TokenId, CTxId, OutPoint, TxIn, TxOut, CTx,
+  TxOutputType, PrivSpendingKey,
+  buildCTx, createTxInVec, addToTxInVec, createTxOutVec, addToTxOutVec,
+  deleteTxInVec, deleteTxOutVec, freeObj,
+} = blsctModule;
+
+/**
+ * Build a confidential transaction and return its serialized hex.
+ * Works around a navio-blsct bug where CTx.generate sets objSize=0,
+ * causing CTx.serialize() to return an empty string.
+ */
+function buildAndSerializeCTx(
+  txIns: InstanceType<typeof TxIn>[],
+  txOuts: InstanceType<typeof TxOut>[],
+): { rawTx: string; txId: string } {
+  const txInVec = createTxInVec();
+  for (const txIn of txIns) addToTxInVec(txInVec, txIn.value());
+  const txOutVec = createTxOutVec();
+  for (const txOut of txOuts) addToTxOutVec(txOutVec, txOut.value());
+
+  const rv = buildCTx(txInVec, txOutVec);
+  deleteTxInVec(txInVec);
+  deleteTxOutVec(txOutVec);
+
+  if (rv.result !== 0) {
+    const msg = `building tx failed. Error code = ${rv.result}`;
+    freeObj(rv);
+    throw new Error(msg);
+  }
+
+  const ctxPtr = rv.ctx;
+  freeObj(rv);
+
+  // Serialize the CTx using the native binding's serialize_ctx
+  let rawTx: string;
+  try {
+    // Node.js: access the native NAPI binding directly
+    const nativeBinding = require(
+      require('path').join(
+        require.resolve('navio-blsct'),
+        '../../build/Release/blsct.node',
+      ),
+    );
+    rawTx = nativeBinding.serialize_ctx(ctxPtr);
+  } catch {
+    // Browser WASM fallback: the WASM module exposes _serialize_ctx
+    // Access it through the blsctModule internals
+    const anyModule = blsctModule as any;
+    if (typeof anyModule.getBlsctModule === 'function') {
+      const wasmModule = anyModule.getBlsctModule();
+      const strPtr = wasmModule._serialize_ctx(ctxPtr);
+      rawTx = wasmModule.UTF8ToString(strPtr);
+      wasmModule._free(strPtr);
+    } else {
+      throw new Error(
+        'Cannot serialize CTx: no native binding and no WASM module available',
+      );
+    }
+  }
+
+  // Get the txId from the generated CTx
+  const ctx = CTx.deserialize(rawTx);
+  const txId = ctx.getCTxId().serialize();
+
+  return { rawTx, txId };
+}
 
 /**
  * Network type for Navio
  */
 export type NetworkType = 'mainnet' | 'testnet' | 'signet' | 'regtest';
+
+/**
+ * Fee per input+output in satoshis (matches navio-core default)
+ */
+const DEFAULT_FEE_PER_COMPONENT = 200_000;
+
+/**
+ * Options for sending a transaction
+ */
+export interface SendTransactionOptions {
+  /** Destination address (bech32m encoded) */
+  address: string;
+  /** Amount to send in satoshis */
+  amount: bigint;
+  /** Optional memo to include in the output */
+  memo?: string;
+  /** Whether to subtract the fee from the sent amount (default: false) */
+  subtractFeeFromAmount?: boolean;
+  /** Optional token ID (null for NAV) */
+  tokenId?: string | null;
+}
+
+/**
+ * Result of a sent transaction
+ */
+export interface SendTransactionResult {
+  /** Transaction ID (hex) */
+  txId: string;
+  /** Serialized transaction (hex) */
+  rawTx: string;
+  /** Fee paid in satoshis */
+  fee: bigint;
+  /** Inputs used */
+  inputCount: number;
+  /** Outputs created (including change) */
+  outputCount: number;
+}
 
 /**
  * Backend type for NavioClient
@@ -44,6 +153,15 @@ export interface P2POptions extends P2PConnectionOptions {
 export interface NavioClientConfig {
   /** Path to wallet database file */
   walletDbPath: string;
+
+  /**
+   * Database adapter type to use for wallet storage.
+   * - 'indexeddb' / 'browser': Native IndexedDB (used automatically in browsers)
+   * - 'better-sqlite3': Node.js native SQLite (use ':memory:' path for testing)
+   * 
+   * If not specified, auto-detected: IndexedDB in browsers, better-sqlite3 in Node.js.
+   */
+  databaseAdapter?: DatabaseAdapterType;
 
   /**
    * Backend type to use for synchronization
@@ -134,9 +252,9 @@ export interface NavioClientConfig {
  * @category Client
  */
 export class NavioClient {
-  private walletDB: WalletDB;
+  private walletDB: IWalletDB | null = null;
   private syncProvider: SyncProvider;
-  private syncManager: TransactionKeysSync;
+  private syncManager: TransactionKeysSync | null = null;
   private keyManager: KeyManager | null = null;
   private config: NavioClientConfig;
   private initialized = false;
@@ -187,9 +305,6 @@ export class NavioClient {
       throw new Error('P2P options required when backend is "p2p"');
     }
 
-    // Initialize components
-    this.walletDB = new WalletDB(this.config.walletDbPath);
-
     // Create sync provider based on backend type
     if (this.config.backend === 'p2p') {
       this.syncProvider = new P2PSyncProvider(this.config.p2p!);
@@ -199,7 +314,22 @@ export class NavioClient {
       this.syncProvider = new ElectrumSyncProvider(this.config.electrum!);
     }
 
-    this.syncManager = new TransactionKeysSync(this.walletDB, this.syncProvider);
+    // Note: WalletDB and SyncManager are created in initialize() since open() is async
+  }
+
+  /**
+   * Parse the walletDbPath and determine adapter options
+   */
+  private getWalletDbOptions(): { path: string; options: WalletDBOptions } {
+    const path = this.config.walletDbPath;
+    const options: WalletDBOptions = {};
+
+    // Use explicit adapter type if specified
+    if (this.config.databaseAdapter) {
+      options.type = this.config.databaseAdapter;
+    }
+
+    return { path, options };
   }
 
   /**
@@ -238,6 +368,28 @@ export class NavioClient {
       return;
     }
 
+    // Create and open WalletDB
+    // Browser environments use IndexedDB (no WASM needed).
+    // Node.js environments use the SQL adapter (better-sqlite3).
+    const adapterType = this.config.databaseAdapter;
+    const isBrowser = typeof window !== 'undefined' && typeof document !== 'undefined';
+    const useIndexedDB = adapterType === 'indexeddb'
+      || adapterType === 'browser'
+      || (!adapterType && isBrowser);
+
+    if (useIndexedDB) {
+      const { IndexedDBWalletDB } = await import('./adapters/indexeddb-wallet-db');
+      this.walletDB = new IndexedDBWalletDB();
+      await this.walletDB.open(this.config.walletDbPath);
+    } else {
+      const { path, options } = this.getWalletDbOptions();
+      this.walletDB = new WalletDB(options);
+      await this.walletDB.open(path);
+    }
+
+    // Create sync manager now that WalletDB is ready
+    this.syncManager = new TransactionKeysSync(this.walletDB, this.syncProvider);
+
     // Load or create wallet
     if (this.config.restoreFromSeed) {
       // Restore from seed with user-provided height (or 0 to scan from genesis)
@@ -264,42 +416,37 @@ export class NavioClient {
       // Connect to backend
       await this.syncProvider.connect();
     } else {
+      // Try to load existing wallet
+      let walletLoaded = false;
       try {
         this.keyManager = await this.walletDB.loadWallet();
+        walletLoaded = true;
+      } catch {
+        // Wallet doesn't exist in the database
+      }
 
-        // Set KeyManager for sync manager (enables output detection)
-        this.syncManager.setKeyManager(this.keyManager);
-
-        // Connect to backend
+      if (walletLoaded) {
+        this.syncManager.setKeyManager(this.keyManager!);
         await this.syncProvider.connect();
-      } catch (error) {
-        if (this.config.createWalletIfNotExists) {
-          // Determine creation height
-          let creationHeight: number;
+      } else if (this.config.createWalletIfNotExists) {
+        // Determine creation height
+        let creationHeight: number;
 
-          if (this.config.creationHeight !== undefined) {
-            // Use explicitly provided creation height
-            creationHeight = this.config.creationHeight;
-          } else {
-            // For new wallets, connect first to get the current chain height
-            await this.syncProvider.connect();
-
-            // Get current chain tip and subtract safety margin
-            const chainTip = await this.syncProvider.getChainTipHeight();
-            creationHeight = Math.max(0, chainTip - NavioClient.CREATION_HEIGHT_MARGIN);
-          }
-
-          // Create new wallet with specified height as creation point
-          this.keyManager = await this.walletDB.createWallet(creationHeight);
-
-          // Set KeyManager for sync manager (enables output detection)
-          this.syncManager.setKeyManager(this.keyManager);
+        if (this.config.creationHeight !== undefined) {
+          creationHeight = this.config.creationHeight;
         } else {
-          throw new Error(
-            `Wallet not found at ${this.config.walletDbPath}. ` +
-              `Set createWalletIfNotExists: true to create a new wallet.`
-          );
+          await this.syncProvider.connect();
+          const chainTip = await this.syncProvider.getChainTipHeight();
+          creationHeight = Math.max(0, chainTip - NavioClient.CREATION_HEIGHT_MARGIN);
         }
+
+        this.keyManager = await this.walletDB.createWallet(creationHeight);
+        this.syncManager.setKeyManager(this.keyManager);
+      } else {
+        throw new Error(
+          `Wallet not found at ${this.config.walletDbPath}. ` +
+            `Set createWalletIfNotExists: true to create a new wallet.`
+        );
       }
     }
 
@@ -336,9 +483,12 @@ export class NavioClient {
 
   /**
    * Get the WalletDB instance
-   * @returns WalletDB instance
+   * @returns WalletDB instance (WalletDB or IndexedDBWalletDB)
    */
-  getWalletDB(): WalletDB {
+  getWalletDB(): IWalletDB {
+    if (!this.walletDB) {
+      throw new Error('Client not initialized. Call initialize() first.');
+    }
     return this.walletDB;
   }
 
@@ -356,6 +506,9 @@ export class NavioClient {
    * @returns TransactionKeysSync instance
    */
   getSyncManager(): TransactionKeysSync {
+    if (!this.syncManager) {
+      throw new Error('Client not initialized. Call initialize() first.');
+    }
     return this.syncManager;
   }
 
@@ -373,6 +526,9 @@ export class NavioClient {
       await this.initialize();
     }
 
+    if (!this.syncManager) {
+      throw new Error('Client not initialized');
+    }
     return this.syncManager.sync(options || {});
   }
 
@@ -510,23 +666,29 @@ export class NavioClient {
     try {
       // Check if we need to sync
       const needsSync = await this.isSyncNeeded();
-      
+      const chainTip = await this.syncProvider.getChainTipHeight();
+      const lastSynced = this.getLastSyncedHeight();
+
       if (!needsSync) {
+        // Fire onProgress once so callers know the current state
+        if (opts?.onProgress) {
+          opts.onProgress(lastSynced, chainTip, 0, 0, false);
+        }
         this.isSyncInProgress = false;
         return;
       }
 
-      // Get current tip for onNewBlock callback
-      const chainTip = await this.syncProvider.getChainTipHeight();
-      const lastSynced = this.getLastSyncedHeight();
-
       // Sync to tip
+      if (!this.syncManager) {
+        throw new Error('Client not initialized');
+      }
       await this.syncManager.sync({
         onProgress: opts?.onProgress,
         saveInterval: opts?.saveInterval,
         verifyHashes: opts?.verifyHashes,
         keepTxKeys: opts?.keepTxKeys,
         blockHashRetention: opts?.blockHashRetention,
+        stopOnReorg: false,
       });
 
       // Notify of new block(s) if we synced past our last known height
@@ -568,6 +730,9 @@ export class NavioClient {
       await this.initialize();
     }
 
+    if (!this.syncManager) {
+      throw new Error('Client not initialized');
+    }
     return this.syncManager.isSyncNeeded();
   }
 
@@ -576,6 +741,9 @@ export class NavioClient {
    * @returns Last synced height, or -1 if never synced
    */
   getLastSyncedHeight(): number {
+    if (!this.syncManager) {
+      return -1;
+    }
     return this.syncManager.getLastSyncedHeight();
   }
 
@@ -584,6 +752,9 @@ export class NavioClient {
    * @returns Current sync state
    */
   getSyncState() {
+    if (!this.syncManager) {
+      return null;
+    }
     return this.syncManager.getSyncState();
   }
 
@@ -592,6 +763,9 @@ export class NavioClient {
    * @returns Creation height or 0 if not set
    */
   async getCreationHeight(): Promise<number> {
+    if (!this.walletDB) {
+      throw new Error('Client not initialized');
+    }
     return this.walletDB.getCreationHeight();
   }
 
@@ -600,6 +774,9 @@ export class NavioClient {
    * @param height - Block height when wallet was created
    */
   async setCreationHeight(height: number): Promise<void> {
+    if (!this.walletDB) {
+      throw new Error('Client not initialized');
+    }
     await this.walletDB.setCreationHeight(height);
   }
 
@@ -613,6 +790,9 @@ export class NavioClient {
     restoredFromSeed: boolean;
     version: number;
   } | null> {
+    if (!this.walletDB) {
+      throw new Error('Client not initialized');
+    }
     return this.walletDB.getWalletMetadata();
   }
 
@@ -695,6 +875,9 @@ export class NavioClient {
    * @returns Balance in satoshis as bigint
    */
   async getBalance(tokenId: string | null = null): Promise<bigint> {
+    if (!this.walletDB) {
+      throw new Error('Client not initialized');
+    }
     return this.walletDB.getBalance(tokenId);
   }
 
@@ -713,7 +896,10 @@ export class NavioClient {
    * @param tokenId - Optional token ID to filter by (null for NAV)
    * @returns Array of unspent wallet outputs
    */
-  async getUnspentOutputs(tokenId: string | null = null): Promise<import('./wallet-db').WalletOutput[]> {
+  async getUnspentOutputs(tokenId: string | null = null): Promise<WalletOutput[]> {
+    if (!this.walletDB) {
+      throw new Error('Client not initialized');
+    }
     return this.walletDB.getUnspentOutputs(tokenId);
   }
 
@@ -721,7 +907,288 @@ export class NavioClient {
    * Get all wallet outputs (spent and unspent)
    * @returns Array of all wallet outputs
    */
-  async getAllOutputs(): Promise<import('./wallet-db').WalletOutput[]> {
+  async getAllOutputs(): Promise<WalletOutput[]> {
+    if (!this.walletDB) {
+      throw new Error('Client not initialized');
+    }
     return this.walletDB.getAllOutputs();
+  }
+
+  // ============================================================
+  // Transaction Creation & Broadcasting
+  // ============================================================
+
+  /**
+   * Send NAV (or a token) to a destination address.
+   *
+   * Selects UTXOs, builds a confidential transaction with change,
+   * and broadcasts it via the connected backend.
+   *
+   * @param options - Send options (address, amount, memo, etc.)
+   * @returns Transaction result with txId and details
+   *
+   * @example
+   * ```typescript
+   * const result = await client.sendTransaction({
+   *   address: 'tnv1...',
+   *   amount: 100_000_000n, // 1 NAV
+   *   memo: 'Payment',
+   * });
+   * console.log('Sent tx:', result.txId);
+   * ```
+   */
+  async sendTransaction(options: SendTransactionOptions): Promise<SendTransactionResult> {
+    if (!this.initialized) {
+      await this.initialize();
+    }
+    if (!this.keyManager || !this.walletDB) {
+      throw new Error('Client not initialized');
+    }
+    if (!this.isConnected()) {
+      throw new Error('Not connected to backend. Please reconnect before sending.');
+    }
+    if (!this.keyManager.isUnlocked()) {
+      throw new Error('Wallet is locked. Unlock it before sending.');
+    }
+
+    const {
+      address,
+      amount,
+      memo = '',
+      subtractFeeFromAmount = false,
+      tokenId = null,
+    } = options;
+
+    if (amount <= 0n) {
+      throw new Error('Amount must be positive');
+    }
+
+    // --- Decode destination address ---
+    const destSubAddr = NavioClient.decodeAddress(address);
+
+    // --- Select inputs ---
+    const utxos = await this.walletDB.getUnspentOutputs(tokenId);
+    if (utxos.length === 0) {
+      throw new Error('No unspent outputs available');
+    }
+
+    const { selected, totalIn } = NavioClient.selectInputs(utxos, amount, subtractFeeFromAmount);
+
+    // Calculate fee: (inputs + 2 outputs) * DEFAULT_FEE_PER_COMPONENT
+    // 2 outputs = destination + change (change may be zero but the fee estimate includes it)
+    const numComponents = selected.length + 2;
+    const fee = BigInt(numComponents * DEFAULT_FEE_PER_COMPONENT);
+
+    let sendAmount: bigint;
+    let changeAmount: bigint;
+
+    if (subtractFeeFromAmount) {
+      sendAmount = amount - fee;
+      if (sendAmount <= 0n) {
+        throw new Error(`Fee (${fee} sat) exceeds send amount (${amount} sat)`);
+      }
+      changeAmount = totalIn - amount;
+    } else {
+      sendAmount = amount;
+      const needed = amount + fee;
+      if (totalIn < needed) {
+        throw new Error(
+          `Insufficient funds: need ${needed} sat (${amount} + ${fee} fee) but only have ${totalIn} sat`
+        );
+      }
+      changeAmount = totalIn - amount - fee;
+    }
+
+    // --- Build token ID ---
+    const blsctTokenId = tokenId
+      ? TokenId.deserialize(tokenId)
+      : TokenId.default();
+
+    // --- Build inputs ---
+    const txIns: InstanceType<typeof TxIn>[] = [];
+    for (const utxo of selected) {
+      const txIn = this.buildTxInput(utxo, blsctTokenId);
+      txIns.push(txIn);
+    }
+
+    // --- Build outputs ---
+    const txOuts: InstanceType<typeof TxOut>[] = [];
+
+    // Destination output
+    const destTxOut = TxOut.generate(
+      destSubAddr,
+      Number(sendAmount),
+      memo,
+      blsctTokenId,
+      TxOutputType.Normal,
+      0,
+      false,
+      Scalar.random(),
+    );
+    txOuts.push(destTxOut);
+
+    // Change output (send back to ourselves at a change sub-address)
+    if (changeAmount > 0n) {
+      const changeSubAddr = this.getChangeSubAddress();
+      const changeTxOut = TxOut.generate(
+        changeSubAddr,
+        Number(changeAmount),
+        '',
+        blsctTokenId,
+        TxOutputType.Normal,
+        0,
+        false,
+        Scalar.random(),
+      );
+      txOuts.push(changeTxOut);
+    }
+
+    // --- Build and serialize the confidential transaction ---
+    const { rawTx, txId } = buildAndSerializeCTx(txIns, txOuts);
+
+    // --- Broadcast ---
+    await this.broadcastRawTransaction(rawTx);
+
+    // --- Mark spent outputs ---
+    for (const utxo of selected) {
+      await this.walletDB.markOutputSpent(utxo.outputHash, txId, 0);
+    }
+
+    return {
+      txId,
+      rawTx,
+      fee,
+      inputCount: txIns.length,
+      outputCount: txOuts.length,
+    };
+  }
+
+  /**
+   * Broadcast a raw transaction hex via the connected backend.
+   * @param rawTx - Serialized transaction hex
+   * @returns Transaction hash returned by the server
+   */
+  async broadcastRawTransaction(rawTx: string): Promise<string> {
+    if (!this.initialized) {
+      await this.initialize();
+    }
+
+    if (!this.isConnected()) {
+      throw new Error('Not connected to backend. Please reconnect before broadcasting.');
+    }
+
+    // Use the sync provider which holds the active connection
+    const provider = this.syncProvider as any;
+    if (typeof provider.broadcastTransaction === 'function') {
+      return provider.broadcastTransaction(rawTx);
+    }
+
+    throw new Error('Connected backend does not support transaction broadcasting');
+  }
+
+  /**
+   * Decode a bech32m address string into a SubAddr for use as a destination.
+   */
+  private static decodeAddress(addressStr: string): InstanceType<typeof SubAddr> {
+    try {
+      const dpk = Address.decode(addressStr);
+      return SubAddr.fromDoublePublicKey(dpk);
+    } catch (err: any) {
+      throw new Error(`Invalid address "${addressStr}": ${err.message}`);
+    }
+  }
+
+  /**
+   * Select UTXOs to cover the target amount.
+   * Uses a simple largest-first strategy.
+   */
+  private static selectInputs(
+    utxos: WalletOutput[],
+    targetAmount: bigint,
+    subtractFee: boolean,
+  ): { selected: WalletOutput[]; totalIn: bigint } {
+    // Sort descending by amount for efficient selection
+    const sorted = [...utxos].sort((a, b) => {
+      if (b.amount > a.amount) return 1;
+      if (b.amount < a.amount) return -1;
+      return 0;
+    });
+
+    const selected: WalletOutput[] = [];
+    let totalIn = 0n;
+
+    for (const utxo of sorted) {
+      selected.push(utxo);
+      totalIn += utxo.amount;
+
+      // Estimate fee with current selection
+      const numComponents = selected.length + 2;
+      const estimatedFee = BigInt(numComponents * DEFAULT_FEE_PER_COMPONENT);
+      const needed = subtractFee ? targetAmount : targetAmount + estimatedFee;
+
+      if (totalIn >= needed) {
+        return { selected, totalIn };
+      }
+    }
+
+    // Not enough, but return what we have; the caller will check and throw
+    return { selected, totalIn };
+  }
+
+  /**
+   * Build a TxIn from a wallet output.
+   */
+  private buildTxInput(
+    utxo: WalletOutput,
+    tokenId: InstanceType<typeof TokenId>,
+  ): InstanceType<typeof TxIn> {
+    if (!this.keyManager) {
+      throw new Error('KeyManager not available');
+    }
+
+    // Reconstruct the blinding public key from the stored hex
+    const blindingPubKey = PublicKey.deserialize(utxo.blindingKey);
+
+    // Derive the private spending key for this output
+    const viewKey = this.keyManager.getPrivateViewKey();
+    const masterSpendKey = this.keyManager.getSpendingKey();
+
+    // Find the sub-address this output belongs to via hash ID
+    const spendingPubKey = PublicKey.deserialize(utxo.spendingKey);
+    const hashId = this.keyManager.calculateHashId(blindingPubKey, spendingPubKey);
+    const subAddrId = { account: 0, address: 0 };
+    this.keyManager.getSubAddressId(hashId, subAddrId);
+
+    // Compute the private spending key for this output
+    const privSpendingKey = new PrivSpendingKey(
+      blindingPubKey,
+      viewKey,
+      masterSpendKey,
+      subAddrId.account,
+      subAddrId.address,
+    );
+
+    // In Navio, UTXOs are identified by the output hash alone
+    const ctxId = CTxId.deserialize(utxo.outputHash);
+    const outPoint = OutPoint.generate(ctxId, 0);
+
+    return TxIn.generate(
+      Number(utxo.amount),
+      0,
+      privSpendingKey,
+      tokenId,
+      outPoint,
+    );
+  }
+
+  /**
+   * Get a SubAddr for receiving change.
+   * Uses the change account (account -1).
+   */
+  private getChangeSubAddress(): InstanceType<typeof SubAddr> {
+    if (!this.keyManager) {
+      throw new Error('KeyManager not available');
+    }
+    return this.keyManager.getSubAddress({ account: -1, address: 0 });
   }
 }

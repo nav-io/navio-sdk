@@ -48,11 +48,11 @@ npm run dev
 
 The `navio-blsct` library uses WebAssembly, which is loaded asynchronously. The wallet may take a moment to initialize on first load.
 
-The SQL.js WebAssembly dependency is loaded from the SQL.js CDN by default. If you need to host it locally, set `window.NAVIO_SQL_WASM_URL` before initializing the SDK.
+The SDK loads `sql.js` (SQLite compiled to WebAssembly) from a CDN for database operations. The database is automatically persisted to IndexedDB.
 
-### In-Memory Storage
+### Persistent Storage
 
-This example uses `:memory:` for the database, meaning all wallet data is lost when you refresh the page. In a production app, you would use IndexedDB or another persistent storage mechanism.
+This example uses the SDK's browser adapter which automatically persists wallet data to IndexedDB using `sql.js`. Your wallet data (including the recovery phrase, keys, and sync state) survives page reloads and browser restarts.
 
 ### CORS
 

@@ -8,160 +8,116 @@
 </head>
 <body>
   <div id="app">
-    <header>
-      <h1>⚓ Navio Web Wallet</h1>
-      <p class="subtitle">Basic example using navio-sdk</p>
-    </header>
+    <h1>Navio Web Wallet</h1>
 
-    <main>
-      <!-- Wallet Setup Section -->
-      <section id="setup-section" class="card">
-        <h2>Wallet Setup</h2>
-        <div class="form-group">
-          <label for="network">Network:</label>
-          <select id="network">
-            <option value="testnet">Testnet</option>
-            <option value="mainnet">Mainnet</option>
-          </select>
-        </div>
-        <div class="form-group">
-          <label for="electrum-host">Electrum Host:</label>
-          <input type="text" id="electrum-host" value="testnet.nav.io" />
-        </div>
-        <div class="form-group">
-          <label for="electrum-port">Electrum Port:</label>
-          <input type="number" id="electrum-port" value="50005" />
-        </div>
-        <div class="form-group">
-          <label for="wallet-password">Wallet Password (optional):</label>
-          <input type="password" id="wallet-password" placeholder="Leave empty for no encryption" />
-        </div>
-        <div class="form-group">
-          <label for="wallet-password-confirm">Confirm Password:</label>
-          <input type="password" id="wallet-password-confirm" placeholder="Confirm password" />
-        </div>
-        <div class="button-group">
-          <button id="create-wallet-btn" class="btn primary">Create New Wallet</button>
-          <button id="restore-wallet-btn" class="btn secondary">Restore from Seed</button>
-        </div>
-      </section>
+    <div id="status">Loading SDK...</div>
 
-      <!-- Restore Section (hidden by default) -->
-      <section id="restore-section" class="card hidden">
-        <h2>Restore Wallet</h2>
-        <div class="form-group">
-          <label for="seed-input">Mnemonic or Seed:</label>
-          <textarea id="seed-input" rows="3" placeholder="Enter your 24-word mnemonic or hex seed..."></textarea>
-        </div>
-        <div class="form-group">
-          <label for="restore-height">Restore from height (optional):</label>
-          <input type="number" id="restore-height" placeholder="0" />
-        </div>
-        <div class="button-group">
-          <button id="confirm-restore-btn" class="btn primary">Restore</button>
-          <button id="cancel-restore-btn" class="btn secondary">Cancel</button>
-        </div>
-      </section>
+    <!-- Wallet list -->
+    <section id="wallet-list" class="hidden">
+      <div class="card">
+        <h2>Your Wallets</h2>
+        <div id="wallets-container"></div>
+        <button id="btn-new-wallet" class="secondary" style="margin-top:0.75rem;width:100%">+ Create New Wallet</button>
+      </div>
+    </section>
 
-      <!-- Wallet Info Section (hidden by default) -->
-      <section id="wallet-section" class="card hidden">
-        <h2>Wallet Info</h2>
-        <div class="info-grid">
-          <div class="info-item">
-            <span class="label">Status:</span>
-            <span id="wallet-status" class="value">Disconnected</span>
-          </div>
-          <div class="info-item">
-            <span class="label">Network:</span>
-            <span id="wallet-network" class="value">-</span>
-          </div>
-          <div class="info-item">
-            <span class="label">Synced Height:</span>
-            <span id="wallet-height" class="value">-</span>
-          </div>
-          <div class="info-item">
-            <span class="label">Balance:</span>
-            <span id="wallet-balance" class="value highlight">0.00000000 NAV</span>
-          </div>
-        </div>
-        
-        <div class="wallet-address">
-          <label>Receive Address:</label>
-          <code id="receive-address">-</code>
+    <!-- Create / Connect -->
+    <section id="setup" class="hidden">
+      <div class="card">
+        <h2 id="setup-title">Create New Wallet</h2>
+
+        <div id="field-wallet-name" class="field">
+          <label for="wallet-name">Wallet Name</label>
+          <input id="wallet-name" value="" placeholder="My Wallet" />
         </div>
 
-        <div class="seed-display">
-          <label>Recovery Phrase (save this!):</label>
-          <code id="wallet-seed" class="seed">-</code>
-        </div>
-
-        <div class="button-group">
-          <button id="sync-btn" class="btn primary">Start Sync</button>
-          <button id="stop-sync-btn" class="btn secondary" disabled>Stop Sync</button>
-          <button id="lock-btn" class="btn secondary hidden">Lock Wallet</button>
-          <button id="disconnect-btn" class="btn danger">Disconnect</button>
-        </div>
-      </section>
-
-      <!-- Unlock Dialog (hidden by default) -->
-      <section id="unlock-section" class="card hidden modal-overlay">
-        <div class="modal">
-          <h2>Unlock Wallet</h2>
-          <p>Enter your password to unlock the wallet.</p>
-          <div class="form-group">
-            <label for="unlock-password">Password:</label>
-            <input type="password" id="unlock-password" placeholder="Enter wallet password" />
-          </div>
-          <div id="unlock-error" class="error-message hidden"></div>
-          <div class="button-group">
-            <button id="confirm-unlock-btn" class="btn primary">Unlock</button>
-            <button id="cancel-unlock-btn" class="btn secondary">Cancel</button>
+        <div class="field">
+          <label for="electrum-host">Electrum Server</label>
+          <div class="row">
+            <input id="electrum-host" value="testnet.nav.io" placeholder="host" />
+            <input id="electrum-port" type="number" value="50005" placeholder="port" style="width:80px" />
           </div>
         </div>
-      </section>
 
-      <!-- Change Password Dialog (hidden by default) -->
-      <section id="change-password-section" class="card hidden modal-overlay">
-        <div class="modal">
-          <h2>Change Password</h2>
-          <div class="form-group">
-            <label for="old-password">Current Password:</label>
-            <input type="password" id="old-password" placeholder="Enter current password" />
-          </div>
-          <div class="form-group">
-            <label for="new-password">New Password:</label>
-            <input type="password" id="new-password" placeholder="Enter new password" />
-          </div>
-          <div class="form-group">
-            <label for="new-password-confirm">Confirm New Password:</label>
-            <input type="password" id="new-password-confirm" placeholder="Confirm new password" />
-          </div>
-          <div id="change-password-error" class="error-message hidden"></div>
-          <div class="button-group">
-            <button id="confirm-change-password-btn" class="btn primary">Change Password</button>
-            <button id="cancel-change-password-btn" class="btn secondary">Cancel</button>
-          </div>
+        <div id="field-password" class="field">
+          <label for="wallet-password">Password <span class="hint">(optional — encrypts spending keys)</span></label>
+          <input id="wallet-password" type="password" placeholder="Leave empty for no encryption" />
         </div>
-      </section>
 
-      <!-- UTXOs Section (hidden by default) -->
-      <section id="utxos-section" class="card hidden">
-        <h2>Unspent Outputs</h2>
-        <div id="utxos-list" class="utxos-list">
-          <p class="empty">No unspent outputs</p>
+        <div id="field-unlock" class="field hidden">
+          <label for="unlock-password">Password <span class="hint">(required — wallet is encrypted)</span></label>
+          <input id="unlock-password" type="password" placeholder="Enter wallet password" />
         </div>
-      </section>
 
-      <!-- Log Section -->
-      <section id="log-section" class="card">
-        <h2>Activity Log</h2>
-        <div id="log" class="log"></div>
-      </section>
-    </main>
+        <div id="field-mnemonic" class="field">
+          <label for="mnemonic">Mnemonic <span class="hint">(leave empty to create new wallet)</span></label>
+          <textarea id="mnemonic" rows="2" placeholder="word1 word2 word3 ..."></textarea>
+        </div>
 
-    <footer>
-      <p>Navio SDK Web Wallet Example</p>
-    </footer>
+        <div id="field-restore-height" class="field">
+          <label for="restore-height">Restore from height</label>
+          <input id="restore-height" type="number" value="0" min="0" placeholder="0" style="width:120px" />
+        </div>
+
+        <div class="row">
+          <button id="btn-create">Create Wallet</button>
+          <button id="btn-back" class="secondary hidden">Back</button>
+        </div>
+      </div>
+    </section>
+
+    <!-- Wallet info -->
+    <section id="wallet" class="hidden">
+      <div class="card">
+        <h2 id="wallet-title">Wallet</h2>
+        <dl>
+          <dt>Mnemonic</dt>
+          <dd>
+            <span id="wallet-mnemonic" class="mono">****</span>
+            <button id="btn-toggle-mnemonic" class="inline-btn">Show</button>
+          </dd>
+          <dt>Address</dt>
+          <dd id="wallet-address" class="mono">-</dd>
+          <dt>Balance</dt>
+          <dd id="wallet-balance">-</dd>
+          <dt>Sync Height</dt>
+          <dd id="wallet-height">-</dd>
+          <dt>Encryption</dt>
+          <dd id="wallet-encryption">None</dd>
+        </dl>
+        <div class="row">
+          <button id="btn-sync">Start Sync</button>
+          <button id="btn-stop" disabled>Stop Sync</button>
+          <button id="btn-lock" class="secondary hidden">Lock</button>
+          <button id="btn-disconnect" class="secondary">Disconnect</button>
+          <button id="btn-delete" class="danger">Delete</button>
+        </div>
+      </div>
+      <div class="card">
+        <h2>Send</h2>
+        <div class="field">
+          <label for="send-address">Destination Address</label>
+          <input id="send-address" placeholder="tnv1..." />
+        </div>
+        <div class="field">
+          <label for="send-amount">Amount (NAV)</label>
+          <input id="send-amount" type="number" step="0.00000001" min="0" placeholder="0.00000000" />
+        </div>
+        <div class="field">
+          <label for="send-memo">Memo <span class="hint">(optional)</span></label>
+          <input id="send-memo" placeholder="" />
+        </div>
+        <div class="row" style="align-items:center;">
+          <button id="btn-send">Send</button>
+          <span id="send-status" class="send-status"></span>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>Log</h2>
+        <pre id="log"></pre>
+      </div>
+    </section>
   </div>
 
   <script type="module" src="/src/main.ts"></script>

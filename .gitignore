@@ -41,6 +41,12 @@ pnpm-debug.log*
 .temp/
 *.tmp
 *.db
+*.db-wal
+*.db-shm
+
+
+
+
 
 
 # Generated documentation

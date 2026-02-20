@@ -12,7 +12,7 @@ TypeScript SDK for interacting with the Navio blockchain. Provides wallet manage
 - **Balance Tracking** - Query wallet balance and UTXOs
 - **Spending Status Tracking** - Monitor spent/unspent outputs
 - **Blockchain Reorganization Handling** - Automatic reorg detection and recovery
-- **Cross-Platform Persistence** - SQLite via SQL.js (browser, Node.js, mobile)
+- **Cross-Platform Persistence** - Efficient SQLite storage (sql.js with IndexedDB for browser, better-sqlite3 for Node.js)
 - **Hierarchical Deterministic Sub-addresses** - Multiple account support
 
 ## Installation
@@ -483,6 +483,70 @@ const rawData = walletDB.export();
 const db = await WalletDB.loadFromBytes(rawData);
 ```
 
+#### Cross-Platform Database Storage
+
+The SDK provides efficient, cross-platform SQLite database storage with automatic adapter selection based on the runtime environment:
+
+| Platform | Adapter | Storage | Performance |
+|----------|---------|---------|-------------|
+| Browser | sql.js + IndexedDB | IndexedDB | Good |
+| Node.js | better-sqlite3 | File system | Excellent |
+| Testing | In-memory | Memory | Fast |
+
+The browser adapter uses `sql.js` (SQLite compiled to WebAssembly) with IndexedDB for persistence. Changes are automatically saved to IndexedDB with debouncing for optimal performance.
+
+```typescript
+import { NavioClient, WalletDB, createDatabaseAdapter } from 'navio-sdk';
+
+// Auto-detect best adapter for environment
+const client = new NavioClient({
+  walletDbPath: 'wallet.db',  // Adapter auto-selected based on environment
+  // ... other config
+});
+
+// Available adapter types:
+// - 'browser': sql.js with IndexedDB persistence
+// - 'node': better-sqlite3 native bindings
+// - 'memory': In-memory (testing)
+```
+
+**Using WalletDB Directly:**
+
+```typescript
+// Create with auto-detected adapter
+const db = new WalletDB();
+await db.open('wallet.db');
+
+// Force specific adapter
+const db = new WalletDB({ type: 'better-sqlite3' });
+await db.open('./wallet.db');
+
+// In-memory for testing
+const db = new WalletDB({ type: 'memory' });
+await db.open(':memory:');
+
+// All operations are async
+await db.createWallet();
+const km = await db.loadWallet();
+await db.close();
+```
+
+**Migrating Between Adapters:**
+
+```typescript
+// Start with in-memory database
+const memDb = new WalletDB({ type: 'memory' });
+await memDb.open(':memory:');
+await memDb.createWallet();
+
+// Migrate to persistent storage
+const persistentDb = await memDb.migrate('wallet.db');
+```
+
+**Browser Storage:**
+
+In browser environments, the SDK uses `sql.js` (SQLite compiled to WebAssembly) with IndexedDB for persistence. The database is automatically saved to IndexedDB when changes are made, ensuring data survives page reloads and browser restarts.
+
 #### Encryption Metadata
 
 ```typescript
@@ -835,6 +899,7 @@ The wallet database includes the following tables:
 | `view_key` | View key for output detection |
 | `spend_key` | Spending public key |
 | `hd_chain` | HD chain information |
+| `master_seed` | Mnemonic phrase for wallet recovery |
 | `sub_addresses` | Sub-address mappings |
 | `wallet_outputs` | Wallet UTXOs with amounts |
 | `wallet_metadata` | Wallet creation info |

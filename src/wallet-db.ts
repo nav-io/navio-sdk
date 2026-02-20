@@ -1,159 +1,150 @@
 /**
  * WalletDB - Database persistence layer for KeyManager
- * Uses SQL.js (SQLite compiled to WebAssembly) for cross-platform compatibility
- * Works on web browsers, Node.js, and mobile platforms
+ * 
+ * Provides cross-platform SQLite database support with efficient page-level persistence:
+ * - Browser: wa-sqlite with OPFS (best performance, requires Web Worker)
+ * - Browser fallback: wa-sqlite with IndexedDB (for Safari incognito, etc.)
+ * - Node.js: better-sqlite3 (native bindings, best performance)
+ * - In-memory: better-sqlite3 with ':memory:' path (for testing)
  *
- * Database schema replicates navio-core wallet database structure
+ * All adapters use page-level persistence - only changed blocks are written,
+ * making them efficient for databases of any size.
+ *
+ * Database schema replicates navio-core wallet database structure.
+ * 
+ * @example
+ * ```typescript
+ * // Auto-detect best adapter for environment
+ * const db = new WalletDB();
+ * await db.open('wallet.db');
+ * 
+ * // In-memory database
+ * const db = new WalletDB({ type: 'memory' });
+ * await db.open(':memory:');
+ * 
+ * // Force specific adapter
+ * const db = new WalletDB({ type: 'better-sqlite3' });
+ * await db.open('./wallet.db');
+ * ```
  */
 
 import { KeyManager } from './key-manager';
 import type { HDChain, SubAddressIdentifier } from './key-manager.types';
 import * as blsctModule from 'navio-blsct';
+import type { IDatabaseAdapter, DatabaseAdapterOptions } from './database-adapter';
+import { createDatabaseAdapter } from './database-adapter';
+import type { SyncState, StoreOutputParams } from './wallet-db.interface';
+export type { SyncState, WalletOutput, WalletMetadata, StoreOutputParams, IWalletDB } from './wallet-db.interface';
+
+// WalletOutput is re-exported from wallet-db.interface.ts
+import type { WalletOutput } from './wallet-db.interface';
 
 /**
- * Wallet output structure returned by getUnspentOutputs and getAllOutputs
+ * Options for WalletDB
  */
-export interface WalletOutput {
-  outputHash: string;
-  txHash: string;
-  outputIndex: number;
-  blockHeight: number;
-  amount: bigint;
-  memo: string | null;
-  tokenId: string | null;
-  blindingKey: string;
-  spendingKey: string;
-  isSpent: boolean;
-  spentTxHash: string | null;
-  spentBlockHeight: number | null;
-}
-
-// Import SQL.js for cross-platform SQLite support
-// In browser: uses WebAssembly SQLite
-// In Node.js: uses native SQLite bindings if available, falls back to WASM
-let initSqlJs: any;
-let SQL: any;
-
-// Lazy load SQL.js to support both browser and Node.js
-async function loadSQL(): Promise<any> {
-  if (SQL) return SQL;
-
-  try {
-    // Try to load SQL.js
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    if (typeof (globalThis as any).window !== 'undefined') {
-      // Browser environment
-      const sqlJs = await import('sql.js');
-      initSqlJs = sqlJs.default;
-      SQL = await initSqlJs({
-        // Prefer explicit override, otherwise use CDN to avoid requiring a local wasm file
-        locateFile: (file: string) => {
-          if (file === 'sql-wasm.wasm') {
-            const override = (globalThis as any).NAVIO_SQL_WASM_URL;
-            if (typeof override === 'string' && override.length > 0) {
-              return override;
-            }
-          }
-          return `https://sql.js.org/dist/${file}`;
-        },
-      });
-    } else {
-      // Node.js environment
-      const sqlJs = require('sql.js');
-      initSqlJs = sqlJs.default || sqlJs;
-      const fs = require('fs');
-      SQL = await initSqlJs({
-        locateFile: (file: string) => {
-          // Try to find sql.js WASM file
-          const path = require('path');
-          const wasmPath = path.join(__dirname, '../node_modules/sql.js/dist/sql-wasm.wasm');
-          if (fs.existsSync(wasmPath)) {
-            return wasmPath;
-          }
-          return file;
-        },
-      });
-    }
-    return SQL;
-  } catch (error) {
-    throw new Error(`Failed to load SQL.js: ${error}. Please install sql.js: npm install sql.js`);
-  }
+export interface WalletDBOptions extends DatabaseAdapterOptions {
+  /** Custom database adapter (overrides type) */
+  adapter?: IDatabaseAdapter;
 }
 
 /**
  * WalletDB - Manages wallet database persistence.
  * 
- * Uses SQL.js (SQLite compiled to WebAssembly) for cross-platform compatibility.
- * Works on web browsers, Node.js, and mobile platforms.
+ * Provides cross-platform SQLite database support with efficient page-level persistence.
+ * The adapter is auto-detected based on the runtime environment:
+ * - Browser: wa-sqlite with OPFS (best) or IndexedDB (fallback)
+ * - Node.js: better-sqlite3 (native bindings)
+ * - Testing: better-sqlite3 with ':memory:' path
+ * 
+ * All database operations are async to support Web Worker-based adapters.
+ * 
+ * @example
+ * ```typescript
+ * // Auto-detect best adapter
+ * const db = new WalletDB();
+ * await db.open('wallet.db');
+ * const km = await db.loadWallet();
+ * 
+ * // Force Node.js adapter
+ * const db = new WalletDB({ type: 'better-sqlite3' });
+ * await db.open('./wallet.db');
+ * 
+ * // Use custom adapter
+ * const adapter = new MyCustomAdapter();
+ * const db = new WalletDB({ adapter });
+ * await db.open('wallet.db');
+ * ```
  * 
  * @category Wallet
  */
 export class WalletDB {
-  private db: any = null;
-  private dbPath: string;
+  private adapter: IDatabaseAdapter | null = null;
+  private adapterOptions: WalletDBOptions;
+  private dbPath: string = '';
   private keyManager: KeyManager | null = null;
-  private isOpen = false;
+  private opened = false;
 
   /**
    * Create a new WalletDB instance
-   * @param dbPath - Path to the database file (or name for in-memory)
-   * @param createIfNotExists - Create database if it doesn't exist
+   * @param options - Database adapter options
    */
-  constructor(dbPath: string = ':memory:', _createIfNotExists = true) {
-    this.dbPath = dbPath;
-    // Database will be opened when loadWallet, createWallet, or restoreWallet is called
-    // Note: _createIfNotExists reserved for future use
+  constructor(options: WalletDBOptions = {}) {
+    this.adapterOptions = options;
+
+    // Use provided adapter if given
+    if (options.adapter) {
+      this.adapter = options.adapter;
+    }
   }
 
   /**
-   * Initialize the database connection and schema
+   * Open the database
+   * @param path - Database path/name
+   * @param data - Optional initial data to import
    */
-  private async initDatabase(): Promise<void> {
-    if (this.isOpen) return;
-
-    const SQL = await loadSQL();
-    const fs = this.getFileSystem();
-
-    // Load existing database or create new one
-    if (this.dbPath !== ':memory:' && fs && fs.existsSync && fs.existsSync(this.dbPath)) {
-      try {
-        const buffer = fs.readFileSync(this.dbPath);
-        this.db = new SQL.Database(buffer);
-      } catch (error) {
-        // If read fails, create new database
-        this.db = new SQL.Database();
-      }
-    } else {
-      this.db = new SQL.Database();
+  async open(path: string, data?: Uint8Array): Promise<void> {
+    if (this.opened) {
+      throw new Error('Database already open');
     }
+
+    this.dbPath = path;
+
+    // Create adapter if not provided
+    if (!this.adapter) {
+      this.adapter = await createDatabaseAdapter(this.adapterOptions);
+    }
+
+    // Open the database
+    await this.adapter.open(path, data);
 
     // Create schema
-    this.createSchema();
-    this.isOpen = true;
+    await this.createSchema();
+    this.opened = true;
   }
 
   /**
-   * Get file system interface (Node.js only)
+   * Check if the database is open
    */
-  private getFileSystem(): any {
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    if (typeof (globalThis as any).window === 'undefined' && typeof require !== 'undefined') {
-      try {
-        return require('fs');
-      } catch {
-        return null;
-      }
-    }
-    return null;
+  isOpen(): boolean {
+    return this.opened && this.adapter !== null && this.adapter.isOpen();
+  }
+
+  /**
+   * Get the adapter type being used
+   */
+  getAdapterType(): string {
+    return this.adapter?.constructor.name ?? 'none';
   }
 
   /**
    * Create database schema
    * Replicates navio-core wallet database structure
    */
-  private createSchema(): void {
+  private async createSchema(): Promise<void> {
+    if (!this.adapter) throw new Error('Database not open');
+
     // Keys table - stores key pairs
-    this.db.run(`
+    await this.adapter.run(`
       CREATE TABLE IF NOT EXISTS keys (
         key_id TEXT PRIMARY KEY,
         secret_key TEXT NOT NULL,
@@ -163,7 +154,7 @@ export class WalletDB {
     `);
 
     // Output keys table - stores output-specific keys
-    this.db.run(`
+    await this.adapter.run(`
       CREATE TABLE IF NOT EXISTS out_keys (
         out_id TEXT PRIMARY KEY,
         secret_key TEXT NOT NULL
@@ -171,7 +162,7 @@ export class WalletDB {
     `);
 
     // Encrypted keys table
-    this.db.run(`
+    await this.adapter.run(`
       CREATE TABLE IF NOT EXISTS crypted_keys (
         key_id TEXT PRIMARY KEY,
         public_key TEXT NOT NULL,
@@ -180,7 +171,7 @@ export class WalletDB {
     `);
 
     // Encrypted output keys table
-    this.db.run(`
+    await this.adapter.run(`
       CREATE TABLE IF NOT EXISTS crypted_out_keys (
         out_id TEXT PRIMARY KEY,
         public_key TEXT NOT NULL,
@@ -189,7 +180,7 @@ export class WalletDB {
     `);
 
     // View key table
-    this.db.run(`
+    await this.adapter.run(`
       CREATE TABLE IF NOT EXISTS view_key (
         public_key TEXT PRIMARY KEY,
         secret_key TEXT NOT NULL
@@ -197,14 +188,14 @@ export class WalletDB {
     `);
 
     // Spend key table (public key only)
-    this.db.run(`
+    await this.adapter.run(`
       CREATE TABLE IF NOT EXISTS spend_key (
         public_key TEXT PRIMARY KEY
       )
     `);
 
     // HD chain table
-    this.db.run(`
+    await this.adapter.run(`
       CREATE TABLE IF NOT EXISTS hd_chain (
         id INTEGER PRIMARY KEY,
         version INTEGER NOT NULL,
@@ -216,8 +207,19 @@ export class WalletDB {
       )
     `);
 
+    // Master seed table (stores the mnemonic for recovery)
+    // Note: This should be encrypted when wallet encryption is enabled
+    // We store the mnemonic directly because Scalar.deserialize/serialize may not roundtrip correctly
+    await this.adapter.run(`
+      CREATE TABLE IF NOT EXISTS master_seed (
+        id INTEGER PRIMARY KEY,
+        seed_hex TEXT,
+        mnemonic TEXT
+      )
+    `);
+
     // Sub-addresses table
-    this.db.run(`
+    await this.adapter.run(`
       CREATE TABLE IF NOT EXISTS sub_addresses (
         hash_id TEXT PRIMARY KEY,
         account INTEGER NOT NULL,
@@ -226,7 +228,7 @@ export class WalletDB {
     `);
 
     // Sub-address strings table
-    this.db.run(`
+    await this.adapter.run(`
       CREATE TABLE IF NOT EXISTS sub_addresses_str (
         sub_address TEXT PRIMARY KEY,
         hash_id TEXT NOT NULL
@@ -234,7 +236,7 @@ export class WalletDB {
     `);
 
     // Sub-address pool table
-    this.db.run(`
+    await this.adapter.run(`
       CREATE TABLE IF NOT EXISTS sub_address_pool (
         account INTEGER NOT NULL,
         address INTEGER NOT NULL,
@@ -244,7 +246,7 @@ export class WalletDB {
     `);
 
     // Sub-address counter table
-    this.db.run(`
+    await this.adapter.run(`
       CREATE TABLE IF NOT EXISTS sub_address_counter (
         account INTEGER PRIMARY KEY,
         counter INTEGER NOT NULL
@@ -252,7 +254,7 @@ export class WalletDB {
     `);
 
     // Key metadata table
-    this.db.run(`
+    await this.adapter.run(`
       CREATE TABLE IF NOT EXISTS key_metadata (
         key_id TEXT PRIMARY KEY,
         create_time INTEGER NOT NULL
@@ -260,7 +262,7 @@ export class WalletDB {
     `);
 
     // Transaction keys table (for sync)
-    this.db.run(`
+    await this.adapter.run(`
       CREATE TABLE IF NOT EXISTS tx_keys (
         tx_hash TEXT PRIMARY KEY,
         block_height INTEGER NOT NULL,
@@ -269,12 +271,12 @@ export class WalletDB {
     `);
 
     // Create index for block_height
-    this.db.run(`
+    await this.adapter.run(`
       CREATE INDEX IF NOT EXISTS idx_tx_keys_block_height ON tx_keys(block_height)
     `);
 
     // Block hashes table (for reorganization detection)
-    this.db.run(`
+    await this.adapter.run(`
       CREATE TABLE IF NOT EXISTS block_hashes (
         height INTEGER PRIMARY KEY,
         hash TEXT NOT NULL
@@ -282,7 +284,7 @@ export class WalletDB {
     `);
 
     // Sync state table (single row, always id = 0)
-    this.db.run(`
+    await this.adapter.run(`
       CREATE TABLE IF NOT EXISTS sync_state (
         id INTEGER PRIMARY KEY,
         last_synced_height INTEGER NOT NULL,
@@ -294,7 +296,7 @@ export class WalletDB {
     `);
 
     // Wallet metadata table (single row, always id = 0)
-    this.db.run(`
+    await this.adapter.run(`
       CREATE TABLE IF NOT EXISTS wallet_metadata (
         id INTEGER PRIMARY KEY,
         creation_height INTEGER NOT NULL DEFAULT 0,
@@ -305,7 +307,7 @@ export class WalletDB {
     `);
 
     // Encryption metadata table (for wallet password protection)
-    this.db.run(`
+    await this.adapter.run(`
       CREATE TABLE IF NOT EXISTS encryption_metadata (
         id INTEGER PRIMARY KEY,
         is_encrypted INTEGER NOT NULL DEFAULT 0,
@@ -316,7 +318,7 @@ export class WalletDB {
     `);
 
     // Wallet outputs table (UTXOs)
-    this.db.run(`
+    await this.adapter.run(`
       CREATE TABLE IF NOT EXISTS wallet_outputs (
         output_hash TEXT PRIMARY KEY,
         tx_hash TEXT NOT NULL,
@@ -336,13 +338,13 @@ export class WalletDB {
     `);
 
     // Create indexes for wallet_outputs
-    this.db.run(`
+    await this.adapter.run(`
       CREATE INDEX IF NOT EXISTS idx_wallet_outputs_tx_hash ON wallet_outputs(tx_hash)
     `);
-    this.db.run(`
+    await this.adapter.run(`
       CREATE INDEX IF NOT EXISTS idx_wallet_outputs_block_height ON wallet_outputs(block_height)
     `);
-    this.db.run(`
+    await this.adapter.run(`
       CREATE INDEX IF NOT EXISTS idx_wallet_outputs_is_spent ON wallet_outputs(is_spent)
     `);
   }
@@ -353,12 +355,14 @@ export class WalletDB {
    * @throws Error if no wallet exists in the database
    */
   async loadWallet(): Promise<KeyManager> {
-    await this.initDatabase();
+    if (!this.opened || !this.adapter) {
+      throw new Error('Database not open. Call open() first.');
+    }
 
     const keyManager = new KeyManager();
 
     // Load HD chain
-    const hdChainResult = this.db.exec('SELECT * FROM hd_chain LIMIT 1');
+    const hdChainResult = await this.adapter.exec('SELECT * FROM hd_chain LIMIT 1');
     if (hdChainResult.length === 0 || hdChainResult[0].values.length === 0) {
       throw new Error('No wallet found in database');
     }
@@ -374,8 +378,25 @@ export class WalletDB {
     };
     keyManager.loadHDChain(hdChain);
 
+    // Load mnemonic for recovery
+    // First try to load mnemonic (new format), then fall back to seed_hex (old format)
+    const masterSeedResult = await this.adapter.exec(
+      'SELECT mnemonic, seed_hex FROM master_seed WHERE id = 0'
+    );
+    if (masterSeedResult.length > 0 && masterSeedResult[0].values.length > 0) {
+      const mnemonic = masterSeedResult[0].values[0][0] as string | null;
+      const seedHex = masterSeedResult[0].values[0][1] as string | null;
+      
+      if (mnemonic) {
+        keyManager.setHDSeedFromMnemonic(mnemonic);
+      } else if (seedHex) {
+        // Legacy: load from seed hex (may not roundtrip correctly)
+        keyManager.loadMasterSeed(seedHex);
+      }
+    }
+
     // Load view key
-    const viewKeyResult = this.db.exec('SELECT * FROM view_key LIMIT 1');
+    const viewKeyResult = await this.adapter.exec('SELECT * FROM view_key LIMIT 1');
     if (viewKeyResult.length > 0 && viewKeyResult[0].values.length > 0) {
       const row = viewKeyResult[0].values[0];
       const viewKey = this.deserializeViewKey(row[1] as string);
@@ -383,7 +404,7 @@ export class WalletDB {
     }
 
     // Load spend key
-    const spendKeyResult = this.db.exec('SELECT * FROM spend_key LIMIT 1');
+    const spendKeyResult = await this.adapter.exec('SELECT * FROM spend_key LIMIT 1');
     if (spendKeyResult.length > 0 && spendKeyResult[0].values.length > 0) {
       const row = spendKeyResult[0].values[0];
       const publicKey = this.deserializePublicKey(row[0] as string);
@@ -391,7 +412,7 @@ export class WalletDB {
     }
 
     // Load keys
-    const keysResult = this.db.exec('SELECT * FROM keys');
+    const keysResult = await this.adapter.exec('SELECT * FROM keys');
     if (keysResult.length > 0) {
       for (const row of keysResult[0].values) {
         const secretKey = this.deserializeScalar(row[1] as string);
@@ -399,20 +420,20 @@ export class WalletDB {
         keyManager.loadKey(secretKey, publicKey);
 
         // Load metadata
-        const stmt = this.db.prepare('SELECT create_time FROM key_metadata WHERE key_id = ?');
+        const stmt = await this.adapter.prepare('SELECT create_time FROM key_metadata WHERE key_id = ?');
         stmt.bind([row[0]]);
-        if (stmt.step()) {
-          const metadataRow = stmt.getAsObject();
+        if (await stmt.step()) {
+          const metadataRow = await stmt.getAsObject();
           keyManager.loadKeyMetadata(this.hexToBytes(row[0] as string), {
             nCreateTime: metadataRow.create_time as number,
           });
         }
-        stmt.free();
+        await stmt.free();
       }
     }
 
     // Load output keys
-    const outKeysResult = this.db.exec('SELECT * FROM out_keys');
+    const outKeysResult = await this.adapter.exec('SELECT * FROM out_keys');
     if (outKeysResult.length > 0) {
       for (const row of outKeysResult[0].values) {
         const secretKey = this.deserializeScalar(row[1] as string);
@@ -422,7 +443,7 @@ export class WalletDB {
     }
 
     // Load encrypted keys
-    const cryptedKeysResult = this.db.exec('SELECT * FROM crypted_keys');
+    const cryptedKeysResult = await this.adapter.exec('SELECT * FROM crypted_keys');
     if (cryptedKeysResult.length > 0) {
       for (const row of cryptedKeysResult[0].values) {
         const publicKey = this.deserializePublicKey(row[1] as string);
@@ -432,7 +453,7 @@ export class WalletDB {
     }
 
     // Load encrypted output keys
-    const cryptedOutKeysResult = this.db.exec('SELECT * FROM crypted_out_keys');
+    const cryptedOutKeysResult = await this.adapter.exec('SELECT * FROM crypted_out_keys');
     if (cryptedOutKeysResult.length > 0) {
       for (const row of cryptedOutKeysResult[0].values) {
         const outId = this.hexToBytes(row[0] as string);
@@ -443,7 +464,7 @@ export class WalletDB {
     }
 
     // Load sub-addresses
-    const subAddressesResult = this.db.exec('SELECT * FROM sub_addresses');
+    const subAddressesResult = await this.adapter.exec('SELECT * FROM sub_addresses');
     if (subAddressesResult.length > 0) {
       for (const row of subAddressesResult[0].values) {
         const hashId = this.hexToBytes(row[0] as string);
@@ -456,7 +477,7 @@ export class WalletDB {
     }
 
     // Load sub-address counters
-    const counterResult = this.db.exec('SELECT * FROM sub_address_counter');
+    const counterResult = await this.adapter.exec('SELECT * FROM sub_address_counter');
     if (counterResult.length > 0) {
       for (const _row of counterResult[0].values) {
         // This would need to be stored in KeyManager
@@ -483,13 +504,15 @@ export class WalletDB {
    * @returns The new KeyManager instance
    */
   async createWallet(creationHeight?: number): Promise<KeyManager> {
-    await this.initDatabase();
+    if (!this.opened || !this.adapter) {
+      throw new Error('Database not open. Call open() first.');
+    }
 
     const keyManager = new KeyManager();
 
-    // Generate new seed
-    const seed = keyManager.generateNewSeed();
-    keyManager.setHDSeed(seed);
+    // Generate new mnemonic and set as HD seed
+    // This ensures we have a mnemonic to store for recovery
+    keyManager.generateNewMnemonic();
 
     // Initialize sub-address pools
     keyManager.newSubAddressPool(0);
@@ -517,7 +540,9 @@ export class WalletDB {
    * @returns The restored KeyManager instance
    */
   async restoreWallet(seedHex: string, creationHeight?: number): Promise<KeyManager> {
-    await this.initDatabase();
+    if (!this.opened || !this.adapter) {
+      throw new Error('Database not open. Call open() first.');
+    }
 
     const keyManager = new KeyManager();
 
@@ -551,7 +576,9 @@ export class WalletDB {
    * @returns The restored KeyManager instance
    */
   async restoreWalletFromMnemonic(mnemonic: string, creationHeight?: number): Promise<KeyManager> {
-    await this.initDatabase();
+    if (!this.opened || !this.adapter) {
+      throw new Error('Database not open. Call open() first.');
+    }
 
     const keyManager = new KeyManager();
 
@@ -585,33 +612,95 @@ export class WalletDB {
     creationTime: number;
     restoredFromSeed: boolean;
   }): Promise<void> {
-    if (!this.isOpen) {
-      await this.initDatabase();
+    if (!this.opened || !this.adapter) {
+      throw new Error('Database not open');
     }
 
-    const stmt = this.db.prepare(`
+    const stmt = await this.adapter.prepare(`
       INSERT OR REPLACE INTO wallet_metadata (id, creation_height, creation_time, restored_from_seed, version)
       VALUES (0, ?, ?, ?, 1)
     `);
-    stmt.run([metadata.creationHeight, metadata.creationTime, metadata.restoredFromSeed ? 1 : 0]);
-    stmt.free();
+    await stmt.run([metadata.creationHeight, metadata.creationTime, metadata.restoredFromSeed ? 1 : 0]);
+    await stmt.free();
 
     // Persist to disk
-    this.persistToDisk();
+    await this.persistToDisk();
   }
 
   /**
    * Persist database to disk (if not in-memory)
    */
-  private persistToDisk(): void {
-    if (this.dbPath !== ':memory:' && this.db) {
-      const fs = this.getFileSystem();
-      if (fs) {
-        const data = this.db.export();
-        const buffer = Buffer.from(data);
-        fs.writeFileSync(this.dbPath, buffer);
+  private async persistToDisk(): Promise<void> {
+    if (this.dbPath === ':memory:' || !this.adapter) {
+      return;
+    }
+
+    // Call save if adapter supports it
+    if (this.adapter.save) {
+      try {
+        await this.adapter.save();
+      } catch (err) {
+        console.warn('[WalletDB] Save failed:', err);
       }
     }
+  }
+
+  /**
+   * Explicitly save the database to persistent storage.
+   * 
+   * This forces a checkpoint/flush to ensure data is persisted.
+   * For file-based databases (Node.js), this is typically a no-op.
+   * For browser databases, this forces a WAL checkpoint.
+   * 
+   * @example
+   * ```typescript
+   * // Make important changes
+   * await db.createWallet();
+   * 
+   * // Force immediate save
+   * await db.save();
+   * ```
+   */
+  async save(): Promise<void> {
+    await this.persistToDisk();
+  }
+
+  /**
+   * Migrate to a different adapter type.
+   * 
+   * Exports the current database and imports into a new adapter.
+   * 
+   * @param newPath - Path for the new database
+   * @param options - Options for the new adapter
+   * @returns A new WalletDB instance
+   * 
+   * @example
+   * ```typescript
+   * // Migrate from memory to persistent storage
+   * const memDb = new WalletDB({ type: 'memory' });
+   * await memDb.open(':memory:');
+   * await memDb.createWallet();
+   * 
+   * // Browser: use wa-sqlite-opfs or wa-sqlite-idb
+   * const persistentDb = await memDb.migrate('wallet.db');
+   * ```
+   */
+  async migrate(newPath: string, options: WalletDBOptions = {}): Promise<WalletDB> {
+    if (!this.opened || !this.adapter) {
+      throw new Error('Database must be open before migration');
+    }
+
+    // Export current database
+    const data = await this.adapter.export();
+
+    // Create new WalletDB with specified adapter
+    const newDb = new WalletDB(options);
+    await newDb.open(newPath, data);
+
+    // Transfer keyManager reference
+    newDb.keyManager = this.keyManager;
+
+    return newDb;
   }
 
   /**
@@ -624,11 +713,11 @@ export class WalletDB {
     restoredFromSeed: boolean;
     version: number;
   } | null> {
-    if (!this.isOpen) {
-      await this.initDatabase();
+    if (!this.opened || !this.adapter) {
+      throw new Error('Database not open');
     }
 
-    const result = this.db.exec('SELECT creation_height, creation_time, restored_from_seed, version FROM wallet_metadata WHERE id = 0');
+    const result = await this.adapter.exec('SELECT creation_height, creation_time, restored_from_seed, version FROM wallet_metadata WHERE id = 0');
     if (result.length === 0 || result[0].values.length === 0) {
       return null;
     }
@@ -656,17 +745,17 @@ export class WalletDB {
    * @param height - Block height
    */
   async setCreationHeight(height: number): Promise<void> {
-    if (!this.isOpen) {
-      await this.initDatabase();
+    if (!this.opened || !this.adapter) {
+      throw new Error('Database not open');
     }
 
     // Check if metadata exists
     const existing = await this.getWalletMetadata();
     if (existing) {
-      const stmt = this.db.prepare('UPDATE wallet_metadata SET creation_height = ? WHERE id = 0');
-      stmt.run([height]);
-      stmt.free();
-      this.persistToDisk();
+      const stmt = await this.adapter.prepare('UPDATE wallet_metadata SET creation_height = ? WHERE id = 0');
+      await stmt.run([height]);
+      await stmt.free();
+      await this.persistToDisk();
     } else {
       await this.saveWalletMetadata({
         creationHeight: height,
@@ -681,8 +770,8 @@ export class WalletDB {
    * @param keyManager - The KeyManager instance to save (optional, uses stored instance if not provided)
    */
   async saveWallet(keyManager?: KeyManager): Promise<void> {
-    if (!this.isOpen) {
-      await this.initDatabase();
+    if (!this.opened || !this.adapter) {
+      throw new Error('Database not open');
     }
 
     const km = keyManager || this.keyManager;
@@ -691,32 +780,33 @@ export class WalletDB {
     }
 
     // Start transaction
-    this.db.run('BEGIN TRANSACTION');
+    await this.adapter.run('BEGIN TRANSACTION');
 
     try {
       // Clear existing data (for simplicity, we'll replace everything)
       // In production, you might want to do incremental updates
-      this.db.run('DELETE FROM keys');
-      this.db.run('DELETE FROM out_keys');
-      this.db.run('DELETE FROM crypted_keys');
-      this.db.run('DELETE FROM crypted_out_keys');
-      this.db.run('DELETE FROM view_key');
-      this.db.run('DELETE FROM spend_key');
-      this.db.run('DELETE FROM hd_chain');
-      this.db.run('DELETE FROM sub_addresses');
-      this.db.run('DELETE FROM sub_addresses_str');
-      this.db.run('DELETE FROM sub_address_pool');
-      this.db.run('DELETE FROM sub_address_counter');
-      this.db.run('DELETE FROM key_metadata');
+      await this.adapter.run('DELETE FROM keys');
+      await this.adapter.run('DELETE FROM out_keys');
+      await this.adapter.run('DELETE FROM crypted_keys');
+      await this.adapter.run('DELETE FROM crypted_out_keys');
+      await this.adapter.run('DELETE FROM view_key');
+      await this.adapter.run('DELETE FROM spend_key');
+      await this.adapter.run('DELETE FROM hd_chain');
+      await this.adapter.run('DELETE FROM master_seed');
+      await this.adapter.run('DELETE FROM sub_addresses');
+      await this.adapter.run('DELETE FROM sub_addresses_str');
+      await this.adapter.run('DELETE FROM sub_address_pool');
+      await this.adapter.run('DELETE FROM sub_address_counter');
+      await this.adapter.run('DELETE FROM key_metadata');
 
       // Save HD chain
       const hdChain = km.getHDChain();
       if (hdChain) {
-        const stmt = this.db.prepare(
+        const stmt = await this.adapter.prepare(
           `INSERT INTO hd_chain (version, seed_id, spend_id, view_id, token_id, blinding_id)
            VALUES (?, ?, ?, ?, ?, ?)`
         );
-        stmt.run([
+        await stmt.run([
           hdChain.version,
           this.bytesToHex(hdChain.seedId),
           this.bytesToHex(hdChain.spendId),
@@ -724,16 +814,29 @@ export class WalletDB {
           this.bytesToHex(hdChain.tokenId),
           this.bytesToHex(hdChain.blindingId),
         ]);
-        stmt.free();
+        await stmt.free();
+      }
+
+      // Save mnemonic for recovery when reopening wallet
+      // We store the mnemonic directly because Scalar.deserialize/serialize may not roundtrip correctly
+      try {
+        const mnemonic = km.getMnemonic();
+        const seedStmt = await this.adapter.prepare(
+          'INSERT INTO master_seed (id, mnemonic) VALUES (0, ?)'
+        );
+        await seedStmt.run([mnemonic]);
+        await seedStmt.free();
+      } catch {
+        // Mnemonic not available (e.g., view-only wallet)
       }
 
       // Save view key
       try {
         const viewKey = km.getPrivateViewKey();
         const viewPublicKey = this.getPublicKeyFromViewKey(viewKey);
-        const stmt = this.db.prepare('INSERT INTO view_key (public_key, secret_key) VALUES (?, ?)');
-        stmt.run([this.serializePublicKey(viewPublicKey), this.serializeViewKey(viewKey)]);
-        stmt.free();
+        const stmt = await this.adapter.prepare('INSERT INTO view_key (public_key, secret_key) VALUES (?, ?)');
+        await stmt.run([this.serializePublicKey(viewPublicKey), this.serializeViewKey(viewKey)]);
+        await stmt.free();
       } catch {
         // View key not available
       }
@@ -741,9 +844,9 @@ export class WalletDB {
       // Save spend key
       try {
         const spendPublicKey = km.getPublicSpendingKey();
-        const stmt = this.db.prepare('INSERT INTO spend_key (public_key) VALUES (?)');
-        stmt.run([this.serializePublicKey(spendPublicKey)]);
-        stmt.free();
+        const stmt = await this.adapter.prepare('INSERT INTO spend_key (public_key) VALUES (?)');
+        await stmt.run([this.serializePublicKey(spendPublicKey)]);
+        await stmt.free();
       } catch {
         // Spend key not available
       }
@@ -753,12 +856,12 @@ export class WalletDB {
       // Full implementation would iterate through all keys and save them
 
       // Commit transaction
-      this.db.run('COMMIT');
+      await this.adapter.run('COMMIT');
 
       // Persist to disk
-      this.persistToDisk();
+      await this.persistToDisk();
     } catch (error) {
-      this.db.run('ROLLBACK');
+      await this.adapter.run('ROLLBACK');
       throw error;
     }
   }
@@ -771,16 +874,16 @@ export class WalletDB {
   }
 
   /**
-   * Get the database instance (for use by sync modules)
+   * Get the database adapter (for use by sync modules)
    * @internal
    */
-  getDatabase(): any {
-    if (!this.isOpen) {
+  getAdapter(): IDatabaseAdapter {
+    if (!this.opened || !this.adapter) {
       throw new Error(
-        'Database not initialized. Call loadWallet(), createWallet(), or restoreWallet() first.'
+        'Database not initialized. Call open() first.'
       );
     }
-    return this.db;
+    return this.adapter;
   }
 
   /**
@@ -795,20 +898,191 @@ export class WalletDB {
    * Save database to disk (if not in-memory)
    */
   async saveDatabase(): Promise<void> {
-    if (this.dbPath === ':memory:' || !this.isOpen) {
-      return;
+    await this.persistToDisk();
+  }
+
+  // ============================================================================
+  // Sync data methods (used by TransactionKeysSync via IWalletDB interface)
+  // ============================================================================
+
+  async loadSyncState(): Promise<SyncState | null> {
+    if (!this.adapter) return null;
+    try {
+      const result = await this.adapter.exec('SELECT * FROM sync_state LIMIT 1');
+      if (result.length > 0 && result[0].values.length > 0) {
+        const row = result[0].values[0];
+        return {
+          lastSyncedHeight: row[1] as number,
+          lastSyncedHash: row[2] as string,
+          totalTxKeysSynced: row[3] as number,
+          lastSyncTime: row[4] as number,
+          chainTipAtLastSync: row[5] as number,
+        };
+      }
+      return null;
+    } catch {
+      return null;
     }
-    this.persistToDisk();
+  }
+
+  async saveSyncState(state: SyncState): Promise<void> {
+    if (!this.adapter) throw new Error('Database not open');
+    const stmt = await this.adapter.prepare(
+      `INSERT OR REPLACE INTO sync_state
+       (id, last_synced_height, last_synced_hash, total_tx_keys_synced, last_sync_time, chain_tip_at_last_sync)
+       VALUES (0, ?, ?, ?, ?, ?)`
+    );
+    await stmt.run([
+      state.lastSyncedHeight,
+      state.lastSyncedHash,
+      state.totalTxKeysSynced,
+      state.lastSyncTime,
+      state.chainTipAtLastSync,
+    ]);
+    await stmt.free();
+  }
+
+  async clearSyncData(): Promise<void> {
+    if (!this.adapter) throw new Error('Database not open');
+    await this.adapter.run('DELETE FROM sync_state');
+    await this.adapter.run('DELETE FROM tx_keys');
+    await this.adapter.run('DELETE FROM block_hashes');
+  }
+
+  async getBlockHash(height: number): Promise<string | null> {
+    if (!this.adapter) throw new Error('Database not open');
+    const stmt = await this.adapter.prepare('SELECT hash FROM block_hashes WHERE height = ?');
+    stmt.bind([height]);
+    if (await stmt.step()) {
+      const row = await stmt.getAsObject();
+      await stmt.free();
+      return row.hash as string;
+    }
+    await stmt.free();
+    return null;
+  }
+
+  async saveBlockHash(height: number, hash: string): Promise<void> {
+    if (!this.adapter) throw new Error('Database not open');
+    const stmt = await this.adapter.prepare('INSERT OR REPLACE INTO block_hashes (height, hash) VALUES (?, ?)');
+    await stmt.run([height, hash]);
+    await stmt.free();
+  }
+
+  async deleteBlockHash(height: number): Promise<void> {
+    if (!this.adapter) throw new Error('Database not open');
+    const stmt = await this.adapter.prepare('DELETE FROM block_hashes WHERE height = ?');
+    await stmt.run([height]);
+    await stmt.free();
+  }
+
+  async deleteBlockHashesBefore(height: number): Promise<void> {
+    if (!this.adapter) throw new Error('Database not open');
+    const stmt = await this.adapter.prepare('DELETE FROM block_hashes WHERE height < ?');
+    await stmt.run([height]);
+    await stmt.free();
+  }
+
+  async saveTxKeys(txHash: string, height: number, keysData: string): Promise<void> {
+    if (!this.adapter) throw new Error('Database not open');
+    const stmt = await this.adapter.prepare(
+      'INSERT OR REPLACE INTO tx_keys (tx_hash, block_height, keys_data) VALUES (?, ?, ?)'
+    );
+    await stmt.run([txHash, height, keysData]);
+    await stmt.free();
+  }
+
+  async getTxKeys(txHash: string): Promise<any | null> {
+    if (!this.adapter) throw new Error('Database not open');
+    const stmt = await this.adapter.prepare('SELECT keys_data FROM tx_keys WHERE tx_hash = ?');
+    stmt.bind([txHash]);
+    if (await stmt.step()) {
+      const row = await stmt.getAsObject();
+      await stmt.free();
+      return JSON.parse(row.keys_data as string);
+    }
+    await stmt.free();
+    return null;
+  }
+
+  async getTxKeysByHeight(height: number): Promise<{ txHash: string; keys: any }[]> {
+    if (!this.adapter) throw new Error('Database not open');
+    const stmt = await this.adapter.prepare('SELECT tx_hash, keys_data FROM tx_keys WHERE block_height = ?');
+    stmt.bind([height]);
+    const results: { txHash: string; keys: any }[] = [];
+    while (await stmt.step()) {
+      const row = await stmt.getAsObject();
+      results.push({ txHash: row.tx_hash as string, keys: JSON.parse(row.keys_data as string) });
+    }
+    await stmt.free();
+    return results;
+  }
+
+  async deleteTxKeysByHeight(height: number): Promise<void> {
+    if (!this.adapter) throw new Error('Database not open');
+    const stmt = await this.adapter.prepare('DELETE FROM tx_keys WHERE block_height = ?');
+    await stmt.run([height]);
+    await stmt.free();
+  }
+
+  async storeWalletOutput(p: StoreOutputParams): Promise<void> {
+    if (!this.adapter) throw new Error('Database not open');
+    const stmt = await this.adapter.prepare(
+      `INSERT OR REPLACE INTO wallet_outputs
+       (output_hash, tx_hash, output_index, block_height, output_data, amount, memo, token_id,
+        blinding_key, spending_key, is_spent, spent_tx_hash, spent_block_height, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    );
+    await stmt.run([
+      p.outputHash, p.txHash, p.outputIndex, p.blockHeight, p.outputData,
+      p.amount, p.memo, p.tokenId, p.blindingKey, p.spendingKey,
+      p.isSpent ? 1 : 0, p.spentTxHash, p.spentBlockHeight, Date.now(),
+    ]);
+    await stmt.free();
+  }
+
+  async isOutputUnspent(outputHash: string): Promise<boolean> {
+    if (!this.adapter) throw new Error('Database not open');
+    const stmt = await this.adapter.prepare(
+      'SELECT output_hash FROM wallet_outputs WHERE output_hash = ? AND is_spent = 0'
+    );
+    stmt.bind([outputHash]);
+    const found = await stmt.step();
+    await stmt.free();
+    return found;
+  }
+
+  async markOutputSpent(outputHash: string, spentTxHash: string, spentBlockHeight: number): Promise<void> {
+    if (!this.adapter) throw new Error('Database not open');
+    await this.adapter.run(
+      `UPDATE wallet_outputs SET is_spent = 1, spent_tx_hash = ?, spent_block_height = ? WHERE output_hash = ?`,
+      [spentTxHash, spentBlockHeight, outputHash]
+    );
+  }
+
+  async deleteOutputsByHeight(height: number): Promise<void> {
+    if (!this.adapter) throw new Error('Database not open');
+    const stmt = await this.adapter.prepare('DELETE FROM wallet_outputs WHERE block_height = ?');
+    await stmt.run([height]);
+    await stmt.free();
+  }
+
+  async unspendOutputsBySpentHeight(height: number): Promise<void> {
+    if (!this.adapter) throw new Error('Database not open');
+    await this.adapter.run(
+      `UPDATE wallet_outputs SET is_spent = 0, spent_tx_hash = NULL, spent_block_height = NULL WHERE spent_block_height = ?`,
+      [height]
+    );
   }
 
   /**
    * Close the database connection
    */
-  close(): void {
-    if (this.db) {
-      this.db.close();
-      this.db = null;
-      this.isOpen = false;
+  async close(): Promise<void> {
+    if (this.adapter) {
+      await this.adapter.close();
+      this.adapter = null;
+      this.opened = false;
     }
   }
 
@@ -867,23 +1141,20 @@ export class WalletDB {
    * @returns Balance in satoshis
    */
   async getBalance(tokenId: string | null = null): Promise<bigint> {
-    if (!this.isOpen) {
+    if (!this.opened || !this.adapter) {
       throw new Error('Database not initialized');
     }
 
     let query = 'SELECT SUM(amount) as total FROM wallet_outputs WHERE is_spent = 0';
-    const params: any[] = [];
 
     if (tokenId === null) {
       // NAV balance - outputs with no token_id or default token_id
-      query += ' AND (token_id IS NULL OR token_id = ?)';
-      params.push('0000000000000000000000000000000000000000000000000000000000000000');
+      query += " AND (token_id IS NULL OR token_id = '0000000000000000000000000000000000000000000000000000000000000000')";
     } else {
-      query += ' AND token_id = ?';
-      params.push(tokenId);
+      query += ` AND token_id = '${tokenId}'`;
     }
 
-    const result = this.db.exec(query);
+    const result = await this.adapter.exec(query);
     if (result.length === 0 || result[0].values.length === 0 || result[0].values[0][0] === null) {
       return 0n;
     }
@@ -897,7 +1168,7 @@ export class WalletDB {
    * @returns Array of unspent outputs
    */
   async getUnspentOutputs(tokenId: string | null = null): Promise<WalletOutput[]> {
-    if (!this.isOpen) {
+    if (!this.opened || !this.adapter) {
       throw new Error('Database not initialized');
     }
 
@@ -907,27 +1178,21 @@ export class WalletDB {
       FROM wallet_outputs 
       WHERE is_spent = 0
     `;
-    const params: any[] = [];
 
     if (tokenId === null) {
       // NAV - outputs with no token_id or default token_id
-      query += ' AND (token_id IS NULL OR token_id = ?)';
-      params.push('0000000000000000000000000000000000000000000000000000000000000000');
+      query += " AND (token_id IS NULL OR token_id = '0000000000000000000000000000000000000000000000000000000000000000')";
     } else {
-      query += ' AND token_id = ?';
-      params.push(tokenId);
+      query += ` AND token_id = '${tokenId}'`;
     }
 
     query += ' ORDER BY block_height ASC';
 
-    const stmt = this.db.prepare(query);
-    if (params.length > 0) {
-      stmt.bind(params);
-    }
+    const stmt = await this.adapter.prepare(query);
 
     const outputs: WalletOutput[] = [];
-    while (stmt.step()) {
-      const row = stmt.getAsObject();
+    while (await stmt.step()) {
+      const row = await stmt.getAsObject();
       outputs.push({
         outputHash: row.output_hash as string,
         txHash: row.tx_hash as string,
@@ -943,7 +1208,7 @@ export class WalletDB {
         spentBlockHeight: row.spent_block_height as number | null,
       });
     }
-    stmt.free();
+    await stmt.free();
 
     return outputs;
   }
@@ -953,11 +1218,11 @@ export class WalletDB {
    * @returns Array of all wallet outputs
    */
   async getAllOutputs(): Promise<WalletOutput[]> {
-    if (!this.isOpen) {
+    if (!this.opened || !this.adapter) {
       throw new Error('Database not initialized');
     }
 
-    const stmt = this.db.prepare(`
+    const stmt = await this.adapter.prepare(`
       SELECT output_hash, tx_hash, output_index, block_height, amount, memo, token_id, 
              blinding_key, spending_key, is_spent, spent_tx_hash, spent_block_height
       FROM wallet_outputs 
@@ -965,8 +1230,8 @@ export class WalletDB {
     `);
 
     const outputs: WalletOutput[] = [];
-    while (stmt.step()) {
-      const row = stmt.getAsObject();
+    while (await stmt.step()) {
+      const row = await stmt.getAsObject();
       outputs.push({
         outputHash: row.output_hash as string,
         txHash: row.tx_hash as string,
@@ -982,7 +1247,7 @@ export class WalletDB {
         spentBlockHeight: row.spent_block_height as number | null,
       });
     }
-    stmt.free();
+    await stmt.free();
 
     return outputs;
   }
@@ -995,18 +1260,18 @@ export class WalletDB {
    * Check if the database has encryption enabled
    * @returns True if encryption is enabled
    */
-  isEncrypted(): boolean {
-    if (!this.isOpen) {
+  async isEncrypted(): Promise<boolean> {
+    if (!this.opened || !this.adapter) {
       return false;
     }
 
-    const stmt = this.db.prepare('SELECT is_encrypted FROM encryption_metadata WHERE id = 0');
-    if (stmt.step()) {
-      const result = (stmt.getAsObject().is_encrypted as number) === 1;
-      stmt.free();
-      return result;
+    const stmt = await this.adapter.prepare('SELECT is_encrypted FROM encryption_metadata WHERE id = 0');
+    if (await stmt.step()) {
+      const row = await stmt.getAsObject();
+      await stmt.free();
+      return (row.is_encrypted as number) === 1;
     }
-    stmt.free();
+    await stmt.free();
     return false;
   }
 
@@ -1015,13 +1280,13 @@ export class WalletDB {
    * @param salt - Hex-encoded salt
    * @param verificationHash - Hex-encoded password verification hash
    */
-  saveEncryptionMetadata(salt: string, verificationHash: string): void {
-    if (!this.isOpen) {
+  async saveEncryptionMetadata(salt: string, verificationHash: string): Promise<void> {
+    if (!this.opened || !this.adapter) {
       throw new Error('Database not initialized');
     }
 
     // Insert or update encryption metadata
-    this.db.run(`
+    await this.adapter.run(`
       INSERT OR REPLACE INTO encryption_metadata (id, is_encrypted, salt, verification_hash, encryption_version)
       VALUES (0, 1, ?, ?, 1)
     `, [salt, verificationHash]);
@@ -1031,18 +1296,18 @@ export class WalletDB {
    * Load encryption metadata from the database
    * @returns Encryption metadata or null if not encrypted
    */
-  getEncryptionMetadata(): { salt: string; verificationHash: string } | null {
-    if (!this.isOpen) {
+  async getEncryptionMetadata(): Promise<{ salt: string; verificationHash: string } | null> {
+    if (!this.opened || !this.adapter) {
       throw new Error('Database not initialized');
     }
 
-    const stmt = this.db.prepare(`
+    const stmt = await this.adapter.prepare(`
       SELECT salt, verification_hash FROM encryption_metadata WHERE id = 0 AND is_encrypted = 1
     `);
 
-    if (stmt.step()) {
-      const row = stmt.getAsObject();
-      stmt.free();
+    if (await stmt.step()) {
+      const row = await stmt.getAsObject();
+      await stmt.free();
       if (row.salt && row.verification_hash) {
         return {
           salt: row.salt as string,
@@ -1050,7 +1315,7 @@ export class WalletDB {
         };
       }
     }
-    stmt.free();
+    await stmt.free();
     return null;
   }
 
@@ -1060,12 +1325,12 @@ export class WalletDB {
    * @param publicKey - Public key (hex)
    * @param encryptedSecret - Encrypted secret (JSON string)
    */
-  saveEncryptedKey(keyId: string, publicKey: string, encryptedSecret: string): void {
-    if (!this.isOpen) {
+  async saveEncryptedKey(keyId: string, publicKey: string, encryptedSecret: string): Promise<void> {
+    if (!this.opened || !this.adapter) {
       throw new Error('Database not initialized');
     }
 
-    this.db.run(`
+    await this.adapter.run(`
       INSERT OR REPLACE INTO crypted_keys (key_id, public_key, encrypted_secret)
       VALUES (?, ?, ?)
     `, [keyId, publicKey, encryptedSecret]);
@@ -1076,25 +1341,25 @@ export class WalletDB {
    * @param keyId - Key identifier (hex)
    * @returns Encrypted key data or null if not found
    */
-  getEncryptedKey(keyId: string): { publicKey: string; encryptedSecret: string } | null {
-    if (!this.isOpen) {
+  async getEncryptedKey(keyId: string): Promise<{ publicKey: string; encryptedSecret: string } | null> {
+    if (!this.opened || !this.adapter) {
       throw new Error('Database not initialized');
     }
 
-    const stmt = this.db.prepare(`
+    const stmt = await this.adapter.prepare(`
       SELECT public_key, encrypted_secret FROM crypted_keys WHERE key_id = ?
     `);
     stmt.bind([keyId]);
 
-    if (stmt.step()) {
-      const row = stmt.getAsObject();
-      stmt.free();
+    if (await stmt.step()) {
+      const row = await stmt.getAsObject();
+      await stmt.free();
       return {
         publicKey: row.public_key as string,
         encryptedSecret: row.encrypted_secret as string,
       };
     }
-    stmt.free();
+    await stmt.free();
     return null;
   }
 
@@ -1102,23 +1367,23 @@ export class WalletDB {
    * Get all encrypted keys from the database
    * @returns Array of encrypted key data
    */
-  getAllEncryptedKeys(): Array<{ keyId: string; publicKey: string; encryptedSecret: string }> {
-    if (!this.isOpen) {
+  async getAllEncryptedKeys(): Promise<Array<{ keyId: string; publicKey: string; encryptedSecret: string }>> {
+    if (!this.opened || !this.adapter) {
       throw new Error('Database not initialized');
     }
 
-    const stmt = this.db.prepare('SELECT key_id, public_key, encrypted_secret FROM crypted_keys');
+    const stmt = await this.adapter.prepare('SELECT key_id, public_key, encrypted_secret FROM crypted_keys');
     const keys: Array<{ keyId: string; publicKey: string; encryptedSecret: string }> = [];
 
-    while (stmt.step()) {
-      const row = stmt.getAsObject();
+    while (await stmt.step()) {
+      const row = await stmt.getAsObject();
       keys.push({
         keyId: row.key_id as string,
         publicKey: row.public_key as string,
         encryptedSecret: row.encrypted_secret as string,
       });
     }
-    stmt.free();
+    await stmt.free();
 
     return keys;
   }
@@ -1129,12 +1394,12 @@ export class WalletDB {
    * @param publicKey - Public key (hex)
    * @param encryptedSecret - Encrypted secret (JSON string)
    */
-  saveEncryptedOutKey(outId: string, publicKey: string, encryptedSecret: string): void {
-    if (!this.isOpen) {
+  async saveEncryptedOutKey(outId: string, publicKey: string, encryptedSecret: string): Promise<void> {
+    if (!this.opened || !this.adapter) {
       throw new Error('Database not initialized');
     }
 
-    this.db.run(`
+    await this.adapter.run(`
       INSERT OR REPLACE INTO crypted_out_keys (out_id, public_key, encrypted_secret)
       VALUES (?, ?, ?)
     `, [outId, publicKey, encryptedSecret]);
@@ -1145,25 +1410,25 @@ export class WalletDB {
    * @param outId - Output identifier (hex)
    * @returns Encrypted output key data or null if not found
    */
-  getEncryptedOutKey(outId: string): { publicKey: string; encryptedSecret: string } | null {
-    if (!this.isOpen) {
+  async getEncryptedOutKey(outId: string): Promise<{ publicKey: string; encryptedSecret: string } | null> {
+    if (!this.opened || !this.adapter) {
       throw new Error('Database not initialized');
     }
 
-    const stmt = this.db.prepare(`
+    const stmt = await this.adapter.prepare(`
       SELECT public_key, encrypted_secret FROM crypted_out_keys WHERE out_id = ?
     `);
     stmt.bind([outId]);
 
-    if (stmt.step()) {
-      const row = stmt.getAsObject();
-      stmt.free();
+    if (await stmt.step()) {
+      const row = await stmt.getAsObject();
+      await stmt.free();
       return {
         publicKey: row.public_key as string,
         encryptedSecret: row.encrypted_secret as string,
       };
     }
-    stmt.free();
+    await stmt.free();
     return null;
   }
 
@@ -1171,23 +1436,23 @@ export class WalletDB {
    * Get all encrypted output keys from the database
    * @returns Array of encrypted output key data
    */
-  getAllEncryptedOutKeys(): Array<{ outId: string; publicKey: string; encryptedSecret: string }> {
-    if (!this.isOpen) {
+  async getAllEncryptedOutKeys(): Promise<Array<{ outId: string; publicKey: string; encryptedSecret: string }>> {
+    if (!this.opened || !this.adapter) {
       throw new Error('Database not initialized');
     }
 
-    const stmt = this.db.prepare('SELECT out_id, public_key, encrypted_secret FROM crypted_out_keys');
+    const stmt = await this.adapter.prepare('SELECT out_id, public_key, encrypted_secret FROM crypted_out_keys');
     const keys: Array<{ outId: string; publicKey: string; encryptedSecret: string }> = [];
 
-    while (stmt.step()) {
-      const row = stmt.getAsObject();
+    while (await stmt.step()) {
+      const row = await stmt.getAsObject();
       keys.push({
         outId: row.out_id as string,
         publicKey: row.public_key as string,
         encryptedSecret: row.encrypted_secret as string,
       });
     }
-    stmt.free();
+    await stmt.free();
 
     return keys;
   }
@@ -1196,13 +1461,13 @@ export class WalletDB {
    * Delete plaintext keys (after encryption)
    * This removes the unencrypted keys from the database
    */
-  deletePlaintextKeys(): void {
-    if (!this.isOpen) {
+  async deletePlaintextKeys(): Promise<void> {
+    if (!this.opened || !this.adapter) {
       throw new Error('Database not initialized');
     }
 
-    this.db.run('DELETE FROM keys');
-    this.db.run('DELETE FROM out_keys');
+    await this.adapter.run('DELETE FROM keys');
+    await this.adapter.run('DELETE FROM out_keys');
   }
 
   /**
@@ -1213,7 +1478,7 @@ export class WalletDB {
    * @returns Encrypted database bytes
    */
   async exportEncrypted(password: string): Promise<Uint8Array> {
-    if (!this.isOpen) {
+    if (!this.opened || !this.adapter) {
       throw new Error('Database not initialized');
     }
 
@@ -1221,10 +1486,10 @@ export class WalletDB {
     const { encryptDatabase } = await import('./crypto');
 
     // Export the raw database
-    const dbBuffer = this.db.export();
+    const dbBuffer = await this.adapter.export();
 
     // Encrypt the database
-    const encrypted = await encryptDatabase(new Uint8Array(dbBuffer), password);
+    const encrypted = await encryptDatabase(dbBuffer, password);
 
     return encrypted;
   }
@@ -1234,13 +1499,13 @@ export class WalletDB {
    * 
    * @param encryptedData - Encrypted database bytes
    * @param password - Password to decrypt
-   * @param dbPath - Path for the new database instance
+   * @param options - Database options
    * @returns New WalletDB instance with decrypted data
    */
   static async loadEncrypted(
     encryptedData: Uint8Array,
     password: string,
-    dbPath = ':memory:'
+    options: WalletDBOptions = {}
   ): Promise<WalletDB> {
     // Import decryption function
     const { decryptDatabase, isEncryptedDatabase } = await import('./crypto');
@@ -1254,14 +1519,8 @@ export class WalletDB {
     const decryptedBuffer = await decryptDatabase(encryptedData, password);
 
     // Create new WalletDB instance
-    const walletDb = new WalletDB(dbPath);
-
-    // Load SQL.js
-    const SQL = await loadSQL();
-
-    // Create database from decrypted buffer
-    walletDb.db = new SQL.Database(decryptedBuffer);
-    walletDb.isOpen = true;
+    const walletDb = new WalletDB(options);
+    await walletDb.open(':memory:', decryptedBuffer);
 
     return walletDb;
   }
@@ -1270,26 +1529,24 @@ export class WalletDB {
    * Get the raw database bytes (unencrypted)
    * @returns Database bytes
    */
-  export(): Uint8Array {
-    if (!this.isOpen) {
+  async export(): Promise<Uint8Array> {
+    if (!this.opened || !this.adapter) {
       throw new Error('Database not initialized');
     }
 
-    return new Uint8Array(this.db.export());
+    return await this.adapter.export();
   }
 
   /**
    * Load a database from raw bytes
    * 
    * @param data - Raw database bytes
-   * @param dbPath - Path for the new database instance
+   * @param options - Database options
    * @returns New WalletDB instance
    */
-  static async loadFromBytes(data: Uint8Array, dbPath = ':memory:'): Promise<WalletDB> {
-    const walletDb = new WalletDB(dbPath);
-    const SQL = await loadSQL();
-    walletDb.db = new SQL.Database(data);
-    walletDb.isOpen = true;
+  static async loadFromBytes(data: Uint8Array, options: WalletDBOptions = {}): Promise<WalletDB> {
+    const walletDb = new WalletDB(options);
+    await walletDb.open(':memory:', data);
     return walletDb;
   }
 }

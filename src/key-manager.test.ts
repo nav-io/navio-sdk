@@ -217,6 +217,22 @@ describe('KeyManager', () => {
 
       expect(recoveredSeed.serialize()).toBe(seed.serialize());
     });
+
+    it('mnemonic restoration should preserve the original mnemonic', () => {
+      // Test multiple mnemonics to ensure round-trip works correctly
+      const testMnemonics = [
+        'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon art',
+        'zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo vote',
+        'cotton whisper mystery garlic stool aunt lend section supreme pony curious twin drift actress soon immune gym shiver eagle satisfy radio turkey embark father',
+      ];
+
+      for (const mnemonic of testMnemonics) {
+        const keyManager = new KeyManager();
+        keyManager.setHDSeedFromMnemonic(mnemonic);
+        const recovered = keyManager.getMnemonic();
+        expect(recovered).toBe(mnemonic);
+      }
+    });
   });
 
   describe('wallet encryption', () => {

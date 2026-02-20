@@ -23,16 +23,12 @@ const AddressEncoding = blsctModule.AddressEncoding;
 const setChain = blsctModule.setChain;
 const BlsctChain = blsctModule.BlsctChain;
 // Helper functions and classes
-const calcPrivSpendingKey = blsctModule.calcPrivSpendingKey;
-const recoverAmount = blsctModule.recoverAmount;
+const PrivSpendingKey = blsctModule.PrivSpendingKey;
+const RangeProof = blsctModule.RangeProof;
+const AmountRecoveryReq = blsctModule.AmountRecoveryReq;
+const TokenId = blsctModule.TokenId;
 const ViewTag = blsctModule.ViewTag;
 const HashId = blsctModule.HashId;
-const calcNonce = blsctModule.calcNonce;
-// Amount recovery helpers
-const getAmountRecoveryResultSize = blsctModule.getAmountRecoveryResultSize;
-const getAmountRecoveryResultIsSucc = blsctModule.getAmountRecoveryResultIsSucc;
-const getAmountRecoveryResultAmount = blsctModule.getAmountRecoveryResultAmount;
-const deleteAmountsRetVal = blsctModule.deleteAmountsRetVal;
 
 // Derive types from runtime values using typeof
 type ScalarType = InstanceType<typeof Scalar>;
@@ -78,6 +74,7 @@ export class KeyManager {
   private viewKey: ViewKeyType | null = null;
   private spendPublicKey: PublicKeyType | null = null;
   private masterSeed: ScalarType | null = null;
+  private storedMnemonic: string | null = null; // Store original mnemonic (avoids Scalar roundtrip issues)
   private spendKeyId: Uint8Array | null = null;
   private viewKeyId: Uint8Array | null = null;
   private tokenKeyId: Uint8Array | null = null;
@@ -350,8 +347,36 @@ export class KeyManager {
    * Called after successful unlock
    */
   private async decryptEssentialKeys(): Promise<void> {
-    // View key is kept in memory for scanning
-    // Other keys are decrypted on-demand when needed
+    // Decrypt keys from cryptedKeys back into keys map
+    if (this.encryptionKey) {
+      for (const [keyIdHex, cryptedData] of this.cryptedKeys) {
+        if (!this.keys.has(keyIdHex)) {
+          try {
+            const encrypted = this.deserializeEncryptedFromBytes(cryptedData.encryptedSecret);
+            const decrypted = await decryptWithKey(encrypted, this.encryptionKey);
+            const secretKey = Scalar.deserialize(this.bytesToHex(decrypted));
+            this.keys.set(keyIdHex, secretKey);
+          } catch {
+            // Skip keys that fail to decrypt
+          }
+        }
+      }
+    }
+
+    // Re-derive master keys from seed if available (handles wallets
+    // where keys were never stored in cryptedKeys)
+    if (this.masterSeed) {
+      const childKey = new ChildKey(this.masterSeed);
+      const txKey = childKey.toTxKey();
+      const spendKey = Scalar.deserialize(txKey.toSpendingKey().serialize());
+      const blindingKey = childKey.toBlindingKey();
+      const tokenKey = childKey.toTokenKey();
+
+      this.addKeyPubKeyInner(spendKey, PublicKey.fromScalar(spendKey));
+      this.addKeyPubKeyInner(this.masterSeed, PublicKey.fromScalar(this.masterSeed));
+      this.addKeyPubKeyInner(tokenKey, PublicKey.fromScalar(tokenKey));
+      this.addKeyPubKeyInner(blindingKey, PublicKey.fromScalar(blindingKey));
+    }
   }
 
   /**
@@ -463,6 +488,10 @@ export class KeyManager {
 
     this.spendPublicKey = spendPublicKey;
 
+    // Mark keys as defined so isMineByKeys and other checks work
+    this.fViewKeyDefined = true;
+    this.fSpendKeyDefined = true;
+
     // Calculate IDs using hash160
     // Get public key representations for hashing
     const seedPublicKey = this.getPublicKeyFromScalar(seed);
@@ -476,6 +505,13 @@ export class KeyManager {
     this.viewKeyId = this.hash160(viewPublicKey);
     this.tokenKeyId = this.hash160(tokenPublicKey);
     this.blindingKeyId = this.hash160(blindingPublicKey);
+
+    // Store derived private keys in the keys map so they can be
+    // retrieved by key ID (needed for getSpendingKey, getMasterTokenKey, etc.)
+    this.addKeyPubKeyInner(spendKey, spendPublicKey);
+    this.addKeyPubKeyInner(seed, PublicKey.fromScalar(seed));
+    this.addKeyPubKeyInner(tokenKey, PublicKey.fromScalar(tokenKey));
+    this.addKeyPubKeyInner(blindingKey, PublicKey.fromScalar(blindingKey));
 
     // Initialize HD chain
     this.hdChain = {
@@ -527,8 +563,8 @@ export class KeyManager {
 
         this.viewKey = Scalar.deserialize(viewKey.serialize());
         this.spendPublicKey = spendingPublicKey;
-
-        // Note: This is a simplified import - full implementation would need more setup
+        this.fViewKeyDefined = true;
+        this.fSpendKeyDefined = true;
       }
     } else {
       // Generate new seed
@@ -638,15 +674,10 @@ export class KeyManager {
    * Generate a new mnemonic and set it as the HD seed
    * @param strength - Entropy strength in bits (default: 256 for 24 words)
    * @returns The mnemonic phrase that can be used to recover this wallet
-   * @note The returned mnemonic is derived from the stored seed, which ensures
-   *       it will produce the same wallet when used for restoration. Due to BLS
-   *       Scalar normalization, this may differ from the initially generated entropy.
    */
   generateNewMnemonic(strength: 128 | 160 | 192 | 224 | 256 = 256): string {
     const mnemonic = KeyManager.generateMnemonic(strength);
     this.setHDSeedFromMnemonic(mnemonic);
-    // Return the mnemonic derived from the actual stored seed
-    // This ensures the returned mnemonic will always restore the same wallet
     return this.getMnemonic();
   }
 
@@ -658,6 +689,8 @@ export class KeyManager {
   setHDSeedFromMnemonic(mnemonic: string): void {
     const seed = KeyManager.mnemonicToScalar(mnemonic);
     this.setHDSeed(seed);
+    // Store the original mnemonic to avoid Scalar serialization roundtrip issues
+    this.storedMnemonic = mnemonic;
   }
 
   /**
@@ -665,9 +698,15 @@ export class KeyManager {
    * @returns The mnemonic phrase for the current master seed
    */
   getMnemonic(): string {
+    // Return stored mnemonic if available (avoids Scalar serialization roundtrip issues)
+    if (this.storedMnemonic) {
+      return this.storedMnemonic;
+    }
     if (!this.masterSeed) {
       throw new Error('No master seed available');
     }
+    // Fallback: derive mnemonic from Scalar (may be incorrect due to modular reduction)
+    console.warn('[KeyManager] getMnemonic - no stored mnemonic, deriving from Scalar (may be incorrect)');
     return KeyManager.seedToMnemonic(this.masterSeed);
   }
 
@@ -946,22 +985,21 @@ export class KeyManager {
 
   /**
    * Calculate nonce for range proof recovery
-   * Uses calcNonce from navio-blsct
    * @param blindingKey - The blinding public key
-   * @returns The nonce (Point)
+   * @returns The nonce (suitable for AmountRecoveryReq)
    */
   calculateNonce(blindingKey: PublicKeyType): any {
     if (!this.viewKey) {
       throw new Error('View key not available');
     }
 
-    // Use calcNonce from navio-blsct
-    // Need to pass .value() for the underlying SWIG objects
-    const result = calcNonce(blindingKey.value(), this.viewKey.value());
-    
-    // Wrap result in Point object
+    // calcNonce returns a raw PublicKey/Point pointer from the C++ layer.
+    // Wrap it via Point.fromObj to properly handle WASM pointers.
+    // The C++ recovery function accepts this pointer type directly.
+    const calcNonce = blsctModule.calcNonce;
     const Point = blsctModule.Point;
-    return new Point(result);
+    const result = calcNonce(blindingKey.value(), this.viewKey.value());
+    return Point.fromObj(result);
   }
 
   /**
@@ -1081,6 +1119,17 @@ export class KeyManager {
     this.viewKeyId = chain.viewId;
     this.tokenKeyId = chain.tokenId;
     this.blindingKeyId = chain.blindingId;
+  }
+
+  /**
+   * Load master seed from storage (legacy method)
+   * @deprecated Use setHDSeedFromMnemonic instead - this method has issues with Scalar roundtripping
+   * @param seedHex - The master seed as hex string
+   */
+  loadMasterSeed(seedHex: string): void {
+    this.masterSeed = Scalar.deserialize(seedHex);
+    // Note: Due to BLS Scalar modular reduction, the mnemonic derived from this seed
+    // may not match the original mnemonic. Use setHDSeedFromMnemonic for correct behavior.
   }
 
   /**
@@ -1407,11 +1456,22 @@ export class KeyManager {
     }
 
     const key = this.getKey(this.spendKeyId);
-    if (!key) {
-      throw new Error('KeyManager: could not access the spend key');
+    if (key) {
+      return key;
     }
 
-    return key;
+    // Fallback: re-derive from master seed (handles encrypted wallets where
+    // the key was never stored in cryptedKeys due to earlier bug)
+    if (this.masterSeed) {
+      const childKey = new ChildKey(this.masterSeed);
+      const txKey = childKey.toTxKey();
+      const spendKey = Scalar.deserialize(txKey.toSpendingKey().serialize());
+      const spendPublicKey = PublicKey.fromScalar(spendKey);
+      this.addKeyPubKeyInner(spendKey, spendPublicKey);
+      return spendKey;
+    }
+
+    throw new Error('KeyManager: could not access the spend key');
   }
 
   /**
@@ -1463,14 +1523,11 @@ export class KeyManager {
 
     const sk = this.getSpendingKey();
 
-    // Calculate private spending key using navio-blsct
-    // Uses calcPrivSpendingKey(blindingKey, viewKey, spendingKey, account, address)
-    // Reference: https://nav-io.github.io/libblsct-bindings/ts/functions/calcPrivSpendingKey.html
     const blindingKey = out.blsctData.blindingKey as PublicKeyType;
     const viewKeyScalar = this.getScalarFromViewKey(this.viewKey);
     const spendingKeyScalar = this.getScalarFromScalar(sk);
 
-    key.value = calcPrivSpendingKey(
+    key.value = new PrivSpendingKey(
       blindingKey,
       viewKeyScalar,
       spendingKeyScalar,
@@ -1565,9 +1622,7 @@ export class KeyManager {
       return true;
     }
 
-    // Calculate and cache using navio-blsct API
-    // Reference: https://nav-io.github.io/libblsct-bindings/ts/functions/calcPrivSpendingKey.html
-    const calculatedKey = calcPrivSpendingKey(
+    const calculatedKey = new PrivSpendingKey(
       blindingKey,
       viewKeyScalar,
       spendingKeyScalar,
@@ -1626,6 +1681,7 @@ export class KeyManager {
    */
   isMineByKeys(blindingKey: PublicKeyType, spendingKey: PublicKeyType, viewTag: number): boolean {
     if (!this.fViewKeyDefined || !this.viewKey) {
+      console.log(`[isMineByKeys] viewKey not defined, returning false`);
       return false;
     }
 
@@ -1635,9 +1691,12 @@ export class KeyManager {
       return false;
     }
 
-    // Get hash ID and check if we have this sub-address
+    // ViewTag matched! Log this rare event.
     const hashId = this.getHashId(blindingKey, spendingKey);
-    return this.haveSubAddress(hashId);
+    const hashIdHex = this.bytesToHex(hashId);
+    const result = this.haveSubAddress(hashId);
+    console.log(`[isMineByKeys] ViewTag MATCH! expected=${viewTag}, calculated=${calculatedViewTag}, hashId=${hashIdHex}, haveSubAddr=${result}, subAddressPoolSize=${this.subAddresses.size}`);
+    return result;
   }
 
   /**
@@ -1754,11 +1813,18 @@ export class KeyManager {
     }
 
     const key = this.getKey(this.tokenKeyId);
-    if (!key) {
-      throw new Error('KeyManager: could not access the master token key');
+    if (key) {
+      return key;
     }
 
-    return key;
+    if (this.masterSeed) {
+      const childKey = new ChildKey(this.masterSeed);
+      const tokenKey = childKey.toTokenKey();
+      this.addKeyPubKeyInner(tokenKey, PublicKey.fromScalar(tokenKey));
+      return tokenKey;
+    }
+
+    throw new Error('KeyManager: could not access the master token key');
   }
 
   /**
@@ -1774,70 +1840,52 @@ export class KeyManager {
       return { success: false, amounts: [], indices: [] };
     }
 
-    // Build recovery requests for outputs that match our view tag
-    const recoveryRequests: any[] = [];
+    const reqs: InstanceType<typeof AmountRecoveryReq>[] = [];
+    const outputIndices: number[] = [];
 
     for (let i = 0; i < outs.length; i++) {
       const out = outs[i];
 
-      // Check if output has BLS CT data and range proof
       if (!out.blsctData || !out.blsctData.rangeProof) {
         continue;
       }
 
-      // Check view tag matches
       const calculatedViewTag = this.calculateViewTag(out.blsctData.blindingKey as PublicKeyType);
       if (out.blsctData.viewTag !== calculatedViewTag) {
         continue;
       }
 
-      // Calculate nonce
       const nonce = this.calculateNonce(out.blsctData.blindingKey as PublicKeyType);
+      const tokenIdHex = out.tokenId ? Buffer.from(out.tokenId).toString('hex') : null;
+      const tokenId = tokenIdHex ? TokenId.deserialize(tokenIdHex) : TokenId.default();
 
-      // Build recovery request
-      // Format depends on navio-blsct API - need to check exact structure
-      recoveryRequests.push({
-        rangeProof: out.blsctData.rangeProof,
-        tokenId: out.tokenId,
-        nonce: nonce,
-        index: i,
-      });
+      reqs.push(new AmountRecoveryReq(out.blsctData.rangeProof as any, nonce, tokenId));
+      outputIndices.push(i);
     }
 
-    if (recoveryRequests.length === 0) {
+    if (reqs.length === 0) {
       return { success: false, amounts: [], indices: [] };
     }
 
-    // Call navio-blsct recoverAmount
-    // Reference: https://nav-io.github.io/libblsct-bindings/ts/functions/recoverAmount.html
-    const rv = recoverAmount(recoveryRequests);
+    const results = RangeProof.recoverAmounts(reqs);
+    const amounts: bigint[] = [];
+    const indices: number[] = [];
+    let allSuccess = true;
 
-    try {
-      // Parse the result using the navio-blsct API
-      const size = getAmountRecoveryResultSize(rv.value);
-      const amounts: bigint[] = [];
-      const indices: number[] = [];
-      let allSuccess = true;
-
-      for (let i = 0; i < size; i++) {
-        const isSucc = getAmountRecoveryResultIsSucc(rv.value, i);
-        if (isSucc) {
-          amounts.push(getAmountRecoveryResultAmount(rv.value, i));
-          indices.push(i);
-        } else {
-          allSuccess = false;
-        }
+    for (let j = 0; j < results.length; j++) {
+      if (results[j].isSucc) {
+        amounts.push(results[j].amount);
+        indices.push(outputIndices[j]);
+      } else {
+        allSuccess = false;
       }
-
-      return {
-        success: allSuccess && amounts.length > 0,
-        amounts,
-        indices,
-      };
-    } finally {
-      // Clean up the result
-      deleteAmountsRetVal(rv);
     }
+
+    return {
+      success: allSuccess && amounts.length > 0,
+      amounts,
+      indices,
+    };
   }
 
   /**
@@ -1852,59 +1900,47 @@ export class KeyManager {
       return { success: false, amounts: [], indices: [] };
     }
 
-    // Build recovery requests using provided nonce
-    const recoveryRequests: any[] = [];
+    const noncePoint = nonce.getPoint();
+    const reqs: InstanceType<typeof AmountRecoveryReq>[] = [];
+    const outputIndices: number[] = [];
 
     for (let i = 0; i < outs.length; i++) {
       const out = outs[i];
 
-      // Check if output has BLS CT data and range proof
       if (!out.blsctData || !out.blsctData.rangeProof) {
         continue;
       }
 
-      // Use the provided nonce instead of calculating it
-      recoveryRequests.push({
-        rangeProof: out.blsctData.rangeProof,
-        tokenId: out.tokenId,
-        nonce: nonce,
-        index: i,
-      });
+      const tokenIdHex = out.tokenId ? Buffer.from(out.tokenId).toString('hex') : null;
+      const tokenId = tokenIdHex ? TokenId.deserialize(tokenIdHex) : TokenId.default();
+
+      reqs.push(new AmountRecoveryReq(out.blsctData.rangeProof as any, noncePoint, tokenId));
+      outputIndices.push(i);
     }
 
-    if (recoveryRequests.length === 0) {
+    if (reqs.length === 0) {
       return { success: false, amounts: [], indices: [] };
     }
 
-    // Call navio-blsct recoverAmount with provided nonce
-    const rv = recoverAmount(recoveryRequests);
+    const results = RangeProof.recoverAmounts(reqs);
+    const amounts: bigint[] = [];
+    const indices: number[] = [];
+    let allSuccess = true;
 
-    try {
-      // Parse the result using the navio-blsct API
-      const size = getAmountRecoveryResultSize(rv.value);
-      const amounts: bigint[] = [];
-      const indices: number[] = [];
-      let allSuccess = true;
-
-      for (let i = 0; i < size; i++) {
-        const isSucc = getAmountRecoveryResultIsSucc(rv.value, i);
-        if (isSucc) {
-          amounts.push(getAmountRecoveryResultAmount(rv.value, i));
-          indices.push(i);
-        } else {
-          allSuccess = false;
-        }
+    for (let j = 0; j < results.length; j++) {
+      if (results[j].isSucc) {
+        amounts.push(results[j].amount);
+        indices.push(outputIndices[j]);
+      } else {
+        allSuccess = false;
       }
-
-      return {
-        success: allSuccess && amounts.length > 0,
-        amounts,
-        indices,
-      };
-    } finally {
-      // Clean up the result
-      deleteAmountsRetVal(rv);
     }
+
+    return {
+      success: allSuccess && amounts.length > 0,
+      amounts,
+      indices,
+    };
   }
 
   // ============================================================================
