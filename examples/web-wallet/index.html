@@ -94,6 +94,29 @@
         </div>
       </div>
       <div class="card">
+        <h2 style="display:flex;justify-content:space-between;align-items:center">
+          UTXOs
+          <span style="display:flex;gap:0.4rem;align-items:center">
+            <label class="toggle-label"><input type="checkbox" id="utxo-show-spent" /> Show spent</label>
+            <button id="btn-refresh-utxos" class="inline-btn">Refresh</button>
+          </span>
+        </h2>
+        <div id="utxo-container" class="utxo-container">
+          <div class="empty-state">Click Refresh to load UTXOs</div>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2 style="display:flex;justify-content:space-between;align-items:center">
+          Transaction History
+          <button id="btn-refresh-history" class="inline-btn">Refresh</button>
+        </h2>
+        <div id="history-container" class="history-container">
+          <div class="empty-state">Click Refresh to load history</div>
+        </div>
+      </div>
+
+      <div class="card">
         <h2>Send</h2>
         <div class="field">
           <label for="send-address">Destination Address</label>

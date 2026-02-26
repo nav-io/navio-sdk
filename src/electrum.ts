@@ -387,7 +387,13 @@ export class ElectrumClient {
    */
   async call(method: string, ...params: any[]): Promise<any> {
     if (!this.connected || !this.ws) {
-      throw new Error('Not connected to Electrum server. Call connect() first.');
+      try {
+        await this.connect();
+      } catch (reconnectError) {
+        throw new Error(
+          `Not connected to Electrum server and reconnection failed: ${(reconnectError as Error).message}`
+        );
+      }
     }
 
     return new Promise((resolve, reject) => {

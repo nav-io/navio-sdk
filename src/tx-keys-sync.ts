@@ -296,15 +296,29 @@ export class TransactionKeysSync {
 
     // Pipeline: prefetch the next batch of tx keys + headers while
     // processing the current batch, eliminating the ~2s pause between batches.
+    // The first batch is fetched inside the loop; subsequent batches are
+    // prefetched at the end of each iteration so the download overlaps with
+    // processing.
 
-    // Kick off the first tx keys fetch
-    let pendingRangePromise: Promise<{ blocks: BlockTransactionKeys[]; nextHeight: number }> | null =
-      this.syncProvider.getBlockTransactionKeysRange(currentHeight);
+    let pendingRangePromise: Promise<{ blocks: BlockTransactionKeys[]; nextHeight: number }> | null = null;
 
-    while (currentHeight <= syncEndHeight && pendingRangePromise) {
-      // Await the current batch (already in flight)
-      const rangeResult = await pendingRangePromise;
-      pendingRangePromise = null;
+    while (currentHeight <= syncEndHeight) {
+      let rangeResult: { blocks: BlockTransactionKeys[]; nextHeight: number };
+
+      if (pendingRangePromise) {
+        try {
+          rangeResult = await pendingRangePromise;
+        } catch {
+          rangeResult = await this.withRetry(() =>
+            this.syncProvider.getBlockTransactionKeysRange(currentHeight)
+          );
+        }
+        pendingRangePromise = null;
+      } else {
+        rangeResult = await this.withRetry(() =>
+          this.syncProvider.getBlockTransactionKeysRange(currentHeight)
+        );
+      }
 
       const blocksToProcess = rangeResult.blocks.filter(b => b.height <= syncEndHeight);
       if (blocksToProcess.length === 0) break;
@@ -416,6 +430,52 @@ export class TransactionKeysSync {
   }
 
   /**
+   * Retry a function on transient network errors (timeout, disconnect).
+   * Reconnects the sync provider between attempts.
+   */
+  private async withRetry<T>(
+    fn: () => Promise<T>,
+    maxRetries: number = 3,
+    baseDelayMs: number = 2000
+  ): Promise<T> {
+    let lastError: Error | undefined;
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+      try {
+        return await fn();
+      } catch (error) {
+        lastError = error as Error;
+        const msg = lastError.message || '';
+        const isRetryable =
+          msg.includes('Not connected') ||
+          msg.includes('Connection closed') ||
+          msg.includes('Request timeout') ||
+          msg.includes('reconnection failed') ||
+          msg.includes('WebSocket');
+
+        if (!isRetryable || attempt === maxRetries) {
+          throw lastError;
+        }
+
+        const delay = baseDelayMs * Math.pow(2, attempt);
+        console.warn(
+          `[tx-keys-sync] Retryable error (attempt ${attempt + 1}/${maxRetries}): ${msg}. ` +
+            `Retrying in ${delay}ms...`
+        );
+        await new Promise(resolve => setTimeout(resolve, delay));
+
+        if (!this.syncProvider.isConnected()) {
+          try {
+            await this.syncProvider.connect();
+          } catch (connectError) {
+            console.warn(`[tx-keys-sync] Reconnection attempt failed:`, connectError);
+          }
+        }
+      }
+    }
+    throw lastError!;
+  }
+
+  /**
    * Check for chain reorganization
    * @param height - Height to check
    * @returns Reorganization info if detected, null otherwise
@@ -498,7 +558,7 @@ export class TransactionKeysSync {
 
       if (Array.isArray(inputs)) {
         for (const input of inputs) {
-          const outputHash = input?.outputHash || input?.output_hash || input?.prevout?.hash;
+          const outputHash = input?.prevoutHash || input?.outputHash || input?.output_hash || input?.prevout?.hash;
           if (outputHash && await this.walletDB.isOutputUnspent(outputHash)) {
             await this.walletDB.markOutputSpent(outputHash, txHash, block.height);
           }
@@ -628,7 +688,9 @@ export class TransactionKeysSync {
         console.log(`[tx-keys-sync] OUTPUT IS MINE at height ${blockHeight}, txHash=${txHash}, outputHash=${outputHash}`);
         // Fetch output data from backend
         try {
-          const outputHex = await this.syncProvider.getTransactionOutput(outputHash);
+          const outputHex = await this.withRetry(() =>
+            this.syncProvider.getTransactionOutput(outputHash)
+          );
           console.log(`[tx-keys-sync] Got output hex, length=${outputHex.length}`);
 
           // Recover the amount from the range proof
@@ -846,7 +908,9 @@ export class TransactionKeysSync {
     count: number
   ): Promise<Map<number, string>> {
     const map = new Map<number, string>();
-    const headersResult = await this.syncProvider.getBlockHeaders(startHeight, count);
+    const headersResult = await this.withRetry(() =>
+      this.syncProvider.getBlockHeaders(startHeight, count)
+    );
     const headerSize = 160; // 80 bytes * 2 hex chars
     const hex = headersResult.hex;
     const returned = Math.min(headersResult.count, count);

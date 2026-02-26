@@ -10,7 +10,7 @@
     "preview": "vite preview"
   },
   "dependencies": {
-    "navio-blsct": "^1.1.8",
+    "navio-blsct": "^1.1.10",
     "navio-sdk": "file:../.."
   },
   "devDependencies": {

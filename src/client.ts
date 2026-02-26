@@ -25,16 +25,15 @@ import type { DatabaseAdapterType } from './database-adapter';
 
 const {
   Scalar, PublicKey, SubAddr,
-  Address, TokenId, CTxId, OutPoint, TxIn, TxOut, CTx,
+  Address, TokenId, CTxId, OutPoint, TxIn, TxOut,
   TxOutputType, PrivSpendingKey,
   buildCTx, createTxInVec, addToTxInVec, createTxOutVec, addToTxOutVec,
-  deleteTxInVec, deleteTxOutVec, freeObj,
-} = blsctModule;
+  deleteTxInVec, deleteTxOutVec, freeObj, getCTxId, serializeCTx,
+} = blsctModule as any;
 
 /**
  * Build a confidential transaction and return its serialized hex.
- * Works around a navio-blsct bug where CTx.generate sets objSize=0,
- * causing CTx.serialize() to return an empty string.
+ * Uses serializeCTx + getCTxId from navio-blsct (works in both Node and WASM).
  */
 function buildAndSerializeCTx(
   txIns: InstanceType<typeof TxIn>[],
@@ -46,10 +45,10 @@ function buildAndSerializeCTx(
   for (const txOut of txOuts) addToTxOutVec(txOutVec, txOut.value());
 
   const rv = buildCTx(txInVec, txOutVec);
-  deleteTxInVec(txInVec);
-  deleteTxOutVec(txOutVec);
 
   if (rv.result !== 0) {
+    deleteTxInVec(txInVec);
+    deleteTxOutVec(txOutVec);
     const msg = `building tx failed. Error code = ${rv.result}`;
     freeObj(rv);
     throw new Error(msg);
@@ -58,36 +57,11 @@ function buildAndSerializeCTx(
   const ctxPtr = rv.ctx;
   freeObj(rv);
 
-  // Serialize the CTx using the native binding's serialize_ctx
-  let rawTx: string;
-  try {
-    // Node.js: access the native NAPI binding directly
-    const nativeBinding = require(
-      require('path').join(
-        require.resolve('navio-blsct'),
-        '../../build/Release/blsct.node',
-      ),
-    );
-    rawTx = nativeBinding.serialize_ctx(ctxPtr);
-  } catch {
-    // Browser WASM fallback: the WASM module exposes _serialize_ctx
-    // Access it through the blsctModule internals
-    const anyModule = blsctModule as any;
-    if (typeof anyModule.getBlsctModule === 'function') {
-      const wasmModule = anyModule.getBlsctModule();
-      const strPtr = wasmModule._serialize_ctx(ctxPtr);
-      rawTx = wasmModule.UTF8ToString(strPtr);
-      wasmModule._free(strPtr);
-    } else {
-      throw new Error(
-        'Cannot serialize CTx: no native binding and no WASM module available',
-      );
-    }
-  }
+  const rawTx: string = serializeCTx(ctxPtr);
+  const txId: string = getCTxId(ctxPtr);
 
-  // Get the txId from the generated CTx
-  const ctx = CTx.deserialize(rawTx);
-  const txId = ctx.getCTxId().serialize();
+  deleteTxInVec(txInVec);
+  deleteTxOutVec(txOutVec);
 
   return { rawTx, txId };
 }
@@ -1168,7 +1142,6 @@ export class NavioClient {
       subAddrId.address,
     );
 
-    // In Navio, UTXOs are identified by the output hash alone
     const ctxId = CTxId.deserialize(utxo.outputHash);
     const outPoint = OutPoint.generate(ctxId, 0);
 

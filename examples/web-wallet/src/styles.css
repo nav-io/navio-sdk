@@ -156,3 +156,109 @@ dd { word-break: break-all; }
 }
 .send-status.ok { color: #86efac; }
 .send-status.error { color: #fca5a5; }
+
+/* UTXO table */
+.utxo-container { max-height: 400px; overflow-y: auto; }
+
+.utxo-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.75rem;
+  font-family: 'SF Mono', 'Fira Code', monospace;
+}
+.utxo-table th {
+  text-align: left;
+  color: #888;
+  font-weight: 600;
+  padding: 0.35rem 0.5rem;
+  border-bottom: 1px solid #2a2d37;
+  position: sticky;
+  top: 0;
+  background: #1a1d27;
+}
+.utxo-table td {
+  padding: 0.35rem 0.5rem;
+  border-bottom: 1px solid #1f222d;
+  color: #ccc;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 160px;
+}
+.utxo-table tr:hover td { background: #22252f; }
+.utxo-table .utxo-spent td { opacity: 0.4; }
+.utxo-table .utxo-amount { text-align: right; color: #86efac; }
+.utxo-table .utxo-spent .utxo-amount { color: #fca5a5; }
+.utxo-table .utxo-height { text-align: right; }
+.utxo-count { font-size: 0.75rem; color: #555; margin-top: 0.35rem; }
+
+/* Transaction history */
+.history-container { max-height: 500px; overflow-y: auto; }
+
+.tx-item {
+  padding: 0.6rem 0.65rem;
+  background: #0f1117;
+  border: 1px solid #1f222d;
+  border-radius: 6px;
+  margin-bottom: 0.4rem;
+  font-size: 0.8rem;
+}
+.tx-item-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 0.5rem;
+}
+.tx-hash {
+  font-family: 'SF Mono', 'Fira Code', monospace;
+  font-size: 0.72rem;
+  color: #888;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+.tx-amount {
+  font-family: 'SF Mono', 'Fira Code', monospace;
+  font-weight: 600;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+.tx-amount.positive { color: #86efac; }
+.tx-amount.negative { color: #fca5a5; }
+.tx-amount.neutral  { color: #93c5fd; }
+.tx-meta {
+  display: flex;
+  gap: 0.75rem;
+  margin-top: 0.2rem;
+  font-size: 0.7rem;
+  color: #555;
+}
+.tx-badge {
+  display: inline-block;
+  padding: 0.05rem 0.35rem;
+  border-radius: 3px;
+  font-size: 0.65rem;
+  font-weight: 600;
+  text-transform: uppercase;
+}
+.tx-badge.recv { background: #14532d; color: #86efac; }
+.tx-badge.sent { background: #7f1d1d; color: #fca5a5; }
+.tx-badge.self { background: #1e3a5f; color: #93c5fd; }
+.tx-memo {
+  margin-top: 0.25rem;
+  font-size: 0.72rem;
+  color: #a78bfa;
+  font-style: italic;
+}
+
+.toggle-label {
+  font-size: 0.75rem;
+  color: #888;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  gap: 0.25rem;
+  font-weight: 400;
+}
+.toggle-label input { cursor: pointer; }

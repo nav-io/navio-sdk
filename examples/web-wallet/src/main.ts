@@ -457,6 +457,164 @@ function lockWallet() {
 }
 
 // ---------------------------------------------------------------------------
+// UTXOs
+// ---------------------------------------------------------------------------
+
+async function refreshUtxos() {
+  if (!client) return;
+  const container = $('utxo-container');
+  const showSpent = ($('utxo-show-spent') as HTMLInputElement).checked;
+
+  try {
+    const outputs = showSpent
+      ? await client.getAllOutputs()
+      : await client.getUnspentOutputs();
+
+    if (outputs.length === 0) {
+      container.innerHTML = '<div class="empty-state">No outputs found</div>';
+      return;
+    }
+
+    outputs.sort((a: any, b: any) => b.blockHeight - a.blockHeight);
+
+    const rows = outputs.map((o: any) => {
+      const amountNav = (Number(o.amount) / 1e8).toFixed(8);
+      const hash = o.outputHash.slice(0, 12) + '…';
+      const txHash = o.txHash ? o.txHash.slice(0, 12) + '…' : '-';
+      const memo = o.memo ? esc(o.memo) : '';
+      const cls = o.isSpent ? ' class="utxo-spent"' : '';
+      return `<tr${cls}>
+        <td title="${esc(o.outputHash)}">${hash}</td>
+        <td title="${esc(o.txHash || '')}">${txHash}</td>
+        <td class="utxo-height">${o.blockHeight}</td>
+        <td class="utxo-amount">${amountNav}</td>
+        <td>${memo}</td>
+        <td>${o.isSpent ? 'spent' : 'unspent'}</td>
+      </tr>`;
+    }).join('');
+
+    const unspentCount = outputs.filter((o: any) => !o.isSpent).length;
+    const spentCount = outputs.filter((o: any) => o.isSpent).length;
+
+    container.innerHTML = `
+      <table class="utxo-table">
+        <thead><tr>
+          <th>Output Hash</th>
+          <th>Tx Hash</th>
+          <th>Height</th>
+          <th style="text-align:right">Amount</th>
+          <th>Memo</th>
+          <th>Status</th>
+        </tr></thead>
+        <tbody>${rows}</tbody>
+      </table>
+      <div class="utxo-count">${unspentCount} unspent${showSpent ? `, ${spentCount} spent` : ''} — ${outputs.length} total</div>`;
+  } catch (e: any) {
+    container.innerHTML = `<div class="empty-state" style="color:#fca5a5">${esc(e.message)}</div>`;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Transaction history
+// ---------------------------------------------------------------------------
+
+interface TxRecord {
+  txHash: string;
+  blockHeight: number;
+  received: bigint;
+  spent: bigint;
+  memos: string[];
+  outputCount: number;
+  spentCount: number;
+}
+
+async function refreshHistory() {
+  if (!client) return;
+  const container = $('history-container');
+
+  try {
+    const outputs: any[] = await client.getAllOutputs();
+
+    if (outputs.length === 0) {
+      container.innerHTML = '<div class="empty-state">No transactions yet</div>';
+      return;
+    }
+
+    const txMap = new Map<string, TxRecord>();
+
+    const getOrCreate = (hash: string, height: number): TxRecord => {
+      let rec = txMap.get(hash);
+      if (!rec) {
+        rec = { txHash: hash, blockHeight: height, received: 0n, spent: 0n, memos: [], outputCount: 0, spentCount: 0 };
+        txMap.set(hash, rec);
+      }
+      return rec;
+    };
+
+    for (const o of outputs) {
+      const amt = BigInt(o.amount);
+
+      const recv = getOrCreate(o.txHash, o.blockHeight);
+      recv.received += amt;
+      recv.outputCount++;
+      if (o.memo) recv.memos.push(o.memo);
+
+      if (o.isSpent && o.spentTxHash) {
+        const sent = getOrCreate(o.spentTxHash, o.spentBlockHeight);
+        sent.spent += amt;
+        sent.spentCount++;
+      }
+    }
+
+    const txList = [...txMap.values()].sort((a, b) => b.blockHeight - a.blockHeight);
+
+    const items = txList.map((tx) => {
+      const net = tx.received - tx.spent;
+      const hasRecv = tx.received > 0n;
+      const hasSent = tx.spent > 0n;
+
+      let type: 'recv' | 'sent' | 'self';
+      let label: string;
+      if (hasRecv && hasSent) {
+        type = 'self';
+        label = 'Self';
+      } else if (hasSent) {
+        type = 'sent';
+        label = 'Sent';
+      } else {
+        type = 'recv';
+        label = 'Received';
+      }
+
+      const sign = net > 0n ? '+' : net < 0n ? '' : '±';
+      const amountClass = net > 0n ? 'positive' : net < 0n ? 'negative' : 'neutral';
+      const navStr = (Number(net) / 1e8).toFixed(8);
+
+      const memoHtml = tx.memos.length > 0
+        ? `<div class="tx-memo">${tx.memos.map(m => esc(m)).join(', ')}</div>`
+        : '';
+
+      return `<div class="tx-item">
+        <div class="tx-item-header">
+          <span class="tx-hash" title="${esc(tx.txHash)}">${tx.txHash.slice(0, 16)}…</span>
+          <span class="tx-amount ${amountClass}">${sign}${navStr} NAV</span>
+        </div>
+        <div class="tx-meta">
+          <span class="tx-badge ${type}">${label}</span>
+          <span>Height ${tx.blockHeight}</span>
+          ${tx.outputCount > 0 ? `<span>${tx.outputCount} output${tx.outputCount > 1 ? 's' : ''}</span>` : ''}
+        </div>
+        ${memoHtml}
+      </div>`;
+    }).join('');
+
+    container.innerHTML = items + `<div class="utxo-count">${txList.length} transaction${txList.length > 1 ? 's' : ''}</div>`;
+  } catch (e: any) {
+    container.innerHTML = `<div class="empty-state" style="color:#fca5a5">${esc(e.message)}</div>`;
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Sync
 // ---------------------------------------------------------------------------
 
@@ -636,6 +794,9 @@ $('btn-toggle-mnemonic').addEventListener('click', toggleMnemonic);
 $('btn-disconnect').addEventListener('click', disconnectWallet);
 $('btn-delete').addEventListener('click', () => deleteWallet());
 $('btn-send').addEventListener('click', sendTransaction);
+$('btn-refresh-utxos').addEventListener('click', refreshUtxos);
+$('utxo-show-spent').addEventListener('change', refreshUtxos);
+$('btn-refresh-history').addEventListener('click', refreshHistory);
 
 // ---------------------------------------------------------------------------
 // Boot
