@@ -1,6 +1,6 @@
 {
     "name": "navio-sdk",
-    "version": "0.1.9",
+    "version": "0.1.10",
     "description": "TypeScript SDK for interacting with the Navio blockchain",
     "main": "dist/index.js",
     "module": "dist/index.mjs",
@@ -80,7 +80,7 @@
         "@noble/hashes": "^1.3.3",
         "@scure/bip39": "^2.0.1",
         "hash-wasm": "^4.12.0",
-        "navio-blsct": "^1.1.10",
+        "navio-blsct": "^1.1.11",
         "ws": "^8.18.3"
     },
     "optionalDependencies": {

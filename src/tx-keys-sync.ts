@@ -16,6 +16,22 @@ import type { IWalletDB, SyncState } from './wallet-db.interface';
 import * as blsctModule from 'navio-blsct';
 import { sha256 } from '@noble/hashes/sha256';
 
+/**
+ * Yield control back to the browser's event loop so it can repaint and
+ * handle user input.  Uses setTimeout(0) which schedules a macrotask,
+ * guaranteeing that pending paint / input tasks run before we resume.
+ * In Node.js environments this is a near-instant no-op.
+ */
+const yieldToMainThread = (): Promise<void> =>
+  new Promise((resolve) => setTimeout(resolve, 0));
+
+/**
+ * How often (in blocks) the sync loop yields to the main thread.
+ * Tuned so each uninterrupted run is short enough (~5-15 ms) to keep
+ * the UI responsive while not adding excessive overhead.
+ */
+const YIELD_EVERY_N_BLOCKS = 50;
+
 export type { SyncState } from './wallet-db.interface';
 
 /**
@@ -153,6 +169,7 @@ export class TransactionKeysSync {
         const result = await client.getBlockTransactionKeys(height);
         return Array.isArray(result) ? result : [];
       },
+      getTransactionKeys: (txHash: string) => client.getTransactionKeys(txHash),
       getTransactionOutput: (outputHash: string) => client.getTransactionOutput(outputHash),
       broadcastTransaction: (rawTx: string) => client.broadcastTransaction(rawTx),
       getRawTransaction: (txHash: string, verbose?: boolean) => client.getRawTransaction(txHash, verbose),
@@ -350,7 +367,15 @@ export class TransactionKeysSync {
 
       let lastBlockHash = '';
       // Process each block using the current chunk; when we cross into the next chunk, swap and prefetch
-      for (const block of blocksToProcess) {
+      for (let blockIdx = 0; blockIdx < blocksToProcess.length; blockIdx++) {
+        const block = blocksToProcess[blockIdx];
+
+        // Yield to the event loop periodically so the browser can repaint
+        // and handle user input, preventing UI freezes during long syncs.
+        if (blockIdx > 0 && blockIdx % YIELD_EVERY_N_BLOCKS === 0) {
+          await yieldToMainThread();
+        }
+
         if (!currentHeaders.has(block.height) && nextHeadersPromise) {
           currentHeaders = await nextHeadersPromise;
           nextHeadersPromise = null;
@@ -549,21 +574,147 @@ export class TransactionKeysSync {
     block: BlockTransactionKeys,
     _blockHash: string
   ): Promise<void> {
+    const replacedMempoolTxIds = new Set<string>();
+
     for (const txKeys of block.txKeys) {
       const txHash = txKeys.txHash || '';
       if (!txHash) continue;
 
       const keys = txKeys.keys || {};
-      const inputs = keys?.inputs || keys?.vin || [];
+      const txData = keys[1] || keys;
+      const inputs = txData?.inputs || txData?.vin || [];
 
       if (Array.isArray(inputs)) {
         for (const input of inputs) {
           const outputHash = input?.prevoutHash || input?.outputHash || input?.output_hash || input?.prevout?.hash;
-          if (outputHash && await this.walletDB.isOutputUnspent(outputHash)) {
+          if (!outputHash) continue;
+
+          if (await this.walletDB.isOutputUnspent(outputHash)) {
             await this.walletDB.markOutputSpent(outputHash, txHash, block.height);
+          } else {
+            // Check if this output was spent in a mempool tx. BLSCT aggregates
+            // transactions at block level, so the confirmed tx hash will differ
+            // from the mempool tx hash.
+            const oldMempoolTxId = await this.walletDB.getMempoolSpentTxHash(outputHash);
+            if (oldMempoolTxId) {
+              replacedMempoolTxIds.add(oldMempoolTxId);
+              await this.walletDB.markOutputSpent(outputHash, txHash, block.height);
+            }
           }
         }
       }
+    }
+
+    // Clean up synthetic pending outputs from replaced mempool transactions.
+    // The real outputs are already stored by storeBlockTransactionKeys.
+    for (const oldTxId of replacedMempoolTxIds) {
+      await this.walletDB.deleteUnconfirmedOutputsByTxHash(oldTxId);
+    }
+  }
+
+  /**
+   * Process a mempool (unconfirmed) transaction using the same ownership
+   * detection logic as confirmed blocks. Outputs owned by this wallet are
+   * stored with blockHeight=0 and inputs that spend wallet outputs are
+   * marked as spent with spentBlockHeight=0.
+   *
+   * The raw transaction hex is deserialized locally to extract output keys
+   * and range proofs, avoiding round-trips to ElectrumX which may not serve
+   * mempool output data.
+   *
+   * @param txHash - The transaction hash (as returned by broadcast)
+   * @param rawTx - The serialized transaction hex
+   */
+  async processMempoolTransaction(txHash: string, rawTx: string): Promise<void> {
+    if (!this.keyManager) {
+      console.log(`[tx-keys-sync] processMempoolTransaction: no keyManager, skipping`);
+      return;
+    }
+
+    const {
+      CTx, PublicKey, Point, RangeProof, AmountRecoveryReq,
+      getCTxOutBlindingKey, getCTxOutSpendingKey, getCTxOutViewTag,
+    } = blsctModule as any;
+
+    let ctx: any;
+    try {
+      ctx = CTx.deserialize(rawTx);
+    } catch (err) {
+      console.warn(`[tx-keys-sync] Failed to deserialize mempool tx ${txHash}:`, err);
+      return;
+    }
+
+    const outs = ctx.getCTxOuts();
+    const numOuts = outs.size();
+    console.log(`[tx-keys-sync] processMempoolTransaction: txHash=${txHash}, ${numOuts} outputs`);
+
+    for (let i = 0; i < numOuts; i++) {
+      const ctxOut = outs.at(i);
+
+      const blindingKeyRawPtr = getCTxOutBlindingKey(ctxOut.obj);
+      const spendingKeyRawPtr = getCTxOutSpendingKey(ctxOut.obj);
+      const viewTag = getCTxOutViewTag(ctxOut.obj);
+
+      const blindingKeyObj = PublicKey.fromPoint(Point.fromObj(blindingKeyRawPtr));
+      const spendingKeyObj = PublicKey.fromPoint(Point.fromObj(spendingKeyRawPtr));
+
+      const isMine = this.keyManager.isMineByKeys(blindingKeyObj, spendingKeyObj, viewTag);
+      console.log(`[tx-keys-sync] mempool output ${i}: viewTag=${viewTag}, isMine=${isMine}`);
+
+      if (!isMine) continue;
+
+      let recoveredAmount = 0;
+      let recoveredGamma = '0';
+      let recoveredMemo: string | null = null;
+      let tokenIdHex: string | null = null;
+
+      try {
+        const nonce = this.keyManager.calculateNonce(blindingKeyObj);
+        const rangeProof = ctxOut.getRangeProof();
+        const tokenId = ctxOut.getTokenId();
+        tokenIdHex = tokenId.serialize();
+
+        const req = new AmountRecoveryReq(rangeProof, nonce, tokenId);
+        const results = RangeProof.recoverAmounts([req]);
+
+        if (results.length > 0 && results[0].isSucc) {
+          recoveredAmount = Number(results[0].amount);
+          recoveredGamma = results[0].gamma ?? '0';
+          recoveredMemo = results[0].msg || null;
+        }
+        console.log(`[tx-keys-sync] mempool output ${i} recovery: amount=${recoveredAmount}, gamma=${recoveredGamma}`);
+      } catch (err) {
+        console.warn(`[tx-keys-sync] Amount recovery failed for mempool output ${i}:`, err);
+      }
+
+      const blindingKeyHex = blindingKeyObj.serialize();
+      const spendingKeyHex = spendingKeyObj.serialize();
+      const outputHash = `mempool:${txHash}:${i}`;
+
+      await this.storeWalletOutput(
+        outputHash, txHash, i, 0, '',
+        recoveredAmount, recoveredGamma, recoveredMemo, tokenIdHex,
+        blindingKeyHex, spendingKeyHex,
+        false, null, null
+      );
+    }
+
+    // Process inputs to mark wallet outputs as spent in mempool
+    try {
+      const ins = ctx.getCTxIns();
+      const numIns = ins.size();
+      for (let i = 0; i < numIns; i++) {
+        const ctxIn = ins.at(i);
+        const prevOutHash = ctxIn.getPrevOutHash();
+        if (prevOutHash) {
+          const outputHash = typeof prevOutHash === 'string' ? prevOutHash : prevOutHash.serialize();
+          if (await this.walletDB.isOutputUnspent(outputHash)) {
+            await this.walletDB.markOutputSpent(outputHash, txHash, 0);
+          }
+        }
+      }
+    } catch (err) {
+      console.warn(`[tx-keys-sync] Failed to process mempool tx inputs:`, err);
     }
   }
 
@@ -698,6 +849,7 @@ export class TransactionKeysSync {
           const AmountRecoveryReq = blsctModule.AmountRecoveryReq;
           
           let recoveredAmount = 0;
+          let recoveredGamma = '0';
           let recoveredMemo: string | null = null;
           let tokenIdHex: string | null = null;
 
@@ -724,6 +876,7 @@ export class TransactionKeysSync {
               
               if (results.length > 0 && results[0].isSucc) {
                 recoveredAmount = Number(results[0].amount);
+                recoveredGamma = results[0].gamma ?? '0';
                 recoveredMemo = results[0].msg || null;
               }
             }
@@ -736,7 +889,7 @@ export class TransactionKeysSync {
             );
           }
           
-          console.log(`[tx-keys-sync] STORING output: amount=${recoveredAmount}, memo=${recoveredMemo}`);
+          console.log(`[tx-keys-sync] STORING output: amount=${recoveredAmount}, gamma=${recoveredGamma}, memo=${recoveredMemo}`);
 
           // Store output as spendable with recovered amount
           await this.storeWalletOutput(
@@ -746,6 +899,7 @@ export class TransactionKeysSync {
             blockHeight,
             outputHex,
             recoveredAmount,
+            recoveredGamma,
             recoveredMemo,
             tokenIdHex,
             blindingKey,
@@ -869,6 +1023,7 @@ export class TransactionKeysSync {
     blockHeight: number,
     outputData: string,
     amount: number,
+    gamma: string,
     memo: string | null,
     tokenId: string | null,
     blindingKey: string,
@@ -879,7 +1034,7 @@ export class TransactionKeysSync {
   ): Promise<void> {
     await this.walletDB.storeWalletOutput({
       outputHash, txHash, outputIndex, blockHeight, outputData,
-      amount, memo, tokenId, blindingKey, spendingKey,
+      amount, gamma, memo, tokenId, blindingKey, spendingKey,
       isSpent, spentTxHash, spentBlockHeight,
     });
   }

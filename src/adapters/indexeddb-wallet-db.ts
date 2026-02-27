@@ -496,6 +496,7 @@ export class IndexedDBWalletDB implements IWalletDB {
     outputIndex: r.outputIndex,
     blockHeight: r.blockHeight,
     amount: BigInt(r.amount),
+    gamma: r.gamma ?? '0',
     memo: r.memo ?? null,
     tokenId: r.tokenId ?? null,
     blindingKey: r.blindingKey,
@@ -599,6 +600,7 @@ export class IndexedDBWalletDB implements IWalletDB {
       blockHeight: p.blockHeight,
       outputData: p.outputData,
       amount: p.amount,
+      gamma: p.gamma,
       memo: p.memo,
       tokenId: p.tokenId,
       blindingKey: p.blindingKey,
@@ -613,6 +615,19 @@ export class IndexedDBWalletDB implements IWalletDB {
   async isOutputUnspent(outputHash: string): Promise<boolean> {
     const rec = await this.get<any>('walletOutputs', outputHash);
     return rec != null && rec.isSpent === 0;
+  }
+
+  async isOutputSpentInMempool(outputHash: string): Promise<boolean> {
+    const rec = await this.get<any>('walletOutputs', outputHash);
+    return rec != null && rec.isSpent === 1 && rec.spentBlockHeight === 0;
+  }
+
+  async getMempoolSpentTxHash(outputHash: string): Promise<string | null> {
+    const rec = await this.get<any>('walletOutputs', outputHash);
+    if (rec && rec.isSpent === 1 && rec.spentBlockHeight === 0) {
+      return rec.spentTxHash ?? null;
+    }
+    return null;
   }
 
   async markOutputSpent(outputHash: string, spentTxHash: string, spentBlockHeight: number): Promise<void> {
@@ -639,6 +654,31 @@ export class IndexedDBWalletDB implements IWalletDB {
       rec.spentTxHash = null;
       rec.spentBlockHeight = null;
       store.put(rec);
+    }
+    await idbTx(tx);
+  }
+
+  async getPendingSpentAmount(tokenId: string | null = null): Promise<bigint> {
+    const recs = await this.getAllByIndex<any>('walletOutputs', 'spentBlockHeight', 0);
+    let total = 0n;
+    for (const rec of recs) {
+      if (rec.isSpent !== 1) continue;
+      if (!this.matchesTokenFilter(rec.tokenId, tokenId)) continue;
+      total += BigInt(rec.amount);
+    }
+    return total;
+  }
+
+  async deleteUnconfirmedOutputsByTxHash(txHash: string): Promise<void> {
+    const recs = await this.getAllByIndex<any>('walletOutputs', 'blockHeight', 0);
+    if (recs.length === 0) return;
+    const db = this.ensureOpen();
+    const tx = db.transaction('walletOutputs', 'readwrite');
+    const store = tx.objectStore('walletOutputs');
+    for (const rec of recs) {
+      if (rec.txHash === txHash) {
+        store.delete(rec.outputHash);
+      }
     }
     await idbTx(tx);
   }

@@ -46,7 +46,7 @@ class NodePreparedStatement implements IPreparedStatement {
       this.iterator = iterable[Symbol.iterator]();
     }
 
-    const result = this.iterator.next();
+    const result = this.iterator!.next();
     if (result.done) {
       this.currentRow = null;
       return false;

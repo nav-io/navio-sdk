@@ -326,6 +326,7 @@ export class WalletDB {
         block_height INTEGER NOT NULL,
         output_data TEXT NOT NULL,
         amount INTEGER NOT NULL DEFAULT 0,
+        gamma TEXT NOT NULL DEFAULT '0',
         memo TEXT,
         token_id TEXT,
         blinding_key TEXT,
@@ -1029,13 +1030,13 @@ export class WalletDB {
     if (!this.adapter) throw new Error('Database not open');
     const stmt = await this.adapter.prepare(
       `INSERT OR REPLACE INTO wallet_outputs
-       (output_hash, tx_hash, output_index, block_height, output_data, amount, memo, token_id,
+       (output_hash, tx_hash, output_index, block_height, output_data, amount, gamma, memo, token_id,
         blinding_key, spending_key, is_spent, spent_tx_hash, spent_block_height, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     );
     await stmt.run([
       p.outputHash, p.txHash, p.outputIndex, p.blockHeight, p.outputData,
-      p.amount, p.memo, p.tokenId, p.blindingKey, p.spendingKey,
+      p.amount, p.gamma, p.memo, p.tokenId, p.blindingKey, p.spendingKey,
       p.isSpent ? 1 : 0, p.spentTxHash, p.spentBlockHeight, Date.now(),
     ]);
     await stmt.free();
@@ -1050,6 +1051,32 @@ export class WalletDB {
     const found = await stmt.step();
     await stmt.free();
     return found;
+  }
+
+  async isOutputSpentInMempool(outputHash: string): Promise<boolean> {
+    if (!this.adapter) throw new Error('Database not open');
+    const stmt = await this.adapter.prepare(
+      'SELECT output_hash FROM wallet_outputs WHERE output_hash = ? AND is_spent = 1 AND spent_block_height = 0'
+    );
+    stmt.bind([outputHash]);
+    const found = await stmt.step();
+    await stmt.free();
+    return found;
+  }
+
+  async getMempoolSpentTxHash(outputHash: string): Promise<string | null> {
+    if (!this.adapter) throw new Error('Database not open');
+    const stmt = await this.adapter.prepare(
+      'SELECT spent_tx_hash FROM wallet_outputs WHERE output_hash = ? AND is_spent = 1 AND spent_block_height = 0'
+    );
+    stmt.bind([outputHash]);
+    if (await stmt.step()) {
+      const row = await stmt.getAsObject();
+      await stmt.free();
+      return (row.spent_tx_hash as string) || null;
+    }
+    await stmt.free();
+    return null;
   }
 
   async markOutputSpent(outputHash: string, spentTxHash: string, spentBlockHeight: number): Promise<void> {
@@ -1072,6 +1099,34 @@ export class WalletDB {
     await this.adapter.run(
       `UPDATE wallet_outputs SET is_spent = 0, spent_tx_hash = NULL, spent_block_height = NULL WHERE spent_block_height = ?`,
       [height]
+    );
+  }
+
+  async getPendingSpentAmount(tokenId: string | null = null): Promise<bigint> {
+    if (!this.adapter) throw new Error('Database not open');
+
+    let query = `SELECT SUM(amount) as total FROM wallet_outputs WHERE is_spent = 1 AND spent_block_height = 0`;
+    if (tokenId === null) {
+      query += " AND (token_id IS NULL OR token_id = '0000000000000000000000000000000000000000000000000000000000000000')";
+    } else {
+      query += ` AND token_id = '${tokenId}'`;
+    }
+
+    const stmt = await this.adapter.prepare(query);
+    if (await stmt.step()) {
+      const row = await stmt.getAsObject();
+      await stmt.free();
+      return BigInt(row.total as number || 0);
+    }
+    await stmt.free();
+    return 0n;
+  }
+
+  async deleteUnconfirmedOutputsByTxHash(txHash: string): Promise<void> {
+    if (!this.adapter) throw new Error('Database not open');
+    await this.adapter.run(
+      'DELETE FROM wallet_outputs WHERE block_height = 0 AND tx_hash = ?',
+      [txHash]
     );
   }
 
@@ -1173,7 +1228,7 @@ export class WalletDB {
     }
 
     let query = `
-      SELECT output_hash, tx_hash, output_index, block_height, amount, memo, token_id, 
+      SELECT output_hash, tx_hash, output_index, block_height, amount, gamma, memo, token_id, 
              blinding_key, spending_key, is_spent, spent_tx_hash, spent_block_height
       FROM wallet_outputs 
       WHERE is_spent = 0
@@ -1199,6 +1254,7 @@ export class WalletDB {
         outputIndex: row.output_index as number,
         blockHeight: row.block_height as number,
         amount: BigInt(row.amount as number),
+        gamma: (row.gamma as string) || '0',
         memo: row.memo as string | null,
         tokenId: row.token_id as string | null,
         blindingKey: row.blinding_key as string,
@@ -1223,7 +1279,7 @@ export class WalletDB {
     }
 
     const stmt = await this.adapter.prepare(`
-      SELECT output_hash, tx_hash, output_index, block_height, amount, memo, token_id, 
+      SELECT output_hash, tx_hash, output_index, block_height, amount, gamma, memo, token_id, 
              blinding_key, spending_key, is_spent, spent_tx_hash, spent_block_height
       FROM wallet_outputs 
       ORDER BY block_height ASC
@@ -1238,6 +1294,7 @@ export class WalletDB {
         outputIndex: row.output_index as number,
         blockHeight: row.block_height as number,
         amount: BigInt(row.amount as number),
+        gamma: (row.gamma as string) || '0',
         memo: row.memo as string | null,
         tokenId: row.token_id as string | null,
         blindingKey: row.blinding_key as string,

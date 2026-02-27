@@ -866,6 +866,24 @@ export class NavioClient {
   }
 
   /**
+   * Get the total amount locked in unconfirmed (mempool) spends, in satoshis.
+   */
+  async getPendingSpentAmount(tokenId: string | null = null): Promise<bigint> {
+    if (!this.walletDB) {
+      throw new Error('Client not initialized');
+    }
+    return this.walletDB.getPendingSpentAmount(tokenId);
+  }
+
+  /**
+   * Get the total amount locked in unconfirmed (mempool) spends, in NAV.
+   */
+  async getPendingSpentNav(tokenId: string | null = null): Promise<number> {
+    const satoshis = await this.getPendingSpentAmount(tokenId);
+    return Number(satoshis) / 1e8;
+  }
+
+  /**
    * Get unspent outputs (UTXOs)
    * @param tokenId - Optional token ID to filter by (null for NAV)
    * @returns Array of unspent wallet outputs
@@ -1023,9 +1041,20 @@ export class NavioClient {
     // --- Broadcast ---
     await this.broadcastRawTransaction(rawTx);
 
-    // --- Mark spent outputs ---
+    // --- Mark spent inputs immediately (safety net) ---
     for (const utxo of selected) {
       await this.walletDB.markOutputSpent(utxo.outputHash, txId, 0);
+    }
+
+    // --- Process the mempool transaction using the same ownership detection
+    //     logic as confirmed blocks (blockHeight=0 for unconfirmed). The raw
+    //     tx is deserialized locally to extract keys and range proofs. ---
+    if (this.syncManager) {
+      try {
+        await this.syncManager.processMempoolTransaction(txId, rawTx);
+      } catch (err) {
+        console.warn(`[client] Failed to process mempool tx ${txId}:`, err);
+      }
     }
 
     return {
@@ -1145,9 +1174,13 @@ export class NavioClient {
     const ctxId = CTxId.deserialize(utxo.outputHash);
     const outPoint = OutPoint.generate(ctxId, 0);
 
+    const gamma = utxo.gamma && utxo.gamma.length >= 64
+      ? Scalar.deserialize(utxo.gamma)
+      : new Scalar(0);
+
     return TxIn.generate(
       Number(utxo.amount),
-      0,
+      gamma,
       privSpendingKey,
       tokenId,
       outPoint,

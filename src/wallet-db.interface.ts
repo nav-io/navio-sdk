@@ -31,6 +31,7 @@ export interface WalletOutput {
   outputIndex: number;
   blockHeight: number;
   amount: bigint;
+  gamma: string;
   memo: string | null;
   tokenId: string | null;
   blindingKey: string;
@@ -50,6 +51,7 @@ export interface StoreOutputParams {
   blockHeight: number;
   outputData: string;
   amount: number;
+  gamma: string;
   memo: string | null;
   tokenId: string | null;
   blindingKey: string;
@@ -120,9 +122,15 @@ export interface IWalletDB {
   // -- wallet output mutations (used by sync) ---------------------------
   storeWalletOutput(params: StoreOutputParams): Promise<void>;
   isOutputUnspent(outputHash: string): Promise<boolean>;
+  isOutputSpentInMempool(outputHash: string): Promise<boolean>;
+  getMempoolSpentTxHash(outputHash: string): Promise<string | null>;
   markOutputSpent(outputHash: string, spentTxHash: string, spentBlockHeight: number): Promise<void>;
   deleteOutputsByHeight(height: number): Promise<void>;
   unspendOutputsBySpentHeight(height: number): Promise<void>;
+
+  // -- pending/mempool balance ------------------------------------------
+  getPendingSpentAmount(tokenId?: string | null): Promise<bigint>;
+  deleteUnconfirmedOutputsByTxHash(txHash: string): Promise<void>;
 
   // -- persistence ------------------------------------------------------
   /** Flush to durable storage.  No-op for backends with immediate persistence. */

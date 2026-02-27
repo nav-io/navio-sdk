@@ -60,6 +60,20 @@ import {
 } from './crypto';
 import type { EncryptedData, SerializedEncryptedData } from './crypto';
 
+function hexToUint8Array(hex: string): Uint8Array {
+  const bytes = new Uint8Array(hex.length / 2);
+  for (let i = 0; i < hex.length; i += 2) {
+    bytes[i / 2] = parseInt(hex.slice(i, i + 2), 16);
+  }
+  return bytes;
+}
+
+function uint8ArrayToHex(bytes: Uint8Array): string {
+  return Array.from(bytes)
+    .map(b => b.toString(16).padStart(2, '0'))
+    .join('');
+}
+
 /**
  * KeyManager class for managing BLS CT keys.
  * Replicates functionality from navio-core's blsct::keyman.
@@ -639,15 +653,13 @@ export class KeyManager {
    */
   static seedToMnemonic(seed: ScalarType): string {
     // Get the 32-byte seed value as entropy
-    // Pad to 64 hex chars (32 bytes) in case leading zeros are stripped
     const seedHex = seed.serialize().padStart(64, '0');
-    const seedBytes = Buffer.from(seedHex, 'hex');
+    const seedBytes = hexToUint8Array(seedHex);
     
     if (seedBytes.length !== 32) {
       throw new Error(`Invalid seed length: ${seedBytes.length}, expected 32 bytes`);
     }
     
-    // Convert entropy to mnemonic (32 bytes = 256 bits = 24 words)
     return bip39.entropyToMnemonic(seedBytes, englishWordlist);
   }
 
@@ -664,9 +676,8 @@ export class KeyManager {
     
     // Convert mnemonic back to entropy (32 bytes for 24-word mnemonic)
     const entropy = bip39.mnemonicToEntropy(mnemonic, englishWordlist);
-    const entropyHex = Buffer.from(entropy).toString('hex');
+    const entropyHex = uint8ArrayToHex(entropy);
     
-    // Create Scalar from entropy
     return Scalar.deserialize(entropyHex);
   }
 
@@ -850,7 +861,7 @@ export class KeyManager {
 
     // The hashId is Hash160(spendingKey) - this is what calcKeyId computes for tx outputs
     // When a sender creates an output for us, the D_prime derivation results in our spendingKey
-    const spendingKeyBytes = Buffer.from(spendingKeyHex, 'hex');
+    const spendingKeyBytes = hexToUint8Array(spendingKeyHex);
     const hashIdBytes = this.hash160(spendingKeyBytes);
     const hashIdHex = this.bytesToHex(hashIdBytes);
     this.subAddresses.set(hashIdHex, id);
@@ -963,7 +974,7 @@ export class KeyManager {
 
     // HashId.serialize() returns a hex string, convert to bytes
     const hashIdHex = hashId.serialize();
-    return Uint8Array.from(Buffer.from(hashIdHex, 'hex'));
+    return hexToUint8Array(hashIdHex);
   }
 
   /**
@@ -1380,9 +1391,7 @@ export class KeyManager {
   // The actual implementation depends on navio-blsct API
 
   private getPublicKeyFromScalar(scalar: ScalarType): Uint8Array {
-    // Convert Scalar to public key bytes
-    // This would use scalar.toPublicKey() or similar based on navio-blsct API
-    return Uint8Array.from(Buffer.from(PublicKey.fromScalar(scalar).serialize(), 'hex'));
+    return hexToUint8Array(PublicKey.fromScalar(scalar).serialize());
   }
 
   private getPublicKeyFromViewKey(viewKey: ViewKeyType): Uint8Array {
@@ -1391,8 +1400,7 @@ export class KeyManager {
   }
 
   private getPublicKeyBytes(publicKey: PublicKeyType): Uint8Array {
-    // Get bytes from PublicKey
-    return Uint8Array.from(Buffer.from(publicKey.serialize(), 'hex'));
+    return hexToUint8Array(publicKey.serialize());
   }
 
 
@@ -1428,17 +1436,11 @@ export class KeyManager {
   }
 
   private bytesToHex(bytes: Uint8Array): string {
-    return Array.from(bytes)
-      .map(b => b.toString(16).padStart(2, '0'))
-      .join('');
+    return uint8ArrayToHex(bytes);
   }
 
   private hexToBytes(hex: string): Uint8Array {
-    const bytes = new Uint8Array(hex.length / 2);
-    for (let i = 0; i < hex.length; i += 2) {
-      bytes[i / 2] = parseInt(hex.slice(i, i + 2), 16);
-    }
-    return bytes;
+    return hexToUint8Array(hex);
   }
 
   /**
@@ -1856,7 +1858,7 @@ export class KeyManager {
       }
 
       const nonce = this.calculateNonce(out.blsctData.blindingKey as PublicKeyType);
-      const tokenIdHex = out.tokenId ? Buffer.from(out.tokenId).toString('hex') : null;
+      const tokenIdHex = out.tokenId ? uint8ArrayToHex(new Uint8Array(out.tokenId)) : null;
       const tokenId = tokenIdHex ? TokenId.deserialize(tokenIdHex) : TokenId.default();
 
       reqs.push(new AmountRecoveryReq(out.blsctData.rangeProof as any, nonce, tokenId));
@@ -1911,7 +1913,7 @@ export class KeyManager {
         continue;
       }
 
-      const tokenIdHex = out.tokenId ? Buffer.from(out.tokenId).toString('hex') : null;
+      const tokenIdHex = out.tokenId ? uint8ArrayToHex(new Uint8Array(out.tokenId)) : null;
       const tokenId = tokenIdHex ? TokenId.deserialize(tokenIdHex) : TokenId.default();
 
       reqs.push(new AmountRecoveryReq(out.blsctData.rangeProof as any, noncePoint, tokenId));
@@ -2249,9 +2251,7 @@ export class KeyManager {
    * Get bytes from Scalar
    */
   private getScalarBytes(scalar: ScalarType): Uint8Array {
-    // Serialize scalar to bytes
-    // This needs navio-blsct API
-    return Uint8Array.from(Buffer.from(scalar.serialize(), 'hex'));
+    return hexToUint8Array(scalar.serialize());
   }
 
   /**

@@ -156,6 +156,13 @@ export interface SyncProvider {
   getBlockTransactionKeys(height: number): Promise<TransactionKeys[]>;
 
   /**
+   * Get transaction keys for a single transaction (e.g. mempool tx)
+   * @param txHash - Transaction hash (hex string)
+   * @returns Transaction keys data
+   */
+  getTransactionKeys(txHash: string): Promise<any>;
+
+  /**
    * Get serialized transaction output by output hash
    * @param outputHash - Output hash (hex string)
    * @returns Serialized output (hex string)
@@ -274,6 +281,7 @@ export abstract class BaseSyncProvider implements SyncProvider {
     nextHeight: number;
   }>;
   abstract getBlockTransactionKeys(height: number): Promise<TransactionKeys[]>;
+  abstract getTransactionKeys(txHash: string): Promise<any>;
   abstract getTransactionOutput(outputHash: string): Promise<string>;
   abstract broadcastTransaction(rawTx: string): Promise<string>;
   abstract getRawTransaction(txHash: string, verbose?: boolean): Promise<string | unknown>;

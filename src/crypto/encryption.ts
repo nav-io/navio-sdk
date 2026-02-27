@@ -77,22 +77,17 @@ const SALT_LENGTH = 16;
 
 /**
  * Get the crypto implementation (Web Crypto API)
- * Works in both browser and Node.js environments
+ * Works in both browser and Node.js (>= 19) environments via globalThis.crypto
  */
 function getCrypto(): WebCrypto {
-  // Check if globalThis.crypto has the methods we need
   if (typeof globalThis.crypto !== 'undefined' && 
       typeof globalThis.crypto.subtle !== 'undefined' &&
       typeof globalThis.crypto.getRandomValues === 'function') {
     return globalThis.crypto;
   }
-  // Node.js environment - use webcrypto from crypto module
-  // eslint-disable-next-line @typescript-eslint/no-var-requires
-  const nodeCrypto = require('crypto');
-  if (nodeCrypto.webcrypto) {
-    return nodeCrypto.webcrypto as WebCrypto;
-  }
-  throw new Error('Web Crypto API not available. Requires Node.js 15+ or a modern browser.');
+  throw new Error(
+    'Web Crypto API not available. Requires Node.js 19+ or a modern browser.'
+  );
 }
 
 /**

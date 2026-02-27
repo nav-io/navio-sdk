@@ -972,6 +972,10 @@ export class P2PSyncProvider extends BaseSyncProvider {
   /**
    * Get serialized transaction output by output hash
    */
+  async getTransactionKeys(_txHash: string): Promise<any> {
+    throw new Error('P2P provider does not support getTransactionKeys');
+  }
+
   async getTransactionOutput(outputHash: string): Promise<string> {
     // Use GETOUTPUTDATA P2P message
     const outputHashBuffer = Buffer.from(outputHash, 'hex');

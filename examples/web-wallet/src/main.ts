@@ -406,6 +406,15 @@ async function updateInfo() {
   const bal = await client.getBalanceNav();
   $('wallet-balance').textContent = `${bal.toFixed(8)} NAV`;
   $('wallet-height').textContent = String(client.getLastSyncedHeight());
+
+  const pending = await client.getPendingSpentNav();
+  const pendingEl = $('wallet-pending');
+  if (pending > 0) {
+    pendingEl.textContent = `(${pending.toFixed(8)} NAV unconfirmed spend)`;
+    pendingEl.style.display = '';
+  } else {
+    pendingEl.style.display = 'none';
+  }
 }
 
 function toggleMnemonic() {
@@ -572,6 +581,7 @@ async function refreshHistory() {
       const net = tx.received - tx.spent;
       const hasRecv = tx.received > 0n;
       const hasSent = tx.spent > 0n;
+      const isUnconfirmed = tx.blockHeight === 0;
 
       let type: 'recv' | 'sent' | 'self';
       let label: string;
@@ -594,14 +604,18 @@ async function refreshHistory() {
         ? `<div class="tx-memo">${tx.memos.map(m => esc(m)).join(', ')}</div>`
         : '';
 
-      return `<div class="tx-item">
+      const heightLabel = isUnconfirmed ? 'Unconfirmed' : `Height ${tx.blockHeight}`;
+      const unconfBadge = isUnconfirmed ? '<span class="tx-badge unconfirmed">Pending</span>' : '';
+
+      return `<div class="tx-item${isUnconfirmed ? ' tx-unconfirmed' : ''}">
         <div class="tx-item-header">
           <span class="tx-hash" title="${esc(tx.txHash)}">${tx.txHash.slice(0, 16)}…</span>
           <span class="tx-amount ${amountClass}">${sign}${navStr} NAV</span>
         </div>
         <div class="tx-meta">
           <span class="tx-badge ${type}">${label}</span>
-          <span>Height ${tx.blockHeight}</span>
+          ${unconfBadge}
+          <span>${heightLabel}</span>
           ${tx.outputCount > 0 ? `<span>${tx.outputCount} output${tx.outputCount > 1 ? 's' : ''}</span>` : ''}
         </div>
         ${memoHtml}
