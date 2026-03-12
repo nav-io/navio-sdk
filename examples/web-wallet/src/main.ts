@@ -18,6 +18,7 @@ interface WalletEntry {
 interface SavedConfig {
   host: string;
   port: number;
+  ssl: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -60,7 +61,7 @@ function loadRegistry(): { wallets: WalletEntry[]; electrum: SavedConfig } {
     const raw = localStorage.getItem(STORAGE_KEY);
     if (raw) return JSON.parse(raw);
   } catch { /* ignore */ }
-  return { wallets: [], electrum: { host: 'testnet.nav.io', port: 50005 } };
+  return { wallets: [], electrum: { host: 'testnet.nav.io', port: 50005, ssl: window.location.protocol === 'https:' } };
 }
 
 function saveRegistry(reg: { wallets: WalletEntry[]; electrum: SavedConfig }) {
@@ -215,6 +216,7 @@ function showCreateForm() {
   const ec = reg.electrum;
   ($('electrum-host') as HTMLInputElement).value = ec.host;
   ($('electrum-port') as HTMLInputElement).value = String(ec.port);
+  ($('electrum-ssl') as HTMLInputElement).checked = ec.ssl ?? (window.location.protocol === 'https:');
 
   hide(walletListEl, walletEl);
   show(setupEl);
@@ -241,6 +243,7 @@ function showConnectForm(walletId: string) {
   const ec = reg.electrum;
   ($('electrum-host') as HTMLInputElement).value = ec.host;
   ($('electrum-port') as HTMLInputElement).value = String(ec.port);
+  ($('electrum-ssl') as HTMLInputElement).checked = ec.ssl ?? (window.location.protocol === 'https:');
 
   hide(walletListEl, walletEl);
   show(setupEl);
@@ -267,16 +270,17 @@ function showWalletListScreen() {
 async function createOrConnect() {
   const host = ($('electrum-host') as HTMLInputElement).value || 'testnet.nav.io';
   const port = parseInt(($('electrum-port') as HTMLInputElement).value, 10) || 50005;
-  saveElectrumConfig({ host, port });
+  const ssl = ($('electrum-ssl') as HTMLInputElement).checked;
+  saveElectrumConfig({ host, port, ssl });
 
   if (connectMode) {
-    await connectToExisting(connectMode, host, port);
+    await connectToExisting(connectMode, host, port, ssl);
   } else {
-    await createNewWallet(host, port);
+    await createNewWallet(host, port, ssl);
   }
 }
 
-async function createNewWallet(host: string, port: number) {
+async function createNewWallet(host: string, port: number, ssl: boolean) {
   const name = ($('wallet-name') as HTMLInputElement).value.trim() || 'My Wallet';
   const password = ($('wallet-password') as HTMLInputElement).value;
   const mnemonic = ($('mnemonic') as HTMLTextAreaElement).value.trim();
@@ -299,7 +303,7 @@ async function createNewWallet(host: string, port: number) {
   const config: any = {
     network: 'testnet',
     backend: 'electrum',
-    electrum: { host, port, ssl: false },
+    electrum: { host, port, ssl },
     walletDbPath: id,
     databaseAdapter: 'indexeddb',
   };
@@ -333,7 +337,7 @@ async function createNewWallet(host: string, port: number) {
   setStatus('Wallet created', 'ok');
 }
 
-async function connectToExisting(entry: WalletEntry, host: string, port: number) {
+async function connectToExisting(entry: WalletEntry, host: string, port: number, ssl: boolean) {
   setStatus('Connecting...');
 
   const { NavioClient } = await import('navio-sdk');
@@ -341,7 +345,7 @@ async function connectToExisting(entry: WalletEntry, host: string, port: number)
   const config: any = {
     network: 'testnet',
     backend: 'electrum',
-    electrum: { host, port, ssl: false },
+    electrum: { host, port, ssl },
     walletDbPath: entry.id,
     databaseAdapter: 'indexeddb',
     createWalletIfNotExists: false,
