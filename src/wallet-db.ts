@@ -33,8 +33,8 @@ import type { HDChain, SubAddressIdentifier } from './key-manager.types';
 import * as blsctModule from 'navio-blsct';
 import type { IDatabaseAdapter, DatabaseAdapterOptions } from './database-adapter';
 import { createDatabaseAdapter } from './database-adapter';
-import type { SyncState, StoreOutputParams } from './wallet-db.interface';
-export type { SyncState, WalletOutput, WalletMetadata, StoreOutputParams, IWalletDB } from './wallet-db.interface';
+import type { SyncState, StoreOutputParams, TxType } from './wallet-db.interface';
+export type { SyncState, WalletOutput, WalletMetadata, StoreOutputParams, IWalletDB, TxType } from './wallet-db.interface';
 
 // WalletOutput is re-exported from wallet-db.interface.ts
 import type { WalletOutput } from './wallet-db.interface';
@@ -334,9 +334,23 @@ export class WalletDB {
         is_spent INTEGER NOT NULL DEFAULT 0,
         spent_tx_hash TEXT,
         spent_block_height INTEGER,
-        created_at INTEGER NOT NULL
+        created_at INTEGER NOT NULL,
+        tx_type TEXT NOT NULL DEFAULT 'received',
+        timestamp INTEGER NOT NULL DEFAULT 0
       )
     `);
+
+    // Migrate existing databases: add tx_type and timestamp columns if missing
+    try {
+      await this.adapter.run(`ALTER TABLE wallet_outputs ADD COLUMN tx_type TEXT NOT NULL DEFAULT 'received'`);
+    } catch {
+      // Column already exists – ignore
+    }
+    try {
+      await this.adapter.run(`ALTER TABLE wallet_outputs ADD COLUMN timestamp INTEGER NOT NULL DEFAULT 0`);
+    } catch {
+      // Column already exists – ignore
+    }
 
     // Create indexes for wallet_outputs
     await this.adapter.run(`
@@ -1031,13 +1045,14 @@ export class WalletDB {
     const stmt = await this.adapter.prepare(
       `INSERT OR REPLACE INTO wallet_outputs
        (output_hash, tx_hash, output_index, block_height, output_data, amount, gamma, memo, token_id,
-        blinding_key, spending_key, is_spent, spent_tx_hash, spent_block_height, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        blinding_key, spending_key, is_spent, spent_tx_hash, spent_block_height, created_at, tx_type, timestamp)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     );
     await stmt.run([
       p.outputHash, p.txHash, p.outputIndex, p.blockHeight, p.outputData,
       p.amount, p.gamma, p.memo, p.tokenId, p.blindingKey, p.spendingKey,
       p.isSpent ? 1 : 0, p.spentTxHash, p.spentBlockHeight, Date.now(),
+      p.txType, p.timestamp,
     ]);
     await stmt.free();
   }
@@ -1229,7 +1244,8 @@ export class WalletDB {
 
     let query = `
       SELECT output_hash, tx_hash, output_index, block_height, amount, gamma, memo, token_id, 
-             blinding_key, spending_key, is_spent, spent_tx_hash, spent_block_height
+             blinding_key, spending_key, is_spent, spent_tx_hash, spent_block_height,
+             tx_type, timestamp
       FROM wallet_outputs 
       WHERE is_spent = 0
     `;
@@ -1262,6 +1278,8 @@ export class WalletDB {
         isSpent: (row.is_spent as number) === 1,
         spentTxHash: row.spent_tx_hash as string | null,
         spentBlockHeight: row.spent_block_height as number | null,
+        txType: ((row.tx_type as string) || 'received') as TxType,
+        timestamp: (row.timestamp as number) || 0,
       });
     }
     await stmt.free();
@@ -1280,7 +1298,8 @@ export class WalletDB {
 
     const stmt = await this.adapter.prepare(`
       SELECT output_hash, tx_hash, output_index, block_height, amount, gamma, memo, token_id, 
-             blinding_key, spending_key, is_spent, spent_tx_hash, spent_block_height
+             blinding_key, spending_key, is_spent, spent_tx_hash, spent_block_height,
+             tx_type, timestamp
       FROM wallet_outputs 
       ORDER BY block_height ASC
     `);
@@ -1302,6 +1321,8 @@ export class WalletDB {
         isSpent: (row.is_spent as number) === 1,
         spentTxHash: row.spent_tx_hash as string | null,
         spentBlockHeight: row.spent_block_height as number | null,
+        txType: ((row.tx_type as string) || 'received') as TxType,
+        timestamp: (row.timestamp as number) || 0,
       });
     }
     await stmt.free();

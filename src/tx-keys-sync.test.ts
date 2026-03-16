@@ -344,4 +344,92 @@ describe('TransactionKeysSync', () => {
       expect(needsSync).toBe(false);
     });
   });
+
+  describe('txType and timestamp fields', () => {
+    it('getUnspentOutputs should include txType and timestamp fields', async () => {
+      syncProvider = createMockSyncProvider({ chainTipHeight: 100 });
+      syncManager = new TransactionKeysSync(walletDB, syncProvider);
+      await syncManager.initialize();
+
+      const db = walletDB.getAdapter();
+
+      // Insert outputs with explicit txType and timestamp
+      await db.run(`
+        INSERT INTO wallet_outputs 
+        (output_hash, tx_hash, output_index, block_height, output_data, amount, is_spent, created_at, tx_type, timestamp)
+        VALUES 
+        ('recv-output', 'recv-tx', 0, 50, 'data', 1000000, 0, ?, 'received', 1700000000),
+        ('sent-output', 'sent-tx', 0, 55, 'data', 500000, 0, ?, 'sent', 1700100000),
+        ('stake-output', 'stake-tx', 0, 60, 'data', 2000000, 0, ?, 'stake', 1700200000)
+      `, [Date.now(), Date.now(), Date.now()]);
+
+      const outputs = await walletDB.getUnspentOutputs();
+
+      expect(outputs).toHaveLength(3);
+
+      const received = outputs.find(o => o.outputHash === 'recv-output');
+      expect(received).toBeDefined();
+      expect(received!.txType).toBe('received');
+      expect(received!.timestamp).toBe(1700000000);
+
+      const sent = outputs.find(o => o.outputHash === 'sent-output');
+      expect(sent).toBeDefined();
+      expect(sent!.txType).toBe('sent');
+      expect(sent!.timestamp).toBe(1700100000);
+
+      const stake = outputs.find(o => o.outputHash === 'stake-output');
+      expect(stake).toBeDefined();
+      expect(stake!.txType).toBe('stake');
+      expect(stake!.timestamp).toBe(1700200000);
+    });
+
+    it('getAllOutputs should include txType and timestamp fields', async () => {
+      syncProvider = createMockSyncProvider({ chainTipHeight: 100 });
+      syncManager = new TransactionKeysSync(walletDB, syncProvider);
+      await syncManager.initialize();
+
+      const db = walletDB.getAdapter();
+
+      // Insert one spent and one unspent output with metadata
+      await db.run(`
+        INSERT INTO wallet_outputs 
+        (output_hash, tx_hash, output_index, block_height, output_data, amount, is_spent, spent_tx_hash, spent_block_height, created_at, tx_type, timestamp)
+        VALUES 
+        ('unspent-out', 'tx-a', 0, 50, 'data', 1000000, 0, NULL, NULL, ?, 'received', 1700000000),
+        ('spent-out', 'tx-b', 0, 60, 'data', 2000000, 1, 'spending-tx', 70, ?, 'stake', 1700200000)
+      `, [Date.now(), Date.now()]);
+
+      const outputs = await walletDB.getAllOutputs();
+
+      expect(outputs).toHaveLength(2);
+
+      const unspent = outputs.find(o => o.outputHash === 'unspent-out');
+      expect(unspent!.txType).toBe('received');
+      expect(unspent!.timestamp).toBe(1700000000);
+
+      const spent = outputs.find(o => o.outputHash === 'spent-out');
+      expect(spent!.txType).toBe('stake');
+      expect(spent!.timestamp).toBe(1700200000);
+    });
+
+    it('outputs inserted without txType and timestamp should use defaults', async () => {
+      syncProvider = createMockSyncProvider({ chainTipHeight: 100 });
+      syncManager = new TransactionKeysSync(walletDB, syncProvider);
+      await syncManager.initialize();
+
+      const db = walletDB.getAdapter();
+
+      // Insert output using the old schema (no tx_type or timestamp columns)
+      await db.run(`
+        INSERT INTO wallet_outputs 
+        (output_hash, tx_hash, output_index, block_height, output_data, amount, is_spent, created_at)
+        VALUES ('legacy-output', 'legacy-tx', 0, 50, 'data', 1000000, 0, ?)
+      `, [Date.now()]);
+
+      const outputs = await walletDB.getUnspentOutputs();
+      expect(outputs).toHaveLength(1);
+      expect(outputs[0].txType).toBe('received');
+      expect(outputs[0].timestamp).toBe(0);
+    });
+  });
 });
