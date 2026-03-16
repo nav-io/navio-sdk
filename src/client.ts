@@ -90,6 +90,12 @@ export interface SendTransactionOptions {
   subtractFeeFromAmount?: boolean;
   /** Optional token ID (null for NAV) */
   tokenId?: string | null;
+  /**
+   * Optional list of specific UTXOs to use as inputs.
+   * Each entry must be an outputHash of an unspent, confirmed output.
+   * When provided, automatic UTXO selection is skipped.
+   */
+  selectedUtxos?: string[];
 }
 
 /**
@@ -949,6 +955,7 @@ export class NavioClient {
       memo = '',
       subtractFeeFromAmount = false,
       tokenId = null,
+      selectedUtxos,
     } = options;
 
     if (amount <= 0n) {
@@ -959,12 +966,38 @@ export class NavioClient {
     const destSubAddr = NavioClient.decodeAddress(address);
 
     // --- Select inputs ---
-    const utxos = await this.walletDB.getUnspentOutputs(tokenId);
-    if (utxos.length === 0) {
-      throw new Error('No unspent outputs available');
-    }
+    const allUtxos = await this.walletDB.getUnspentOutputs(tokenId);
 
-    const { selected, totalIn } = NavioClient.selectInputs(utxos, amount, subtractFeeFromAmount);
+    // Filter out unconfirmed (mempool) outputs – they have synthetic output
+    // hashes that are not valid CTxIds and cannot be spent until confirmed.
+    const confirmedUtxos = allUtxos.filter(u => u.blockHeight > 0);
+
+    let selected: WalletOutput[];
+    let totalIn: bigint;
+
+    if (selectedUtxos && selectedUtxos.length > 0) {
+      // Manual UTXO selection
+      const utxoMap = new Map(confirmedUtxos.map(u => [u.outputHash, u]));
+      selected = [];
+      totalIn = 0n;
+      for (const hash of selectedUtxos) {
+        const utxo = utxoMap.get(hash);
+        if (!utxo) {
+          throw new Error(`Selected UTXO not found or not spendable: ${hash.slice(0, 16)}...`);
+        }
+        selected.push(utxo);
+        totalIn += utxo.amount;
+      }
+    } else {
+      // Automatic selection
+      if (confirmedUtxos.length === 0) {
+        if (allUtxos.length > 0) {
+          throw new Error('All outputs are unconfirmed. Wait for block confirmation before spending.');
+        }
+        throw new Error('No unspent outputs available');
+      }
+      ({ selected, totalIn } = NavioClient.selectInputs(confirmedUtxos, amount, subtractFeeFromAmount));
+    }
 
     // Calculate fee: (inputs + 2 outputs) * DEFAULT_FEE_PER_COMPONENT
     // 2 outputs = destination + change (change may be zero but the fee estimate includes it)
@@ -1052,8 +1085,8 @@ export class NavioClient {
     if (this.syncManager) {
       try {
         await this.syncManager.processMempoolTransaction(txId, rawTx);
-      } catch (err) {
-        console.warn(`[client] Failed to process mempool tx ${txId}:`, err);
+      } catch {
+        // Mempool tx processing is best-effort; failures are non-fatal
       }
     }
 
@@ -1159,8 +1192,14 @@ export class NavioClient {
     // Find the sub-address this output belongs to via hash ID
     const spendingPubKey = PublicKey.deserialize(utxo.spendingKey);
     const hashId = this.keyManager.calculateHashId(blindingPubKey, spendingPubKey);
+    const hashIdHex = Array.from(hashId).map(b => b.toString(16).padStart(2, '0')).join('');
     const subAddrId = { account: 0, address: 0 };
-    this.keyManager.getSubAddressId(hashId, subAddrId);
+    if (!this.keyManager.getSubAddressId(hashId, subAddrId)) {
+      throw new Error(
+        `Cannot derive spending key: output ${utxo.outputHash.slice(0, 16)}… ` +
+        `does not map to a known sub-address in this wallet (hashId=${hashIdHex})`
+      );
+    }
 
     // Compute the private spending key for this output
     const privSpendingKey = new PrivSpendingKey(
@@ -1172,9 +1211,9 @@ export class NavioClient {
     );
 
     const ctxId = CTxId.deserialize(utxo.outputHash);
-    const outPoint = OutPoint.generate(ctxId, 0);
+    const outPoint = OutPoint.generate(ctxId);
 
-    const gamma = utxo.gamma && utxo.gamma.length >= 64
+    const gamma = utxo.gamma && utxo.gamma !== '0' && utxo.gamma.length > 0
       ? Scalar.deserialize(utxo.gamma)
       : new Scalar(0);
 

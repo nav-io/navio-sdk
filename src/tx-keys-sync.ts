@@ -482,17 +482,13 @@ export class TransactionKeysSync {
         }
 
         const delay = baseDelayMs * Math.pow(2, attempt);
-        console.warn(
-          `[tx-keys-sync] Retryable error (attempt ${attempt + 1}/${maxRetries}): ${msg}. ` +
-            `Retrying in ${delay}ms...`
-        );
         await new Promise(resolve => setTimeout(resolve, delay));
 
         if (!this.syncProvider.isConnected()) {
           try {
             await this.syncProvider.connect();
-          } catch (connectError) {
-            console.warn(`[tx-keys-sync] Reconnection attempt failed:`, connectError);
+          } catch {
+            // Reconnection failed; next iteration will retry
           }
         }
       }
@@ -547,10 +543,6 @@ export class TransactionKeysSync {
    * @param reorgInfo - Reorganization information
    */
   private async handleReorganization(reorgInfo: ReorganizationInfo): Promise<void> {
-    console.log(
-      `Handling reorganization: reverting ${reorgInfo.blocksToRevert} blocks from height ${reorgInfo.height}`
-    );
-
     // Revert blocks in database
     const revertHeight = reorgInfo.height + reorgInfo.blocksToRevert - 1;
     await this.revertBlocks(reorgInfo.height, revertHeight);
@@ -626,10 +618,7 @@ export class TransactionKeysSync {
    * @param rawTx - The serialized transaction hex
    */
   async processMempoolTransaction(txHash: string, rawTx: string): Promise<void> {
-    if (!this.keyManager) {
-      console.log(`[tx-keys-sync] processMempoolTransaction: no keyManager, skipping`);
-      return;
-    }
+    if (!this.keyManager) return;
 
     const {
       CTx, PublicKey, Point, RangeProof, AmountRecoveryReq,
@@ -639,14 +628,12 @@ export class TransactionKeysSync {
     let ctx: any;
     try {
       ctx = CTx.deserialize(rawTx);
-    } catch (err) {
-      console.warn(`[tx-keys-sync] Failed to deserialize mempool tx ${txHash}:`, err);
+    } catch {
       return;
     }
 
     const outs = ctx.getCTxOuts();
     const numOuts = outs.size();
-    console.log(`[tx-keys-sync] processMempoolTransaction: txHash=${txHash}, ${numOuts} outputs`);
 
     for (let i = 0; i < numOuts; i++) {
       const ctxOut = outs.at(i);
@@ -659,7 +646,6 @@ export class TransactionKeysSync {
       const spendingKeyObj = PublicKey.fromPoint(Point.fromObj(spendingKeyRawPtr));
 
       const isMine = this.keyManager.isMineByKeys(blindingKeyObj, spendingKeyObj, viewTag);
-      console.log(`[tx-keys-sync] mempool output ${i}: viewTag=${viewTag}, isMine=${isMine}`);
 
       if (!isMine) continue;
 
@@ -682,9 +668,8 @@ export class TransactionKeysSync {
           recoveredGamma = results[0].gamma ?? '0';
           recoveredMemo = results[0].msg || null;
         }
-        console.log(`[tx-keys-sync] mempool output ${i} recovery: amount=${recoveredAmount}, gamma=${recoveredGamma}`);
-      } catch (err) {
-        console.warn(`[tx-keys-sync] Amount recovery failed for mempool output ${i}:`, err);
+      } catch {
+        // Amount recovery failed; store output with zero amount
       }
 
       const blindingKeyHex = blindingKeyObj.serialize();
@@ -713,8 +698,8 @@ export class TransactionKeysSync {
           }
         }
       }
-    } catch (err) {
-      console.warn(`[tx-keys-sync] Failed to process mempool tx inputs:`, err);
+    } catch {
+      // Input processing is best-effort
     }
   }
 
@@ -745,10 +730,6 @@ export class TransactionKeysSync {
     keepTxKeys: boolean = false
   ): Promise<number> {
     let count = 0;
-
-    if (block.height <= 100005 || block.height % 5000 === 0) {
-      console.log(`[tx-keys-sync] storeBlockTransactionKeys: height=${block.height}, txKeys count=${block.txKeys.length}, keyManager=${!!this.keyManager}`);
-    }
 
     for (const txKeys of block.txKeys) {
       let txHash = txKeys.txHash;
@@ -786,28 +767,13 @@ export class TransactionKeysSync {
     blockHeight: number,
     _blockHash: string
   ): Promise<void> {
-    if (!this.keyManager) {
-      console.log(`[tx-keys-sync] processTransactionKeys called but keyManager is null`);
-      return;
-    }
-
-    // Log raw keys structure for first few blocks to understand format
-    if (blockHeight <= 100005 || blockHeight % 5000 === 0) {
-      console.log(`[tx-keys-sync] processTransactionKeys: height=${blockHeight}, keys type=${typeof keys}, isArray=${Array.isArray(keys)}, structure:`, JSON.stringify(keys).slice(0, 500));
-    }
+    if (!this.keyManager) return;
 
     // Transaction keys structure: { outputs: [{ blindingKey, spendingKey, viewTag, outputHash, ... }, ...] }
     // The exact structure depends on electrumx implementation
     const outputs = keys[1]?.outputs || keys[1]?.vout || [];
 
-    if (!Array.isArray(outputs)) {
-      console.log(`[tx-keys-sync] outputs is not array, keys[1]:`, JSON.stringify(keys[1]).slice(0, 300));
-      return;
-    }
-
-    if (outputs.length > 0) {
-      console.log(`[tx-keys-sync] height=${blockHeight}, txHash=${txHash}, ${outputs.length} outputs, first:`, JSON.stringify(outputs[0]).slice(0, 300));
-    }
+    if (!Array.isArray(outputs)) return;
 
     for (let outputIndex = 0; outputIndex < outputs.length; outputIndex++) {
       const outputKeys = outputs[outputIndex];
@@ -819,9 +785,6 @@ export class TransactionKeysSync {
       const outputHash = outputKeys?.outputHash || outputKeys?.output_hash;
 
       if (!blindingKey || !spendingKey || viewTag === undefined || !outputHash) {
-        console.warn(
-          `[tx-keys-sync] Invalid output keys at height ${blockHeight}: blindingKey=${!!blindingKey}, spendingKey=${!!spendingKey}, viewTag=${viewTag}, outputHash=${!!outputHash}. Raw keys:`, JSON.stringify(outputKeys).slice(0, 300)
-        );
         continue;
       }
 
@@ -832,17 +795,12 @@ export class TransactionKeysSync {
 
       // Check if output belongs to wallet
       const isMine = this.keyManager.isMineByKeys(blindingKeyObj, spendingKeyObj, viewTag);
-      if (blockHeight >= 100000 && outputs.length > 0) {
-        console.log(`[tx-keys-sync] isMine check: height=${blockHeight}, outputIndex=${outputIndex}, viewTag=${viewTag}, isMine=${isMine}`);
-      }
       if (isMine) {
-        console.log(`[tx-keys-sync] OUTPUT IS MINE at height ${blockHeight}, txHash=${txHash}, outputHash=${outputHash}`);
         // Fetch output data from backend
         try {
           const outputHex = await this.withRetry(() =>
             this.syncProvider.getTransactionOutput(outputHash)
           );
-          console.log(`[tx-keys-sync] Got output hex, length=${outputHex.length}`);
 
           // Recover the amount from the range proof
           const RangeProof = blsctModule.RangeProof;
@@ -856,23 +814,18 @@ export class TransactionKeysSync {
           try {
             // Calculate the nonce (shared secret) for amount recovery
             const nonce = this.keyManager.calculateNonce(blindingKeyObj);
-            console.log(`[tx-keys-sync] Nonce calculated, type=${typeof nonce}, constructor=${nonce?.constructor?.name}`);
-            
+
             // Parse the range proof from the output data
             const rangeProofResult = this.extractRangeProofFromOutput(outputHex);
-            console.log(`[tx-keys-sync] Range proof extracted: hasProof=${!!rangeProofResult.rangeProofHex}, proofLen=${rangeProofResult.rangeProofHex?.length}, tokenId=${rangeProofResult.tokenIdHex}`);
-            
+
             if (rangeProofResult.rangeProofHex) {
               const rangeProof = RangeProof.deserialize(rangeProofResult.rangeProofHex);
-              console.log(`[tx-keys-sync] Range proof deserialized, type=${rangeProof?.constructor?.name}`);
-              
+
               // Create recovery request
               const req = new AmountRecoveryReq(rangeProof, nonce);
-              console.log(`[tx-keys-sync] AmountRecoveryReq created`);
-              
+
               // Recover the amount using static method
               const results = RangeProof.recoverAmounts([req]);
-              console.log(`[tx-keys-sync] Recovery results: count=${results.length}, isSucc=${results[0]?.isSucc}, amount=${results[0]?.amount}, msg=${results[0]?.msg}`);
               
               if (results.length > 0 && results[0].isSucc) {
                 recoveredAmount = Number(results[0].amount);
@@ -882,14 +835,9 @@ export class TransactionKeysSync {
             }
             
             tokenIdHex = rangeProofResult.tokenIdHex;
-          } catch (amountError) {
-            console.warn(
-              `[tx-keys-sync] Amount recovery FAILED for output ${outputHash} at height ${blockHeight}:`,
-              amountError
-            );
+          } catch {
+            // Amount recovery failed; store output with zero amount
           }
-          
-          console.log(`[tx-keys-sync] STORING output: amount=${recoveredAmount}, gamma=${recoveredGamma}, memo=${recoveredMemo}`);
 
           // Store output as spendable with recovered amount
           await this.storeWalletOutput(
@@ -908,9 +856,8 @@ export class TransactionKeysSync {
             null, // spent_tx_hash
             null // spent_block_height
           );
-        } catch (error) {
+        } catch {
           // Output might not be available yet, skip for now
-          console.warn(`Failed to fetch output ${outputHash} for tx ${txHash}:`, error);
         }
       }
     }

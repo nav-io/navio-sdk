@@ -137,6 +137,9 @@ let mnemonicVisible = false;
 // Tracks whether the setup form is in "connect to existing" mode
 let connectMode: WalletEntry | null = null;
 
+// Selected UTXOs for manual input selection (outputHash strings)
+let selectedUtxoHashes: Set<string> = new Set();
+
 // ---------------------------------------------------------------------------
 // Wallet list screen
 // ---------------------------------------------------------------------------
@@ -473,6 +476,20 @@ function lockWallet() {
 // UTXOs
 // ---------------------------------------------------------------------------
 
+function updateSelectionUI() {
+  const clearBtn = $('btn-clear-utxo-selection');
+  if (selectedUtxoHashes.size > 0) {
+    clearBtn.style.display = '';
+    let total = 0;
+    document.querySelectorAll<HTMLInputElement>('.utxo-select-cb:checked').forEach((cb) => {
+      total += parseFloat(cb.dataset.amount || '0');
+    });
+    clearBtn.textContent = `Clear selection (${selectedUtxoHashes.size} / ${total.toFixed(8)} NAV)`;
+  } else {
+    clearBtn.style.display = 'none';
+  }
+}
+
 async function refreshUtxos() {
   if (!client) return;
   const container = $('utxo-container');
@@ -496,13 +513,20 @@ async function refreshUtxos() {
       const txHash = o.txHash ? o.txHash.slice(0, 12) + '…' : '-';
       const memo = o.memo ? esc(o.memo) : '';
       const cls = o.isSpent ? ' class="utxo-spent"' : '';
+      const isConfirmed = o.blockHeight > 0;
+      const canSelect = !o.isSpent && isConfirmed;
+      const checked = selectedUtxoHashes.has(o.outputHash) ? ' checked' : '';
+      const checkbox = canSelect
+        ? `<input type="checkbox" class="utxo-select-cb" data-hash="${esc(o.outputHash)}" data-amount="${amountNav}"${checked} />`
+        : (o.isSpent ? '' : '<span title="Unconfirmed — cannot select">⏳</span>');
       return `<tr${cls}>
+        <td style="text-align:center">${checkbox}</td>
         <td title="${esc(o.outputHash)}">${hash}</td>
         <td title="${esc(o.txHash || '')}">${txHash}</td>
         <td class="utxo-height">${o.blockHeight}</td>
         <td class="utxo-amount">${amountNav}</td>
         <td>${memo}</td>
-        <td>${o.isSpent ? 'spent' : 'unspent'}</td>
+        <td>${o.isSpent ? 'spent' : (isConfirmed ? 'unspent' : 'pending')}</td>
       </tr>`;
     }).join('');
 
@@ -512,6 +536,7 @@ async function refreshUtxos() {
     container.innerHTML = `
       <table class="utxo-table">
         <thead><tr>
+          <th style="width:2rem"></th>
           <th>Output Hash</th>
           <th>Tx Hash</th>
           <th>Height</th>
@@ -522,6 +547,21 @@ async function refreshUtxos() {
         <tbody>${rows}</tbody>
       </table>
       <div class="utxo-count">${unspentCount} unspent${showSpent ? `, ${spentCount} spent` : ''} — ${outputs.length} total</div>`;
+
+    // Wire up checkbox events
+    container.querySelectorAll<HTMLInputElement>('.utxo-select-cb').forEach((cb) => {
+      cb.addEventListener('change', () => {
+        const hash = cb.dataset.hash!;
+        if (cb.checked) {
+          selectedUtxoHashes.add(hash);
+        } else {
+          selectedUtxoHashes.delete(hash);
+        }
+        updateSelectionUI();
+      });
+    });
+
+    updateSelectionUI();
   } catch (e: any) {
     container.innerHTML = `<div class="empty-state" style="color:#fca5a5">${esc(e.message)}</div>`;
   }
@@ -721,11 +761,18 @@ async function sendTransaction() {
   sendStatusEl.className = 'send-status';
 
   try {
-    const result = await client.sendTransaction({
+    const sendOpts: any = {
       address,
       amount: amountSat,
       memo: memo || undefined,
-    });
+    };
+
+    if (selectedUtxoHashes.size > 0) {
+      sendOpts.selectedUtxos = [...selectedUtxoHashes];
+      log(`Using ${selectedUtxoHashes.size} manually selected UTXO(s)`);
+    }
+
+    const result = await client.sendTransaction(sendOpts);
 
     log(`Sent ${amountNav} NAV → ${address.slice(0, 20)}...`);
     log(`TxID: ${result.txId}`);
@@ -734,13 +781,16 @@ async function sendTransaction() {
     sendStatusEl.textContent = `Sent! TxID: ${result.txId.slice(0, 16)}...`;
     sendStatusEl.className = 'send-status ok';
 
-    // Clear form
+    // Clear form and UTXO selection
     addressInput.value = '';
     amountInput.value = '';
     memoInput.value = '';
+    selectedUtxoHashes.clear();
+    updateSelectionUI();
 
-    // Refresh balance
+    // Refresh balance and UTXOs
     await updateInfo();
+    await refreshUtxos();
   } catch (e: any) {
     console.error('Send failed:', e);
     log(`Send failed: ${e.message}`);
@@ -814,6 +864,11 @@ $('btn-delete').addEventListener('click', () => deleteWallet());
 $('btn-send').addEventListener('click', sendTransaction);
 $('btn-refresh-utxos').addEventListener('click', refreshUtxos);
 $('utxo-show-spent').addEventListener('change', refreshUtxos);
+$('btn-clear-utxo-selection').addEventListener('click', () => {
+  selectedUtxoHashes.clear();
+  document.querySelectorAll<HTMLInputElement>('.utxo-select-cb').forEach((cb) => { cb.checked = false; });
+  updateSelectionUI();
+});
 $('btn-refresh-history').addEventListener('click', refreshHistory);
 
 // ---------------------------------------------------------------------------

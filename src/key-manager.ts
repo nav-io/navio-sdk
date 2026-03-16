@@ -859,8 +859,10 @@ export class KeyManager {
     // First 96 chars = blinding key, second 96 chars = spending key
     const spendingKeyHex = serialized.substring(96);
 
-    // The hashId is Hash160(spendingKey) - this is what calcKeyId computes for tx outputs
-    // When a sender creates an output for us, the D_prime derivation results in our spendingKey
+    // The hashId is Hash160 of the sub-address spending key D (the second G1 point of the DPK).
+    // In navio-core: DoublePublicKey::GetID() returns sk.GetID() = Hash160(sk.GetVch())
+    // During output detection, CalculateHashId recovers D_prime from the output keys,
+    // and Hash160(D_prime) == Hash160(D) for outputs belonging to this sub-address.
     const spendingKeyBytes = hexToUint8Array(spendingKeyHex);
     const hashIdBytes = this.hash160(spendingKeyBytes);
     const hashIdHex = this.bytesToHex(hashIdBytes);
