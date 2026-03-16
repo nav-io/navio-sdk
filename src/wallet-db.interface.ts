@@ -23,6 +23,14 @@ export interface SyncState {
 }
 
 /**
+ * Transaction type for a wallet output.
+ * - `received`: coins received from an external sender
+ * - `sent`: change output returned to the wallet from an outgoing transaction
+ * - `stake`: staking reward from a Proof-of-Stake block
+ */
+export type TxType = 'received' | 'sent' | 'stake';
+
+/**
  * Wallet output (UTXO) as returned by query methods
  */
 export interface WalletOutput {
@@ -39,6 +47,10 @@ export interface WalletOutput {
   isSpent: boolean;
   spentTxHash: string | null;
   spentBlockHeight: number | null;
+  /** Transaction type: received, sent, or stake */
+  txType: TxType;
+  /** Unix epoch timestamp of the block (or current time for mempool outputs) */
+  timestamp: number;
 }
 
 /**
@@ -59,6 +71,10 @@ export interface StoreOutputParams {
   isSpent: boolean;
   spentTxHash: string | null;
   spentBlockHeight: number | null;
+  /** Transaction type: received, sent, or stake */
+  txType: TxType;
+  /** Unix epoch timestamp of the block (or current time for mempool outputs) */
+  timestamp: number;
 }
 
 /**

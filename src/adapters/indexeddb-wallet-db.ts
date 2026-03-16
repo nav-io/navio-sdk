@@ -22,6 +22,7 @@ import type {
   WalletOutput,
   WalletMetadata,
   StoreOutputParams,
+  TxType,
 } from '../wallet-db.interface';
 
 const IDB_VERSION = 1;
@@ -504,6 +505,8 @@ export class IndexedDBWalletDB implements IWalletDB {
     isSpent: r.isSpent === 1,
     spentTxHash: r.spentTxHash ?? null,
     spentBlockHeight: r.spentBlockHeight ?? null,
+    txType: (r.txType ?? 'received') as TxType,
+    timestamp: r.timestamp ?? 0,
   });
 
   // -- sync state -------------------------------------------------------
@@ -608,6 +611,8 @@ export class IndexedDBWalletDB implements IWalletDB {
       isSpent: p.isSpent ? 1 : 0,
       spentTxHash: p.spentTxHash,
       spentBlockHeight: p.spentBlockHeight,
+      txType: p.txType,
+      timestamp: p.timestamp,
       createdAt: Date.now(),
     });
   }

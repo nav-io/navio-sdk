@@ -12,7 +12,7 @@ import { SyncProvider } from './sync-provider';
 import { ElectrumClient } from './electrum';
 import { KeyManager } from './key-manager';
 import type { BlockTransactionKeys, TransactionKeys } from './electrum';
-import type { IWalletDB, SyncState } from './wallet-db.interface';
+import type { IWalletDB, SyncState, TxType } from './wallet-db.interface';
 import * as blsctModule from 'navio-blsct';
 import { sha256 } from '@noble/hashes/sha256';
 
@@ -389,6 +389,16 @@ export class TransactionKeysSync {
         const blockHash = this.extractBlockHash(headerHex);
         lastBlockHash = blockHash;
 
+        // Extract block timestamp and PoS flag from the 80-byte header
+        let blockTimestamp = 0;
+        let isPoS = false;
+        if (headerHex && headerHex.length >= 160) {
+          const headerBytes = Buffer.from(headerHex, 'hex');
+          blockTimestamp = headerBytes.readUInt32LE(68);
+          const blockVersion = headerBytes.readInt32LE(0);
+          isPoS = (blockVersion & 0x01000000) !== 0;
+        }
+
         if (verifyHashes) {
           await this.storeBlockHash(block.height, blockHash, chainTip);
 
@@ -416,7 +426,7 @@ export class TransactionKeysSync {
           await this.storeBlockHash(block.height, blockHash, chainTip);
         }
 
-        const txKeysCount = await this.storeBlockTransactionKeys(block, blockHash, keepTxKeys);
+        const txKeysCount = await this.storeBlockTransactionKeys(block, blockHash, keepTxKeys, blockTimestamp, isPoS);
 
         if (this.keyManager) {
           await this.processBlockForSpentOutputs(block, blockHash);
@@ -632,6 +642,30 @@ export class TransactionKeysSync {
       return;
     }
 
+    // Determine txType: check if any inputs reference wallet-owned outputs.
+    // Mempool transactions are never PoS blocks, so: spent wallet input → 'sent', else → 'received'.
+    let mempoolTxType: TxType = 'received';
+    try {
+      const ins = ctx.getCTxIns();
+      const numIns = ins.size();
+      for (let i = 0; i < numIns; i++) {
+        const ctxIn = ins.at(i);
+        const prevOutHash = ctxIn.getPrevOutHash();
+        if (prevOutHash) {
+          const outputHash = typeof prevOutHash === 'string' ? prevOutHash : prevOutHash.serialize();
+          if (await this.walletDB.isOutputUnspent(outputHash)) {
+            mempoolTxType = 'sent';
+            break;
+          }
+        }
+      }
+    } catch {
+      // Input inspection is best-effort
+    }
+
+    // Use current time as unix epoch for mempool outputs (no block timestamp available)
+    const mempoolTimestamp = Math.floor(Date.now() / 1000);
+
     const outs = ctx.getCTxOuts();
     const numOuts = outs.size();
 
@@ -680,7 +714,8 @@ export class TransactionKeysSync {
         outputHash, txHash, i, 0, '',
         recoveredAmount, recoveredGamma, recoveredMemo, tokenIdHex,
         blindingKeyHex, spendingKeyHex,
-        false, null, null
+        false, null, null,
+        mempoolTxType, mempoolTimestamp
       );
     }
 
@@ -722,12 +757,16 @@ export class TransactionKeysSync {
    * @param block - Block transaction keys
    * @param blockHash - Block hash
    * @param keepTxKeys - Whether to keep transaction keys in database after processing
+   * @param blockTimestamp - Unix epoch timestamp from the block header
+   * @param isPoS - Whether this block is a Proof-of-Stake block
    * @returns Number of transaction keys stored
    */
   private async storeBlockTransactionKeys(
     block: BlockTransactionKeys,
     blockHash: string,
-    keepTxKeys: boolean = false
+    keepTxKeys: boolean = false,
+    blockTimestamp: number = 0,
+    isPoS: boolean = false
   ): Promise<number> {
     let count = 0;
 
@@ -741,7 +780,7 @@ export class TransactionKeysSync {
       }
 
       if (this.keyManager) {
-        await this.processTransactionKeys(txHash, txKeys.keys, block.height, blockHash);
+        await this.processTransactionKeys(txHash, txKeys.keys, block.height, blockHash, blockTimestamp, isPoS);
       }
 
       if (keepTxKeys) {
@@ -760,12 +799,16 @@ export class TransactionKeysSync {
    * @param keys - Transaction keys data
    * @param blockHeight - Block height
    * @param _blockHash - Block hash (for reference, currently unused)
+   * @param blockTimestamp - Unix epoch timestamp of the block
+   * @param isPoS - Whether this block is a Proof-of-Stake block
    */
   private async processTransactionKeys(
     txHash: string,
     keys: any,
     blockHeight: number,
-    _blockHash: string
+    _blockHash: string,
+    blockTimestamp: number = 0,
+    isPoS: boolean = false
   ): Promise<void> {
     if (!this.keyManager) return;
 
@@ -774,6 +817,23 @@ export class TransactionKeysSync {
     const outputs = keys[1]?.outputs || keys[1]?.vout || [];
 
     if (!Array.isArray(outputs)) return;
+
+    // Determine txType by checking if any inputs reference wallet-owned outputs.
+    // - If yes and block is PoS: the wallet's stake UTXO was spent as a staking input → 'stake'
+    // - If yes and block is not PoS: this is a change output from an outgoing transaction → 'sent'
+    // - Otherwise: coins received from an external sender → 'received'
+    const txData = keys[1] || keys;
+    const inputs: any[] = txData?.inputs || txData?.vin || [];
+    let txType: TxType = 'received';
+    if (Array.isArray(inputs) && inputs.length > 0) {
+      for (const input of inputs) {
+        const outputHash = input?.prevoutHash || input?.outputHash || input?.output_hash || input?.prevout?.hash;
+        if (outputHash && await this.walletDB.isOutputUnspent(outputHash)) {
+          txType = isPoS ? 'stake' : 'sent';
+          break;
+        }
+      }
+    }
 
     for (let outputIndex = 0; outputIndex < outputs.length; outputIndex++) {
       const outputKeys = outputs[outputIndex];
@@ -854,7 +914,9 @@ export class TransactionKeysSync {
             spendingKey,
             false, // not spent
             null, // spent_tx_hash
-            null // spent_block_height
+            null, // spent_block_height
+            txType,
+            blockTimestamp
           );
         } catch {
           // Output might not be available yet, skip for now
@@ -977,12 +1039,14 @@ export class TransactionKeysSync {
     spendingKey: string,
     isSpent: boolean,
     spentTxHash: string | null,
-    spentBlockHeight: number | null
+    spentBlockHeight: number | null,
+    txType: TxType = 'received',
+    timestamp: number = 0
   ): Promise<void> {
     await this.walletDB.storeWalletOutput({
       outputHash, txHash, outputIndex, blockHeight, outputData,
       amount, gamma, memo, tokenId, blindingKey, spendingKey,
-      isSpent, spentTxHash, spentBlockHeight,
+      isSpent, spentTxHash, spentBlockHeight, txType, timestamp,
     });
   }
 
