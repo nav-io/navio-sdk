@@ -4,18 +4,21 @@ A basic web wallet example demonstrating how to use `navio-sdk` in a browser env
 
 ## Features
 
+- Multiple wallet profiles persisted in browser storage
 - Create new wallet with optional password protection
 - Restore wallet from seed or mnemonic
 - Wallet encryption with lock/unlock support
 - Background sync with Electrum backend
 - Display balance and UTXOs
+- View transaction history
+- Send confidential transactions (optional memo)
 - Bech32m encoded receiving addresses
 - Real-time activity log
 
 ## Prerequisites
 
 - Node.js 20+
-- An Electrum server running (default: localhost:50001)
+- An Electrum server endpoint (default: `testnet.nav.io:50005`)
 
 ## Setup
 
@@ -76,10 +79,13 @@ The example demonstrates:
 - Dynamic import of navio-sdk (ESM)
 - NavioClient initialization with Electrum backend
 - Wallet creation and restoration
+- Multi-wallet browser persistence with IndexedDB
 - Password-based wallet encryption (Argon2id + AES-256-GCM)
 - Lock/unlock workflow for encrypted wallets
 - Background sync with callbacks
 - Balance and UTXO display
+- Transaction history aggregation
+- Transaction sending with memo support
 - Bech32m address encoding
 
 ## Wallet Encryption
