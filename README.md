@@ -106,6 +106,7 @@ interface NavioClientConfig {
   createWalletIfNotExists?: boolean; // Create wallet if missing (default: false)
   restoreFromSeed?: string;          // Restore from seed (hex string)
   restoreFromMnemonic?: string;      // Restore from BIP39 mnemonic (12-24 words)
+  restoreFromAuditKey?: string;      // Restore watch-only wallet from audit key (160 hex chars)
   restoreFromHeight?: number;        // Block height when wallet was created (for restore)
   creationHeight?: number;           // Creation height for new wallets (default: chainTip - 100)
 }
@@ -397,6 +398,11 @@ keyManager.setHDSeedFromMnemonic(mnemonic);
 // Get mnemonic from current seed (for backup)
 const backupMnemonic = keyManager.getMnemonic();
 console.log('Backup mnemonic:', backupMnemonic);
+
+// Export the BLSCT audit key used by navio-core's getblsctauditkey RPC.
+// Format: 32-byte private view key || 48-byte public spending key
+const auditKeyHex = keyManager.getAuditKeyHex();
+console.log('Audit key:', auditKeyHex);
 
 // Static conversion methods
 const scalar = KeyManager.mnemonicToScalar(mnemonic); // Convert to Scalar
@@ -774,6 +780,21 @@ await client.sync({
     console.log(`Syncing: ${height}/${tip}`);
   },
 });
+```
+
+### Restore Watch-Only Wallet from Audit Key
+
+```typescript
+const client = new NavioClient({
+  walletDbPath: './watch-only-wallet.db',
+  electrum: { host: 'localhost', port: 50005 },
+  restoreFromAuditKey: 'your-160-hex-audit-key',
+  restoreFromHeight: 50000, // Block height when the wallet first became active
+  network: 'testnet',
+});
+
+await client.initialize();
+await client.sync();
 ```
 
 ### Using P2P Backend

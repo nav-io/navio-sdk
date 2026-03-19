@@ -361,23 +361,23 @@ export class WalletDB {
     }
 
     const keyManager = new KeyManager();
+    let walletFound = false;
 
-    // Load HD chain
+    // Load HD chain when available. Watch-only audit-key wallets do not have one.
     const hdChainResult = await this.adapter.exec('SELECT * FROM hd_chain LIMIT 1');
-    if (hdChainResult.length === 0 || hdChainResult[0].values.length === 0) {
-      throw new Error('No wallet found in database');
+    if (hdChainResult.length > 0 && hdChainResult[0].values.length > 0) {
+      const row = hdChainResult[0].values[0];
+      const hdChain: HDChain = {
+        version: row[1] as number,
+        seedId: this.hexToBytes(row[2] as string),
+        spendId: this.hexToBytes(row[3] as string),
+        viewId: this.hexToBytes(row[4] as string),
+        tokenId: this.hexToBytes(row[5] as string),
+        blindingId: this.hexToBytes(row[6] as string),
+      };
+      keyManager.loadHDChain(hdChain);
+      walletFound = true;
     }
-
-    const row = hdChainResult[0].values[0];
-    const hdChain: HDChain = {
-      version: row[1] as number,
-      seedId: this.hexToBytes(row[2] as string),
-      spendId: this.hexToBytes(row[3] as string),
-      viewId: this.hexToBytes(row[4] as string),
-      tokenId: this.hexToBytes(row[5] as string),
-      blindingId: this.hexToBytes(row[6] as string),
-    };
-    keyManager.loadHDChain(hdChain);
 
     // Load mnemonic for recovery
     // First try to load mnemonic (new format), then fall back to seed_hex (old format)
@@ -390,9 +390,11 @@ export class WalletDB {
       
       if (mnemonic) {
         keyManager.setHDSeedFromMnemonic(mnemonic);
+        walletFound = true;
       } else if (seedHex) {
         // Legacy: load from seed hex (may not roundtrip correctly)
         keyManager.loadMasterSeed(seedHex);
+        walletFound = true;
       }
     }
 
@@ -402,6 +404,7 @@ export class WalletDB {
       const row = viewKeyResult[0].values[0];
       const viewKey = this.deserializeViewKey(row[1] as string);
       keyManager.loadViewKey(viewKey);
+      walletFound = true;
     }
 
     // Load spend key
@@ -410,6 +413,11 @@ export class WalletDB {
       const row = spendKeyResult[0].values[0];
       const publicKey = this.deserializePublicKey(row[0] as string);
       keyManager.loadSpendKey(publicKey);
+      walletFound = true;
+    }
+
+    if (!walletFound) {
+      throw new Error('No wallet found in database');
     }
 
     // Load keys
@@ -560,6 +568,36 @@ export class WalletDB {
     await this.saveWallet(keyManager);
 
     // Save wallet metadata with restore height
+    await this.saveWalletMetadata({
+      creationHeight: creationHeight ?? 0,
+      creationTime: Date.now(),
+      restoredFromSeed: true,
+    });
+
+    this.keyManager = keyManager;
+    return keyManager;
+  }
+
+  /**
+   * Restore a watch-only wallet from a BLSCT audit key.
+   * Format matches navio-core getblsctauditkey / IMPORT_VIEW_KEY:
+   * 32-byte private view key || 48-byte public spending key.
+   */
+  async restoreWalletFromAuditKey(auditKeyHex: string, creationHeight?: number): Promise<KeyManager> {
+    if (!this.opened || !this.adapter) {
+      throw new Error('Database not open. Call open() first.');
+    }
+    if (!/^[0-9a-fA-F]{160}$/.test(auditKeyHex)) {
+      throw new Error('Audit key must be 160 hex characters long');
+    }
+
+    const keyManager = new KeyManager();
+    const imported = keyManager.setupGeneration(this.hexToBytes(auditKeyHex), 'IMPORT_VIEW_KEY');
+    if (!imported) {
+      throw new Error('Failed to import audit key');
+    }
+
+    await this.saveWallet(keyManager);
     await this.saveWalletMetadata({
       creationHeight: creationHeight ?? 0,
       creationTime: Date.now(),

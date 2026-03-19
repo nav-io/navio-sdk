@@ -173,11 +173,18 @@ export interface NavioClientConfig {
   restoreFromMnemonic?: string;
 
   /**
-   * Block height to start scanning from when restoring a wallet from seed or mnemonic.
+   * Restore a watch-only wallet from a BLSCT audit key.
+   * Format matches navio-core getblsctauditkey / IMPORT_VIEW_KEY:
+   * 32-byte private view key || 48-byte public spending key.
+   */
+  restoreFromAuditKey?: string;
+
+  /**
+   * Block height to start scanning from when restoring a wallet from seed, mnemonic, or audit key.
    * This is the height when the wallet was originally created.
    * Setting this avoids scanning blocks before the wallet existed.
    *
-   * Note: This option is only used when `restoreFromSeed` is provided.
+   * Note: This option is only used when a restore input is provided.
    * For newly created wallets, the creation height is automatically set
    * to the current chain tip minus a safety margin (100 blocks).
    *
@@ -283,6 +290,14 @@ export class NavioClient {
     }
     if (this.config.backend === 'p2p' && !this.config.p2p) {
       throw new Error('P2P options required when backend is "p2p"');
+    }
+    const restoreSources = [
+      this.config.restoreFromSeed,
+      this.config.restoreFromMnemonic,
+      this.config.restoreFromAuditKey,
+    ].filter((value) => value !== undefined);
+    if (restoreSources.length > 1) {
+      throw new Error('Specify only one of restoreFromSeed, restoreFromMnemonic, or restoreFromAuditKey');
     }
 
     // Create sync provider based on backend type
@@ -395,6 +410,18 @@ export class NavioClient {
 
       // Connect to backend
       await this.syncProvider.connect();
+    } else if (this.config.restoreFromAuditKey) {
+      // Restore watch-only wallet from audit key with user-provided height (or 0 to scan from genesis)
+      this.keyManager = await this.walletDB.restoreWalletFromAuditKey(
+        this.config.restoreFromAuditKey,
+        this.config.restoreFromHeight
+      );
+
+      // Set KeyManager for sync manager (enables output detection)
+      this.syncManager.setKeyManager(this.keyManager);
+
+      // Connect to backend
+      await this.syncProvider.connect();
     } else {
       // Try to load existing wallet
       let walletLoaded = false;
@@ -459,6 +486,23 @@ export class NavioClient {
       throw new Error('Client not initialized. Call initialize() first.');
     }
     return this.keyManager;
+  }
+
+  /**
+   * Export the BLSCT audit key as hex.
+   * Format matches navio-core getblsctauditkey / IMPORT_VIEW_KEY payload:
+   *   32-byte private view key || 48-byte public spending key
+   */
+  getAuditKeyHex(): string {
+    return this.getKeyManager().getAuditKeyHex();
+  }
+
+  /**
+   * Backward-compatible alias for the audit key export.
+   * @deprecated Use getAuditKeyHex()
+   */
+  getWalletViewKeyHex(): string {
+    return this.getAuditKeyHex();
   }
 
   /**

@@ -193,36 +193,49 @@ export class IndexedDBWalletDB implements IWalletDB {
 
   async loadWallet(): Promise<KeyManager> {
     const km = new KeyManager();
+    let walletFound = false;
 
     const hdRec = await this.get<any>('config', 'hdChain');
-    if (!hdRec) throw new Error('No wallet found in database');
-
-    const hdChain: HDChain = {
-      version: hdRec.version,
-      seedId: this.hexToBytes(hdRec.seedId),
-      spendId: this.hexToBytes(hdRec.spendId),
-      viewId: this.hexToBytes(hdRec.viewId),
-      tokenId: this.hexToBytes(hdRec.tokenId),
-      blindingId: this.hexToBytes(hdRec.blindingId),
-    };
-    km.loadHDChain(hdChain);
+    if (hdRec) {
+      const hdChain: HDChain = {
+        version: hdRec.version,
+        seedId: this.hexToBytes(hdRec.seedId),
+        spendId: this.hexToBytes(hdRec.spendId),
+        viewId: this.hexToBytes(hdRec.viewId),
+        tokenId: this.hexToBytes(hdRec.tokenId),
+        blindingId: this.hexToBytes(hdRec.blindingId),
+      };
+      km.loadHDChain(hdChain);
+      walletFound = true;
+    }
 
     const seedRec = await this.get<any>('config', 'mnemonic');
     if (seedRec) {
-      if (seedRec.mnemonic) km.setHDSeedFromMnemonic(seedRec.mnemonic);
-      else if (seedRec.seedHex) km.loadMasterSeed(seedRec.seedHex);
+      if (seedRec.mnemonic) {
+        km.setHDSeedFromMnemonic(seedRec.mnemonic);
+        walletFound = true;
+      } else if (seedRec.seedHex) {
+        km.loadMasterSeed(seedRec.seedHex);
+        walletFound = true;
+      }
     }
 
     const viewRec = await this.get<any>('config', 'viewKey');
     if (viewRec) {
       const viewKey = this.deserializeViewKey(viewRec.secretKey);
       km.loadViewKey(viewKey);
+      walletFound = true;
     }
 
     const spendRec = await this.get<any>('config', 'spendKey');
     if (spendRec) {
       const pk = this.deserializePublicKey(spendRec.publicKey);
       km.loadSpendKey(pk);
+      walletFound = true;
+    }
+
+    if (!walletFound) {
+      throw new Error('No wallet found in database');
     }
 
     const keys = await this.getAll<any>('keys');
@@ -307,6 +320,29 @@ export class IndexedDBWalletDB implements IWalletDB {
     km.newSubAddressPool(0);
     km.newSubAddressPool(-1);
     km.newSubAddressPool(-2);
+
+    await this.saveWallet(km);
+    await this.saveWalletMetadata({
+      creationHeight: creationHeight ?? 0,
+      creationTime: Date.now(),
+      restoredFromSeed: true,
+      version: 1,
+    });
+
+    this.keyManager = km;
+    return km;
+  }
+
+  async restoreWalletFromAuditKey(auditKeyHex: string, creationHeight?: number): Promise<KeyManager> {
+    if (!/^[0-9a-fA-F]{160}$/.test(auditKeyHex)) {
+      throw new Error('Audit key must be 160 hex characters long');
+    }
+
+    const km = new KeyManager();
+    const imported = km.setupGeneration(this.hexToBytes(auditKeyHex), 'IMPORT_VIEW_KEY');
+    if (!imported) {
+      throw new Error('Failed to import audit key');
+    }
 
     await this.saveWallet(km);
     await this.saveWalletMetadata({

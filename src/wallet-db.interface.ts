@@ -88,6 +88,7 @@ export interface IWalletDB {
   loadWallet(): Promise<KeyManager>;
   createWallet(creationHeight?: number): Promise<KeyManager>;
   restoreWallet(seedHex: string, creationHeight?: number): Promise<KeyManager>;
+  restoreWalletFromAuditKey(auditKeyHex: string, creationHeight?: number): Promise<KeyManager>;
   restoreWalletFromMnemonic(mnemonic: string, creationHeight?: number): Promise<KeyManager>;
   saveWallet(keyManager?: KeyManager): Promise<void>;
   getKeyManager(): KeyManager | null;

@@ -44,4 +44,56 @@ describe('NavioClient', () => {
       });
     }).toThrow('Electrum options required when backend is "electrum"');
   });
+
+  it('should export the audit key from the key manager', () => {
+    const client = new NavioClient({
+      network: 'testnet',
+      backend: 'electrum',
+      electrum: {
+        host: 'testnet.nav.io',
+        port: 50005,
+      },
+      walletDbPath: 'test-client-wallet.db',
+    });
+
+    const getAuditKeyHex = 'ab'.repeat(80);
+    (client as any).keyManager = {
+      getAuditKeyHex: () => getAuditKeyHex,
+    };
+
+    expect(client.getAuditKeyHex()).toBe(getAuditKeyHex);
+    expect(client.getWalletViewKeyHex()).toBe(getAuditKeyHex);
+  });
+
+  it('should accept audit-key restore config', () => {
+    const auditKeyHex = 'ab'.repeat(80);
+    const client = new NavioClient({
+      network: 'testnet',
+      backend: 'electrum',
+      electrum: {
+        host: 'testnet.nav.io',
+        port: 50005,
+      },
+      walletDbPath: 'test-client-wallet.db',
+      restoreFromAuditKey: auditKeyHex,
+    });
+
+    expect(client.getConfig().restoreFromAuditKey).toBe(auditKeyHex);
+  });
+
+  it('should reject multiple restore sources', () => {
+    expect(() => {
+      new NavioClient({
+        network: 'testnet',
+        backend: 'electrum',
+        electrum: {
+          host: 'testnet.nav.io',
+          port: 50005,
+        },
+        walletDbPath: 'test-client-wallet.db',
+        restoreFromMnemonic: 'word1 word2',
+        restoreFromAuditKey: 'ab'.repeat(80),
+      });
+    }).toThrow('Specify only one of restoreFromSeed, restoreFromMnemonic, or restoreFromAuditKey');
+  });
 });
