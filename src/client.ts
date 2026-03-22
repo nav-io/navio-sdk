@@ -27,6 +27,9 @@ const {
   Scalar, PublicKey, SubAddr,
   Address, TokenId, CTxId, OutPoint, TxIn, TxOut,
   TxOutputType, PrivSpendingKey,
+  CTx, UnsignedInput, UnsignedOutput, UnsignedTransaction,
+  TokenInfo, TokenType,
+  calcCollectionTokenHashHex, deriveCollectionTokenKeyFromMaster, deriveCollectionTokenPublicKeyFromMaster,
   buildCTx, createTxInVec, addToTxInVec, createTxOutVec, addToTxOutVec,
   deleteTxInVec, deleteTxOutVec, freeObj, getCTxId, serializeCTx,
 } = blsctModule as any;
@@ -75,6 +78,15 @@ export type NetworkType = 'mainnet' | 'testnet' | 'signet' | 'regtest';
  * Fee per input+output in satoshis (matches navio-core default)
  */
 const DEFAULT_FEE_PER_COMPONENT = 200_000;
+const TOKEN_HASH_HEX_LENGTH = 64;
+const TOKEN_ID_HEX_LENGTH = 80;
+const TOKEN_ID_SUBID_HEX_LENGTH = 16;
+const TOKEN_ID_NO_SUBID_HEX = 'f'.repeat(TOKEN_ID_SUBID_HEX_LENGTH);
+const DEFAULT_NAV_TOKEN_HASH_HEX = '0'.repeat(TOKEN_HASH_HEX_LENGTH);
+const DEFAULT_NAV_STORED_TOKEN_ID_HEX = DEFAULT_NAV_TOKEN_HASH_HEX + TOKEN_ID_NO_SUBID_HEX;
+const MAX_UINT64 = (1n << 64n) - 1n;
+const MAX_SAFE_INTEGER_BIGINT = BigInt(Number.MAX_SAFE_INTEGER);
+const BLSCT_DEFAULT_FEE_RATE = 125n;
 
 /**
  * Options for sending a transaction
@@ -99,6 +111,83 @@ export interface SendTransactionOptions {
 }
 
 /**
+ * Options for sending a fungible token.
+ */
+export interface SendTokenOptions extends Omit<SendTransactionOptions, 'tokenId'> {
+  /**
+   * Token ID to spend.
+   * Accepts either:
+   * - a 64-hex collection token hash from navio-core RPCs, or
+   * - an 80-hex token ID in the same byte order (`token hash || subid`).
+   */
+  tokenId: string;
+}
+
+/**
+ * Options for sending a single NFT.
+ */
+export interface SendNftOptions extends Omit<SendTransactionOptions, 'tokenId' | 'amount' | 'subtractFeeFromAmount'> {
+  /**
+   * Full 80-hex NFT token ID in navio-core/RPC byte order.
+   * Optional when `collectionTokenId` + `nftId` are provided.
+   */
+  tokenId?: string;
+  /**
+   * Collection token ID.
+   * Accepts either:
+   * - a 64-hex collection token hash from navio-core RPCs, or
+   * - an 80-hex token ID with `ffffffffffffffff` as the subid suffix.
+   */
+  collectionTokenId?: string;
+  /** NFT id within the collection. Required with `collectionTokenId`. */
+  nftId?: bigint | number;
+}
+
+export type TokenMetadata = Record<string, string>;
+
+export interface CreateTokenCollectionOptions {
+  /** Metadata embedded in the collection predicate. */
+  metadata?: TokenMetadata;
+  /** Maximum total supply allowed for the collection. */
+  totalSupply: bigint | number;
+  /** Optional NAV UTXOs to fund the transaction fee. */
+  selectedUtxos?: string[];
+}
+
+export interface CreateNftCollectionOptions {
+  /** Metadata embedded in the collection predicate. */
+  metadata?: TokenMetadata;
+  /** Optional maximum total supply recorded for the collection. Defaults to 0. */
+  totalSupply?: bigint | number;
+  /** Optional NAV UTXOs to fund the transaction fee. */
+  selectedUtxos?: string[];
+}
+
+export interface MintTokenOptions {
+  /** Destination address receiving the minted fungible token output. */
+  address: string;
+  /** Collection token ID or collection token hash. */
+  collectionTokenId: string;
+  /** Amount of fungible tokens to mint. */
+  amount: bigint | number;
+  /** Optional NAV UTXOs to fund the transaction fee. */
+  selectedUtxos?: string[];
+}
+
+export interface MintNftOptions {
+  /** Destination address receiving the minted NFT. */
+  address: string;
+  /** Collection token ID or collection token hash. */
+  collectionTokenId: string;
+  /** NFT sub-id within the collection. */
+  nftId: bigint | number;
+  /** Metadata embedded in the mint predicate. */
+  metadata?: TokenMetadata;
+  /** Optional NAV UTXOs to fund the transaction fee. */
+  selectedUtxos?: string[];
+}
+
+/**
  * Result of a sent transaction
  */
 export interface SendTransactionResult {
@@ -112,6 +201,253 @@ export interface SendTransactionResult {
   inputCount: number;
   /** Outputs created (including change) */
   outputCount: number;
+}
+
+export type WalletAssetKind = 'token' | 'nft';
+
+/**
+ * Current balance summary for a wallet-owned asset.
+ */
+export interface WalletAssetBalance {
+  /** Asset token ID */
+  tokenId: string;
+  /** Asset type derived from token ID shape */
+  kind: WalletAssetKind;
+  /** Current unspent balance for this asset */
+  balance: bigint;
+  /** Number of unspent outputs contributing to the balance */
+  outputCount: number;
+  /** Collection token ID for NFTs, otherwise null */
+  collectionTokenId: string | null;
+  /** NFT sub-id for NFTs, otherwise null */
+  nftId: bigint | null;
+}
+
+export interface CreateCollectionResult extends SendTransactionResult {
+  /** Asset type for the created collection. */
+  kind: WalletAssetKind;
+  /** Collection token ID in navio-core/RPC byte order. */
+  collectionTokenId: string;
+  /** Derived collection token public key. */
+  tokenPublicKey: string;
+}
+
+export interface MintAssetResult extends SendTransactionResult {
+  /** Asset type for the minted output. */
+  kind: WalletAssetKind;
+  /** Collection token ID in navio-core/RPC byte order. */
+  collectionTokenId: string;
+  /** Token ID of the minted asset in navio-core/RPC byte order. */
+  tokenId: string;
+  /** Derived collection token public key. */
+  tokenPublicKey: string;
+}
+
+function reverseHexBytes(hex: string): string {
+  if (hex.length % 2 !== 0) {
+    throw new Error('Hex string must have an even length');
+  }
+
+  const bytes = hex.match(/../g);
+  if (!bytes) {
+    return '';
+  }
+  return bytes.reverse().join('');
+}
+
+function normalizeHex(tokenIdHex: string): string {
+  const normalized = tokenIdHex.trim().toLowerCase();
+  if (!/^[0-9a-f]+$/.test(normalized)) {
+    throw new Error('Token ID must be hexadecimal');
+  }
+  return normalized;
+}
+
+function normalizePublicTokenIdHex(tokenIdHex: string): string {
+  const normalized = normalizeHex(tokenIdHex);
+  if (normalized.length === TOKEN_HASH_HEX_LENGTH) {
+    return normalized;
+  }
+  if (normalized.length !== TOKEN_ID_HEX_LENGTH) {
+    throw new Error(`Invalid tokenId length: expected ${TOKEN_HASH_HEX_LENGTH} or ${TOKEN_ID_HEX_LENGTH} hex chars`);
+  }
+  const tokenHashHex = normalized.slice(0, TOKEN_HASH_HEX_LENGTH);
+  const subidHex = normalized.slice(TOKEN_HASH_HEX_LENGTH);
+  return subidHex === TOKEN_ID_NO_SUBID_HEX ? tokenHashHex : normalized;
+}
+
+function normalizeStoredTokenIdHex(tokenIdHex: string): string {
+  const normalized = normalizeHex(tokenIdHex);
+  if (normalized.length === TOKEN_ID_HEX_LENGTH) {
+    return normalized;
+  }
+  if (normalized.length === 128) {
+    return normalized.slice(0, TOKEN_ID_HEX_LENGTH);
+  }
+  throw new Error(`Invalid stored tokenId length: expected ${TOKEN_ID_HEX_LENGTH} or 128 hex chars`);
+}
+
+function publicToStoredTokenIdHex(tokenIdHex: string): string {
+  const normalized = normalizePublicTokenIdHex(tokenIdHex);
+  const fullTokenId = normalized.length === TOKEN_HASH_HEX_LENGTH
+    ? normalized + TOKEN_ID_NO_SUBID_HEX
+    : normalized;
+  return reverseHexBytes(fullTokenId.slice(0, TOKEN_HASH_HEX_LENGTH)) + fullTokenId.slice(TOKEN_HASH_HEX_LENGTH);
+}
+
+function storedToPublicTokenIdHex(tokenIdHex: string): string {
+  const normalized = normalizeStoredTokenIdHex(tokenIdHex);
+  const tokenHashHex = reverseHexBytes(normalized.slice(0, TOKEN_HASH_HEX_LENGTH));
+  const subidHex = normalized.slice(TOKEN_HASH_HEX_LENGTH);
+  return subidHex === TOKEN_ID_NO_SUBID_HEX ? tokenHashHex : tokenHashHex + subidHex;
+}
+
+function normalizeTokenIdHex(tokenIdHex: string): string {
+  return normalizePublicTokenIdHex(tokenIdHex);
+}
+
+function getTokenIdCandidates(tokenIdHex: string): string[] {
+  const normalized = normalizeHex(tokenIdHex);
+  if (normalized.length === TOKEN_HASH_HEX_LENGTH) {
+    return [normalizePublicTokenIdHex(normalized)];
+  }
+
+  if (normalized.length !== TOKEN_ID_HEX_LENGTH) {
+    throw new Error(`Invalid tokenId length: expected ${TOKEN_HASH_HEX_LENGTH} or ${TOKEN_ID_HEX_LENGTH} hex chars`);
+  }
+
+  const publicCandidate = normalizePublicTokenIdHex(normalized);
+  const legacySerializedCandidate = storedToPublicTokenIdHex(normalized);
+  return legacySerializedCandidate === publicCandidate
+    ? [publicCandidate]
+    : [publicCandidate, legacySerializedCandidate];
+}
+
+function toPublicTokenId(tokenIdHex: string | null): string | null {
+  if (tokenIdHex === null) {
+    return null;
+  }
+
+  const normalizedStoredTokenId = normalizeStoredTokenIdHex(tokenIdHex);
+  if (normalizedStoredTokenId === DEFAULT_NAV_STORED_TOKEN_ID_HEX) {
+    return null;
+  }
+
+  const publicTokenId = storedToPublicTokenIdHex(normalizedStoredTokenId);
+  return publicTokenId === DEFAULT_NAV_TOKEN_HASH_HEX ? null : publicTokenId;
+}
+
+function encodeUint64LEHex(value: bigint): string {
+  if (value < 0n || value > MAX_UINT64) {
+    throw new Error(`NFT id must be between 0 and ${MAX_UINT64.toString()}`);
+  }
+
+  let remaining = value;
+  let hex = '';
+  for (let i = 0; i < 8; i++) {
+    hex += Number(remaining & 0xffn).toString(16).padStart(2, '0');
+    remaining >>= 8n;
+  }
+  return hex;
+}
+
+function composeNftTokenId(collectionTokenIdHex: string, nftId: bigint | number): string {
+  const collectionTokenId = normalizeTokenIdHex(collectionTokenIdHex);
+  const normalizedNftId = typeof nftId === 'bigint' ? nftId : BigInt(nftId);
+  const tokenHashHex = collectionTokenId.slice(0, TOKEN_HASH_HEX_LENGTH);
+  return tokenHashHex + encodeUint64LEHex(normalizedNftId);
+}
+
+function describeTokenId(tokenIdHex: string): Pick<WalletAssetBalance, 'kind' | 'collectionTokenId' | 'nftId'> {
+  const normalizedTokenId = normalizeTokenIdHex(tokenIdHex);
+  if (normalizedTokenId.length === TOKEN_HASH_HEX_LENGTH) {
+    return {
+      kind: 'token',
+      collectionTokenId: normalizedTokenId,
+      nftId: null,
+    };
+  }
+
+  const subidHex = normalizedTokenId.slice(TOKEN_ID_HEX_LENGTH - TOKEN_ID_SUBID_HEX_LENGTH);
+
+  if (subidHex === TOKEN_ID_NO_SUBID_HEX) {
+    return {
+      kind: 'token',
+      collectionTokenId: normalizedTokenId.slice(0, TOKEN_HASH_HEX_LENGTH),
+      nftId: null,
+    };
+  }
+
+  const nftIdBytes = Buffer.from(subidHex, 'hex');
+  const nftId = nftIdBytes.reduceRight((acc, byte) => (acc << 8n) + BigInt(byte), 0n);
+
+  return {
+    kind: 'nft',
+    collectionTokenId: normalizedTokenId.slice(0, TOKEN_HASH_HEX_LENGTH),
+    nftId,
+  };
+}
+
+function normalizeCollectionTokenHashHex(tokenIdHex: string): string {
+  const normalizedTokenId = normalizeTokenIdHex(tokenIdHex);
+  const tokenInfo = describeTokenId(normalizedTokenId);
+  if (tokenInfo.kind !== 'token' || !tokenInfo.collectionTokenId) {
+    throw new Error('collectionTokenId must reference a fungible collection token hash.');
+  }
+  return tokenInfo.collectionTokenId;
+}
+
+function normalizeTokenMetadata(metadata?: TokenMetadata): TokenMetadata {
+  if (!metadata) {
+    return {};
+  }
+
+  return Object.fromEntries(Object.entries(metadata).map(([key, value]) => {
+    if (typeof value !== 'string') {
+      throw new Error(`Metadata value for "${key}" must be a string.`);
+    }
+    return [key, value];
+  }));
+}
+
+function toSafeInteger(value: bigint | number, fieldName: string): number {
+  const bigintValue = typeof value === 'bigint' ? value : BigInt(value);
+
+  if (bigintValue < 0n) {
+    throw new Error(`${fieldName} must be non-negative`);
+  }
+  if (bigintValue > MAX_SAFE_INTEGER_BIGINT) {
+    throw new Error(`${fieldName} exceeds JavaScript's safe integer range`);
+  }
+
+  return Number(bigintValue);
+}
+
+function mapOutputToPublic(output: WalletOutput): WalletOutput {
+  let tokenId = output.tokenId;
+  try {
+    tokenId = toPublicTokenId(output.tokenId);
+  } catch {
+    tokenId = output.tokenId;
+  }
+
+  return {
+    ...output,
+    tokenId,
+  };
+}
+
+function resolveRequestedTokenId(tokenIdHex: string, outputs: readonly Pick<WalletOutput, 'tokenId'>[]): string {
+  const candidates = getTokenIdCandidates(tokenIdHex);
+  if (candidates.length === 1) {
+    return candidates[0];
+  }
+
+  const matchedCandidates = candidates.filter((candidate) =>
+    outputs.some((output) => output.tokenId === candidate)
+  );
+
+  return matchedCandidates.length === 1 ? matchedCandidates[0] : candidates[0];
 }
 
 /**
@@ -902,6 +1238,16 @@ export class NavioClient {
     if (!this.walletDB) {
       throw new Error('Client not initialized');
     }
+    if (tokenId !== null) {
+      const outputs = await this.getAllOutputs();
+      const resolvedTokenId = resolveRequestedTokenId(tokenId, outputs);
+      return outputs.reduce((total, output) => {
+        if (output.isSpent || output.tokenId !== resolvedTokenId) {
+          return total;
+        }
+        return total + output.amount;
+      }, 0n);
+    }
     return this.walletDB.getBalance(tokenId);
   }
 
@@ -916,11 +1262,95 @@ export class NavioClient {
   }
 
   /**
+   * Get the current balance for a specific token or NFT.
+   * @param tokenId - Asset token ID
+   * @returns Balance in raw on-chain units
+   */
+  async getTokenBalance(tokenId: string): Promise<bigint> {
+    return this.getBalance(tokenId);
+  }
+
+  /**
+   * Get unspent outputs for a specific token or NFT.
+   * @param tokenId - Asset token ID
+   * @returns Matching unspent outputs
+   */
+  async getTokenOutputs(tokenId: string): Promise<WalletOutput[]> {
+    return this.getUnspentOutputs(tokenId);
+  }
+
+  /**
+   * Get current balances for all non-NAV assets owned by the wallet.
+   * Aggregates unspent outputs by token ID.
+   */
+  async getAssetBalances(): Promise<WalletAssetBalance[]> {
+    if (!this.walletDB) {
+      throw new Error('Client not initialized');
+    }
+
+    const outputs = await this.getAllOutputs();
+    const balances = new Map<string, WalletAssetBalance>();
+
+    for (const output of outputs) {
+      if (output.isSpent || output.tokenId === null) {
+        continue;
+      }
+
+      const current = balances.get(output.tokenId);
+      if (current) {
+        current.balance += output.amount;
+        current.outputCount += 1;
+        continue;
+      }
+
+      let tokenInfo: Pick<WalletAssetBalance, 'kind' | 'collectionTokenId' | 'nftId'>;
+      try {
+        tokenInfo = describeTokenId(output.tokenId);
+      } catch {
+        // Skip malformed token IDs from older sync data instead of failing the whole asset view.
+        continue;
+      }
+      balances.set(output.tokenId, {
+        tokenId: output.tokenId,
+        balance: output.amount,
+        outputCount: 1,
+        ...tokenInfo,
+      });
+    }
+
+    return [...balances.values()].sort((a, b) => a.tokenId.localeCompare(b.tokenId));
+  }
+
+  /**
+   * Get current balances for all fungible tokens owned by the wallet.
+   */
+  async getTokenBalances(): Promise<WalletAssetBalance[]> {
+    return (await this.getAssetBalances()).filter((asset) => asset.kind === 'token');
+  }
+
+  /**
+   * Get current balances for all NFTs owned by the wallet.
+   */
+  async getNftBalances(): Promise<WalletAssetBalance[]> {
+    return (await this.getAssetBalances()).filter((asset) => asset.kind === 'nft');
+  }
+
+  /**
    * Get the total amount locked in unconfirmed (mempool) spends, in satoshis.
    */
   async getPendingSpentAmount(tokenId: string | null = null): Promise<bigint> {
     if (!this.walletDB) {
       throw new Error('Client not initialized');
+    }
+    if (tokenId !== null) {
+      const outputs = await this.getAllOutputs();
+      const resolvedTokenId = resolveRequestedTokenId(tokenId, outputs);
+      return outputs.reduce((total, output) => {
+        if (!output.isSpent || output.spentBlockHeight !== 0 || output.tokenId !== resolvedTokenId) {
+          return total;
+        }
+        return total + output.amount;
+      }, 0n);
     }
     return this.walletDB.getPendingSpentAmount(tokenId);
   }
@@ -942,7 +1372,17 @@ export class NavioClient {
     if (!this.walletDB) {
       throw new Error('Client not initialized');
     }
-    return this.walletDB.getUnspentOutputs(tokenId);
+    const outputs = await this.getAllOutputs();
+    const resolvedTokenId = tokenId === null ? null : resolveRequestedTokenId(tokenId, outputs);
+    return outputs.filter((output) => {
+      if (output.isSpent) {
+        return false;
+      }
+      if (resolvedTokenId === null) {
+        return output.tokenId === null;
+      }
+      return output.tokenId === resolvedTokenId;
+    });
   }
 
   /**
@@ -953,7 +1393,7 @@ export class NavioClient {
     if (!this.walletDB) {
       throw new Error('Client not initialized');
     }
-    return this.walletDB.getAllOutputs();
+    return (await this.walletDB.getAllOutputs()).map(mapOutputToPublic);
   }
 
   // ============================================================
@@ -980,18 +1420,7 @@ export class NavioClient {
    * ```
    */
   async sendTransaction(options: SendTransactionOptions): Promise<SendTransactionResult> {
-    if (!this.initialized) {
-      await this.initialize();
-    }
-    if (!this.keyManager || !this.walletDB) {
-      throw new Error('Client not initialized');
-    }
-    if (!this.isConnected()) {
-      throw new Error('Not connected to backend. Please reconnect before sending.');
-    }
-    if (!this.keyManager.isUnlocked()) {
-      throw new Error('Wallet is locked. Unlock it before sending.');
-    }
+    const { walletDB } = await this.ensureSpendReady();
 
     const {
       address,
@@ -1009,8 +1438,189 @@ export class NavioClient {
     // --- Decode destination address ---
     const destSubAddr = NavioClient.decodeAddress(address);
 
+    if (tokenId !== null) {
+      if (subtractFeeFromAmount) {
+        throw new Error('subtractFeeFromAmount is not supported for token or NFT sends. Fees are paid with NAV.');
+      }
+
+      const allOutputs = await this.getAllOutputs();
+      const normalizedTokenId = resolveRequestedTokenId(tokenId, allOutputs);
+      const blsctTokenId = TokenId.deserialize(publicToStoredTokenIdHex(normalizedTokenId));
+      const requestedAssetOutputs = allOutputs.filter((output) => !output.isSpent && output.tokenId === normalizedTokenId);
+      const navOutputs = allOutputs.filter((output) => !output.isSpent && output.tokenId === null);
+      const confirmedAssetOutputs = requestedAssetOutputs.filter((output) => output.blockHeight > 0);
+      const confirmedNavOutputs = navOutputs.filter((output) => output.blockHeight > 0);
+
+      const manualHashes = selectedUtxos ?? [];
+      const manualAssetByHash = new Map(confirmedAssetOutputs.map((output) => [output.outputHash, output]));
+      const manualNavByHash = new Map(confirmedNavOutputs.map((output) => [output.outputHash, output]));
+
+      const manualAssetOutputs: WalletOutput[] = [];
+      const manualNavOutputs: WalletOutput[] = [];
+      if (manualHashes.length > 0) {
+        const spendableOutputHashes = new Set([
+          ...requestedAssetOutputs.map((output) => output.outputHash),
+          ...navOutputs.map((output) => output.outputHash),
+        ]);
+
+        for (const hash of manualHashes) {
+          const assetOutput = manualAssetByHash.get(hash);
+          if (assetOutput) {
+            manualAssetOutputs.push(assetOutput);
+            continue;
+          }
+
+          const navOutput = manualNavByHash.get(hash);
+          if (navOutput) {
+            manualNavOutputs.push(navOutput);
+            continue;
+          }
+
+          if (spendableOutputHashes.has(hash)) {
+            throw new Error(`Selected UTXO is unconfirmed and cannot be spent yet: ${hash.slice(0, 16)}...`);
+          }
+          throw new Error(`Selected UTXO not found or not spendable: ${hash.slice(0, 16)}...`);
+        }
+      }
+
+      let selectedAssetOutputs: WalletOutput[];
+      let totalAssetIn: bigint;
+
+      if (manualAssetOutputs.length > 0) {
+        selectedAssetOutputs = manualAssetOutputs;
+        totalAssetIn = manualAssetOutputs.reduce((sum, output) => sum + output.amount, 0n);
+      } else {
+        if (confirmedAssetOutputs.length === 0) {
+          if (requestedAssetOutputs.length > 0) {
+            throw new Error('All requested asset outputs are unconfirmed. Wait for block confirmation before spending.');
+          }
+          throw new Error('No unspent outputs available for the requested asset.');
+        }
+        ({ selected: selectedAssetOutputs, totalIn: totalAssetIn } = NavioClient.selectInputsByAmount(
+          confirmedAssetOutputs,
+          amount,
+        ));
+      }
+
+      if (totalAssetIn < amount) {
+        throw new Error(
+          `Insufficient asset funds: need ${amount} units but only have ${totalAssetIn} units available`
+        );
+      }
+
+      const assetChangeAmount = totalAssetIn - amount;
+      let selectedNavOutputs = manualNavOutputs;
+      let totalNavIn = manualNavOutputs.reduce((sum, output) => sum + output.amount, 0n);
+      let fee = 0n;
+      let includeNavChange = selectedNavOutputs.length > 0;
+
+      for (let attempt = 0; attempt < 6; attempt++) {
+        if (manualNavOutputs.length === 0 && selectedNavOutputs.length === 0) {
+          if (confirmedNavOutputs.length === 0) {
+            if (navOutputs.length > 0) {
+              throw new Error('All NAV outputs available for fees are unconfirmed. Wait for block confirmation before spending.');
+            }
+            throw new Error('No unspent NAV outputs available to fund the transaction fee.');
+          }
+
+          ({ selected: selectedNavOutputs, totalIn: totalNavIn } = NavioClient.selectInputsByAmount(
+            confirmedNavOutputs,
+            1n,
+          ));
+        }
+
+        const candidateOutputs = this.buildUnsignedSendOutputs(
+          destSubAddr,
+          blsctTokenId,
+          amount,
+          memo,
+          assetChangeAmount,
+          includeNavChange ? 1n : 0n,
+        );
+        const candidateInputs = [
+          ...selectedAssetOutputs.map((output) => ({ output, tokenId: blsctTokenId })),
+          ...selectedNavOutputs.map((output) => ({ output, tokenId: TokenId.default() })),
+        ];
+        const estimatedFee = this.estimateSignedUnsignedTransactionFee(candidateInputs, candidateOutputs);
+
+        if (manualNavOutputs.length > 0) {
+          if (totalNavIn < estimatedFee) {
+            throw new Error(
+              `Insufficient NAV funds for fees: need ${estimatedFee} sat but only have ${totalNavIn} sat selected`
+            );
+          }
+        } else if (totalNavIn < estimatedFee) {
+          ({ selected: selectedNavOutputs, totalIn: totalNavIn } = NavioClient.selectInputsByAmount(
+            confirmedNavOutputs,
+            estimatedFee,
+          ));
+          if (totalNavIn < estimatedFee) {
+            throw new Error(
+              `Insufficient NAV funds for fees: need ${estimatedFee} sat but only have ${totalNavIn} sat available`
+            );
+          }
+        }
+
+        const nextIncludeNavChange = totalNavIn > estimatedFee;
+        if (estimatedFee === fee && nextIncludeNavChange === includeNavChange) {
+          fee = estimatedFee;
+          includeNavChange = nextIncludeNavChange;
+          break;
+        }
+
+        fee = estimatedFee;
+        includeNavChange = nextIncludeNavChange;
+      }
+
+      const navChangeAmount = totalNavIn - fee;
+      const selectedInputs = [
+        ...selectedAssetOutputs.map((output) => ({ output, tokenId: blsctTokenId })),
+        ...selectedNavOutputs.map((output) => ({ output, tokenId: TokenId.default() })),
+      ];
+      const outputs = this.buildUnsignedSendOutputs(
+        destSubAddr,
+        blsctTokenId,
+        amount,
+        memo,
+        assetChangeAmount,
+        navChangeAmount,
+      );
+
+      return this.signAndBroadcastUnsignedTransaction(walletDB, selectedInputs, outputs, fee);
+    }
+
     // --- Select inputs ---
-    const allUtxos = await this.walletDB.getUnspentOutputs(tokenId);
+    const allOutputs = tokenId === null ? null : await walletDB.getAllOutputs();
+    const normalizedTokenCandidates = tokenId === null ? null : getTokenIdCandidates(tokenId);
+    const normalizedTokenId = normalizedTokenCandidates === null
+      ? null
+      : allOutputs?.reduce<string | null>((matched, output) => {
+        if (matched !== null) {
+          return matched;
+        }
+        try {
+          const publicTokenId = toPublicTokenId(output.tokenId);
+          return publicTokenId !== null && normalizedTokenCandidates.includes(publicTokenId)
+            ? publicTokenId
+            : null;
+        } catch {
+          return null;
+        }
+      }, null) ?? normalizedTokenCandidates[0];
+
+    const allUtxos = tokenId === null
+      ? await walletDB.getUnspentOutputs(null)
+      : (allOutputs ?? []).filter((utxo) => {
+        if (utxo.isSpent) {
+          return false;
+        }
+
+        try {
+          return toPublicTokenId(utxo.tokenId) === normalizedTokenId;
+        } catch {
+          return false;
+        }
+      });
 
     // Filter out unconfirmed (mempool) outputs – they have synthetic output
     // hashes that are not valid CTxIds and cannot be spent until confirmed.
@@ -1019,7 +1629,7 @@ export class NavioClient {
     let selected: WalletOutput[];
     let totalIn: bigint;
 
-    if (selectedUtxos && selectedUtxos.length > 0) {
+      if (selectedUtxos && selectedUtxos.length > 0) {
       // Manual UTXO selection
       const utxoMap = new Map(confirmedUtxos.map(u => [u.outputHash, u]));
       selected = [];
@@ -1069,8 +1679,8 @@ export class NavioClient {
     }
 
     // --- Build token ID ---
-    const blsctTokenId = tokenId
-      ? TokenId.deserialize(tokenId)
+    const blsctTokenId = normalizedTokenId
+      ? TokenId.deserialize(publicToStoredTokenIdHex(normalizedTokenId))
       : TokenId.default();
 
     // --- Build inputs ---
@@ -1120,7 +1730,7 @@ export class NavioClient {
 
     // --- Mark spent inputs immediately (safety net) ---
     for (const utxo of selected) {
-      await this.walletDB.markOutputSpent(utxo.outputHash, txId, 0);
+      await walletDB.markOutputSpent(utxo.outputHash, txId, 0);
     }
 
     // --- Process the mempool transaction using the same ownership detection
@@ -1140,6 +1750,167 @@ export class NavioClient {
       fee,
       inputCount: txIns.length,
       outputCount: txOuts.length,
+    };
+  }
+
+  /**
+   * Send a fungible token output.
+   */
+  async sendToken(options: SendTokenOptions): Promise<SendTransactionResult> {
+    const normalizedTokenId = normalizeTokenIdHex(options.tokenId);
+    const tokenInfo = describeTokenId(normalizedTokenId);
+    if (tokenInfo.kind !== 'token') {
+      throw new Error('sendToken only supports fungible token IDs. Use sendNft() for NFT token IDs.');
+    }
+
+    return this.sendTransaction({
+      ...options,
+      tokenId: normalizedTokenId,
+    });
+  }
+
+  /**
+   * Send a single NFT.
+   */
+  async sendNft(options: SendNftOptions): Promise<SendTransactionResult> {
+    const hasTokenId = options.tokenId !== undefined && options.tokenId.trim().length > 0;
+    const hasCollectionSource = options.collectionTokenId !== undefined || options.nftId !== undefined;
+
+    if (hasTokenId && hasCollectionSource) {
+      throw new Error('Specify either tokenId or collectionTokenId + nftId for sendNft().');
+    }
+
+    let nftTokenId: string;
+    if (hasTokenId) {
+      nftTokenId = normalizeTokenIdHex(options.tokenId!);
+    } else {
+      if (!options.collectionTokenId || options.nftId === undefined) {
+        throw new Error('sendNft requires tokenId, or collectionTokenId + nftId.');
+      }
+      nftTokenId = composeNftTokenId(options.collectionTokenId, options.nftId);
+    }
+
+    const tokenInfo = describeTokenId(nftTokenId);
+    if (tokenInfo.kind !== 'nft') {
+      throw new Error('sendNft requires an NFT token ID.');
+    }
+
+    const { tokenId: _tokenId, collectionTokenId: _collectionTokenId, nftId: _nftId, ...sendOptions } = options;
+
+    return this.sendTransaction({
+      ...sendOptions,
+      amount: 1n,
+      tokenId: nftTokenId,
+    });
+  }
+
+  /**
+   * Create a fungible token collection.
+   */
+  async createTokenCollection(options: CreateTokenCollectionOptions): Promise<CreateCollectionResult> {
+    await this.ensureSpendReady();
+
+    const metadata = normalizeTokenMetadata(options.metadata);
+    const totalSupply = toSafeInteger(options.totalSupply, 'totalSupply');
+    if (totalSupply <= 0) {
+      throw new Error('totalSupply must be positive');
+    }
+
+    const collectionTokenId = calcCollectionTokenHashHex(metadata, totalSupply);
+    const { tokenKey, tokenPublicKey } = this.buildCollectionTokenContext(collectionTokenId);
+    const tokenInfo = TokenInfo.build(TokenType.Token, tokenPublicKey, metadata, totalSupply);
+
+    const result = await this.buildAndBroadcastUnsignedTransaction(
+      UnsignedOutput.createTokenCollection(tokenKey, tokenInfo),
+      options.selectedUtxos
+    );
+
+    return {
+      ...result,
+      kind: 'token',
+      collectionTokenId,
+      tokenPublicKey: tokenPublicKey.serialize(),
+    };
+  }
+
+  /**
+   * Create an NFT collection.
+   */
+  async createNftCollection(options: CreateNftCollectionOptions): Promise<CreateCollectionResult> {
+    await this.ensureSpendReady();
+
+    const metadata = normalizeTokenMetadata(options.metadata);
+    const totalSupply = toSafeInteger(options.totalSupply ?? 0, 'totalSupply');
+    const collectionTokenId = calcCollectionTokenHashHex(metadata, totalSupply);
+    const { tokenKey, tokenPublicKey } = this.buildCollectionTokenContext(collectionTokenId);
+    const tokenInfo = TokenInfo.build(TokenType.Nft, tokenPublicKey, metadata, totalSupply);
+
+    const result = await this.buildAndBroadcastUnsignedTransaction(
+      UnsignedOutput.createTokenCollection(tokenKey, tokenInfo),
+      options.selectedUtxos
+    );
+
+    return {
+      ...result,
+      kind: 'nft',
+      collectionTokenId,
+      tokenPublicKey: tokenPublicKey.serialize(),
+    };
+  }
+
+  /**
+   * Mint a fungible token output from an existing collection.
+   */
+  async mintToken(options: MintTokenOptions): Promise<MintAssetResult> {
+    await this.ensureSpendReady();
+
+    const mintAmount = toSafeInteger(options.amount, 'amount');
+    if (mintAmount <= 0) {
+      throw new Error('amount must be positive');
+    }
+
+    const destination = NavioClient.decodeAddress(options.address);
+    const collectionTokenId = normalizeCollectionTokenHashHex(options.collectionTokenId);
+    const { tokenKey, tokenPublicKey } = this.buildCollectionTokenContext(collectionTokenId);
+
+    const result = await this.buildAndBroadcastUnsignedTransaction(
+      UnsignedOutput.mintToken(destination, mintAmount, Scalar.random(), tokenKey, tokenPublicKey),
+      options.selectedUtxos
+    );
+
+    return {
+      ...result,
+      kind: 'token',
+      collectionTokenId,
+      tokenId: collectionTokenId,
+      tokenPublicKey: tokenPublicKey.serialize(),
+    };
+  }
+
+  /**
+   * Mint an NFT output from an existing collection.
+   */
+  async mintNft(options: MintNftOptions): Promise<MintAssetResult> {
+    await this.ensureSpendReady();
+
+    const normalizedNftId = typeof options.nftId === 'bigint' ? options.nftId : BigInt(options.nftId);
+    const nftId = toSafeInteger(normalizedNftId, 'nftId');
+    const metadata = normalizeTokenMetadata(options.metadata);
+    const destination = NavioClient.decodeAddress(options.address);
+    const collectionTokenId = normalizeCollectionTokenHashHex(options.collectionTokenId);
+    const { tokenKey, tokenPublicKey } = this.buildCollectionTokenContext(collectionTokenId);
+
+    const result = await this.buildAndBroadcastUnsignedTransaction(
+      UnsignedOutput.mintNft(destination, Scalar.random(), tokenKey, tokenPublicKey, nftId, metadata),
+      options.selectedUtxos
+    );
+
+    return {
+      ...result,
+      kind: 'nft',
+      collectionTokenId,
+      tokenId: composeNftTokenId(collectionTokenId, normalizedNftId),
+      tokenPublicKey: tokenPublicKey.serialize(),
     };
   }
 
@@ -1213,6 +1984,278 @@ export class NavioClient {
 
     // Not enough, but return what we have; the caller will check and throw
     return { selected, totalIn };
+  }
+
+  private static selectInputsByAmount(
+    utxos: WalletOutput[],
+    targetAmount: bigint,
+  ): { selected: WalletOutput[]; totalIn: bigint } {
+    const sorted = [...utxos].sort((a, b) => {
+      if (b.amount > a.amount) return 1;
+      if (b.amount < a.amount) return -1;
+      return 0;
+    });
+
+    const selected: WalletOutput[] = [];
+    let totalIn = 0n;
+
+    for (const utxo of sorted) {
+      selected.push(utxo);
+      totalIn += utxo.amount;
+
+      if (totalIn >= targetAmount) {
+        return { selected, totalIn };
+      }
+    }
+
+    return { selected, totalIn };
+  }
+
+  private async ensureSpendReady(): Promise<{ keyManager: KeyManager; walletDB: IWalletDB }> {
+    if (!this.initialized) {
+      await this.initialize();
+    }
+    if (!this.keyManager || !this.walletDB) {
+      throw new Error('Client not initialized');
+    }
+    if (!this.isConnected()) {
+      throw new Error('Not connected to backend. Please reconnect before sending.');
+    }
+    if (!this.keyManager.isUnlocked()) {
+      throw new Error('Wallet is locked. Unlock it before sending.');
+    }
+
+    return {
+      keyManager: this.keyManager,
+      walletDB: this.walletDB,
+    };
+  }
+
+  private buildCollectionTokenContext(collectionTokenId: string): {
+    tokenKey: InstanceType<typeof Scalar>;
+    tokenPublicKey: InstanceType<typeof PublicKey>;
+  } {
+    if (!this.keyManager) {
+      throw new Error('KeyManager not available');
+    }
+
+    const collectionTokenHashHex = normalizeCollectionTokenHashHex(collectionTokenId);
+    const masterTokenKey = this.keyManager.getMasterTokenKey();
+
+    return {
+      tokenKey: deriveCollectionTokenKeyFromMaster(masterTokenKey, collectionTokenHashHex),
+      tokenPublicKey: deriveCollectionTokenPublicKeyFromMaster(masterTokenKey, collectionTokenHashHex),
+    };
+  }
+
+  private async selectFundingUtxos(
+    walletDB: IWalletDB,
+    selectedUtxos?: string[],
+  ): Promise<{ selected: WalletOutput[]; totalIn: bigint; fee: bigint }> {
+    const allUtxos = await walletDB.getUnspentOutputs(null);
+    const confirmedUtxos = allUtxos.filter((utxo) => utxo.blockHeight > 0);
+
+    let selected: WalletOutput[];
+    let totalIn: bigint;
+
+    if (selectedUtxos && selectedUtxos.length > 0) {
+      const utxoMap = new Map(confirmedUtxos.map((utxo) => [utxo.outputHash, utxo]));
+      selected = [];
+      totalIn = 0n;
+
+      for (const hash of selectedUtxos) {
+        const utxo = utxoMap.get(hash);
+        if (!utxo) {
+          throw new Error(`Selected UTXO not found or not spendable: ${hash.slice(0, 16)}...`);
+        }
+        selected.push(utxo);
+        totalIn += utxo.amount;
+      }
+    } else {
+      if (confirmedUtxos.length === 0) {
+        if (allUtxos.length > 0) {
+          throw new Error('All outputs are unconfirmed. Wait for block confirmation before spending.');
+        }
+        throw new Error('No unspent NAV outputs available to fund the transaction.');
+      }
+      ({ selected, totalIn } = NavioClient.selectInputs(confirmedUtxos, 0n, false));
+    }
+
+    const fee = BigInt((selected.length + 2) * DEFAULT_FEE_PER_COMPONENT);
+    if (totalIn < fee) {
+      throw new Error(`Insufficient funds: need ${fee} sat for fees but only have ${totalIn} sat`);
+    }
+
+    return { selected, totalIn, fee };
+  }
+
+  private async buildAndBroadcastUnsignedTransaction(
+    unsignedOutput: InstanceType<typeof UnsignedOutput>,
+    selectedUtxos?: string[],
+  ): Promise<SendTransactionResult> {
+    const { walletDB } = await this.ensureSpendReady();
+    const { selected, totalIn } = await this.selectFundingUtxos(walletDB, selectedUtxos);
+    const inputs = selected.map((utxo) => ({ output: utxo, tokenId: TokenId.default() }));
+
+    let outputs = [unsignedOutput];
+    let fee = 0n;
+    let previousNavChange: bigint | null = null;
+
+    // Creating collections and minting only consume NAV for fees, so they need
+    // an explicit NAV change output whenever the selected funding input exceeds
+    // the final fee.
+    for (let i = 0; i < 3; i++) {
+      fee = this.estimateSignedUnsignedTransactionFee(inputs, outputs);
+      if (totalIn < fee) {
+        throw new Error(`Insufficient funds: need ${fee} sat for fees but only have ${totalIn} sat`);
+      }
+
+      const navChangeAmount = totalIn - fee;
+      const nextOutputs = [unsignedOutput];
+      if (navChangeAmount > 0n) {
+        nextOutputs.push(this.buildUnsignedNavChangeOutput(navChangeAmount));
+      }
+
+      if (previousNavChange !== null && navChangeAmount === previousNavChange) {
+        outputs = nextOutputs;
+        break;
+      }
+
+      outputs = nextOutputs;
+      previousNavChange = navChangeAmount;
+    }
+
+    return this.signAndBroadcastUnsignedTransaction(
+      walletDB,
+      inputs,
+      outputs,
+      fee,
+    );
+  }
+
+  private buildUnsignedNavChangeOutput(amount: bigint): InstanceType<typeof UnsignedOutput> {
+    return UnsignedOutput.fromTxOut(TxOut.generate(
+      this.getChangeSubAddress(),
+      Number(amount),
+      '',
+      TokenId.default(),
+      TxOutputType.Normal,
+      0,
+      false,
+      Scalar.random(),
+    ));
+  }
+
+  private buildUnsignedSendOutputs(
+    destination: InstanceType<typeof SubAddr>,
+    assetTokenId: InstanceType<typeof TokenId>,
+    amount: bigint,
+    memo: string,
+    assetChangeAmount: bigint,
+    navChangeAmount: bigint,
+  ): InstanceType<typeof UnsignedOutput>[] {
+    const outputs: InstanceType<typeof UnsignedOutput>[] = [];
+    const changeSubAddr = this.getChangeSubAddress();
+
+    outputs.push(UnsignedOutput.fromTxOut(TxOut.generate(
+      destination,
+      Number(amount),
+      memo,
+      assetTokenId,
+      TxOutputType.Normal,
+      0,
+      false,
+      Scalar.random(),
+    )));
+
+    if (assetChangeAmount > 0n) {
+      outputs.push(UnsignedOutput.fromTxOut(TxOut.generate(
+        changeSubAddr,
+        Number(assetChangeAmount),
+        '',
+        assetTokenId,
+        TxOutputType.Normal,
+        0,
+        false,
+        Scalar.random(),
+      )));
+    }
+
+    if (navChangeAmount > 0n) {
+      outputs.push(UnsignedOutput.fromTxOut(TxOut.generate(
+        changeSubAddr,
+        Number(navChangeAmount),
+        '',
+        TokenId.default(),
+        TxOutputType.Normal,
+        0,
+        false,
+        Scalar.random(),
+      )));
+    }
+
+    return outputs;
+  }
+
+  private estimateSignedUnsignedTransactionFee(
+    inputs: Array<{ output: WalletOutput; tokenId: InstanceType<typeof TokenId> }>,
+    outputs: InstanceType<typeof UnsignedOutput>[],
+  ): bigint {
+    const { rawTx } = this.signUnsignedTransaction(inputs, outputs, 0n);
+    return BigInt(rawTx.length / 2) * BLSCT_DEFAULT_FEE_RATE;
+  }
+
+  private async signAndBroadcastUnsignedTransaction(
+    walletDB: IWalletDB,
+    inputs: Array<{ output: WalletOutput; tokenId: InstanceType<typeof TokenId> }>,
+    outputs: InstanceType<typeof UnsignedOutput>[],
+    fee: bigint,
+  ): Promise<SendTransactionResult> {
+    const { rawTx, txId, ctx } = this.signUnsignedTransaction(inputs, outputs, fee);
+
+    await this.broadcastRawTransaction(rawTx);
+
+    for (const input of inputs) {
+      await walletDB.markOutputSpent(input.output.outputHash, txId, 0);
+    }
+
+    if (this.syncManager) {
+      try {
+        await this.syncManager.processMempoolTransaction(txId, rawTx);
+      } catch {
+        // Mempool tx processing is best-effort; failures are non-fatal
+      }
+    }
+
+    return {
+      txId,
+      rawTx,
+      fee,
+      inputCount: ctx.getCTxIns().size(),
+      outputCount: ctx.getCTxOuts().size(),
+    };
+  }
+
+  private signUnsignedTransaction(
+    inputs: Array<{ output: WalletOutput; tokenId: InstanceType<typeof TokenId> }>,
+    outputs: InstanceType<typeof UnsignedOutput>[],
+    fee: bigint,
+  ): { rawTx: string; txId: string; ctx: InstanceType<typeof CTx> } {
+    const unsignedTx = UnsignedTransaction.create();
+    for (const input of inputs) {
+      const txIn = this.buildTxInput(input.output, input.tokenId);
+      unsignedTx.addInput(UnsignedInput.fromTxIn(txIn));
+    }
+    for (const output of outputs) {
+      unsignedTx.addOutput(output);
+    }
+    unsignedTx.setFee(Number(fee));
+
+    const rawTx = unsignedTx.sign();
+    const ctx = CTx.deserialize(rawTx);
+    const txId = ctx.getCTxId().serialize();
+
+    return { rawTx, txId, ctx };
   }
 
   /**

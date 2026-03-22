@@ -100,6 +100,16 @@
       </div>
       <div class="card">
         <h2 style="display:flex;justify-content:space-between;align-items:center">
+          Assets
+          <button id="btn-refresh-assets" class="inline-btn">Refresh</button>
+        </h2>
+        <div id="assets-container" class="assets-container">
+          <div class="empty-state">Click Refresh to load token and NFT balances</div>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2 style="display:flex;justify-content:space-between;align-items:center">
           UTXOs
           <span style="display:flex;gap:0.4rem;align-items:center">
             <label class="toggle-label"><input type="checkbox" id="utxo-show-spent" /> Show spent</label>
@@ -125,11 +135,29 @@
       <div class="card">
         <h2>Send</h2>
         <div class="field">
+          <label for="send-asset-kind">Asset Type</label>
+          <select id="send-asset-kind">
+            <option value="nav">NAV</option>
+            <option value="token">Token</option>
+            <option value="nft">NFT</option>
+          </select>
+        </div>
+        <div id="send-token-field" class="field hidden">
+          <label for="send-token-id">Token ID</label>
+          <input id="send-token-id" list="send-token-id-list" placeholder="80-hex token id" />
+          <datalist id="send-token-id-list"></datalist>
+          <div id="send-token-help" class="field-help">Choose an owned token/NFT or paste a token id.</div>
+        </div>
+        <div id="send-nft-id-field" class="field hidden">
+          <label for="send-nft-id">NFT ID</label>
+          <input id="send-nft-id" type="number" step="1" min="0" placeholder="0" />
+        </div>
+        <div class="field">
           <label for="send-address">Destination Address</label>
           <input id="send-address" placeholder="tnv1..." />
         </div>
-        <div class="field">
-          <label for="send-amount">Amount (NAV)</label>
+        <div id="send-amount-field" class="field">
+          <label id="send-amount-label" for="send-amount">Amount (NAV)</label>
           <input id="send-amount" type="number" step="0.00000001" min="0" placeholder="0.00000000" />
         </div>
         <div class="field">
@@ -139,6 +167,52 @@
         <div class="row" style="align-items:center;">
           <button id="btn-send">Send</button>
           <span id="send-status" class="send-status"></span>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>Create / Mint</h2>
+        <div class="field">
+          <label for="create-mint-action">Action</label>
+          <select id="create-mint-action">
+            <option value="create-token">Create Token Collection</option>
+            <option value="create-nft">Create NFT Collection</option>
+            <option value="mint-token">Mint Fungible Tokens</option>
+            <option value="mint-nft">Mint NFT</option>
+          </select>
+        </div>
+        <div id="create-mint-collection-field" class="field hidden">
+          <label id="create-mint-collection-label" for="create-mint-collection-id">Collection Token ID</label>
+          <input id="create-mint-collection-id" list="create-mint-collection-id-list" placeholder="64 or 80 hex collection token id" />
+          <datalist id="create-mint-collection-id-list"></datalist>
+          <div id="create-mint-collection-help" class="field-help">Choose a known collection id or paste one manually.</div>
+        </div>
+        <div id="create-mint-destination-field" class="field hidden">
+          <label for="create-mint-address">Destination Address</label>
+          <input id="create-mint-address" placeholder="tnv1..." />
+        </div>
+        <div id="create-mint-total-supply-field" class="field hidden">
+          <label id="create-mint-total-supply-label" for="create-mint-total-supply">Total Supply</label>
+          <input id="create-mint-total-supply" type="number" step="1" min="1" placeholder="1000000" />
+          <div id="create-mint-total-supply-help" class="field-help">Maximum fungible supply recorded in the collection predicate.</div>
+        </div>
+        <div id="create-mint-amount-field" class="field hidden">
+          <label for="create-mint-amount">Amount (raw token units)</label>
+          <input id="create-mint-amount" type="number" step="1" min="1" placeholder="1" />
+        </div>
+        <div id="create-mint-nft-id-field" class="field hidden">
+          <label for="create-mint-nft-id">NFT ID</label>
+          <input id="create-mint-nft-id" type="number" step="1" min="0" placeholder="0" />
+        </div>
+        <div id="create-mint-metadata-field" class="field hidden">
+          <label id="create-mint-metadata-label" for="create-mint-metadata">Metadata (JSON object)</label>
+          <textarea id="create-mint-metadata" rows="3" placeholder='{"name":"Token Collection","symbol":"TOK"}'></textarea>
+          <div id="create-mint-metadata-help" class="field-help">Metadata values are stored on-chain as strings.</div>
+        </div>
+        <div class="field-help">Manual UTXO selections from the UTXO table above are reused here to fund fees. Only confirmed NAV outputs are valid.</div>
+        <div class="row" style="align-items:center;">
+          <button id="btn-create-mint">Run Action</button>
+          <span id="create-mint-status" class="send-status"></span>
         </div>
       </div>
 

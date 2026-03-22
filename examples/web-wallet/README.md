@@ -9,9 +9,12 @@ A basic web wallet example demonstrating how to use `navio-sdk` in a browser env
 - Restore wallet from seed or mnemonic
 - Wallet encryption with lock/unlock support
 - Background sync with Electrum backend
-- Display balance and UTXOs
-- View transaction history
-- Send confidential transactions (optional memo)
+- Display NAV, token, and NFT balances
+- Display asset-aware UTXOs
+- View asset-aware transaction history
+- Send NAV, fungible tokens, and NFTs (collection token id + NFT id, optional memo)
+- Create token collections and capped or uncapped NFT collections
+- Mint fungible tokens and NFTs from the browser UI
 - Bech32m encoded receiving addresses
 - Real-time activity log
 
@@ -83,9 +86,10 @@ The example demonstrates:
 - Password-based wallet encryption (Argon2id + AES-256-GCM)
 - Lock/unlock workflow for encrypted wallets
 - Background sync with callbacks
-- Balance and UTXO display
-- Transaction history aggregation
-- Transaction sending with memo support
+- Balance, token, and NFT inventory display
+- Asset-aware UTXO and transaction history views
+- NAV / token / NFT sending with memo support
+- Token/NFT collection creation and minting flows
 - Bech32m address encoding
 
 ## Wallet Encryption

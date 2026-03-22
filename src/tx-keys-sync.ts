@@ -796,70 +796,165 @@ export class TransactionKeysSync {
       // Check if output belongs to wallet
       const isMine = this.keyManager.isMineByKeys(blindingKeyObj, spendingKeyObj, viewTag);
       if (isMine) {
-        // Fetch output data from backend
+        let outputHex = '';
         try {
-          const outputHex = await this.withRetry(() =>
+          outputHex = await this.withRetry(() =>
             this.syncProvider.getTransactionOutput(outputHash)
           );
-
-          // Recover the amount from the range proof
-          const RangeProof = blsctModule.RangeProof;
-          const AmountRecoveryReq = blsctModule.AmountRecoveryReq;
-          
-          let recoveredAmount = 0;
-          let recoveredGamma = '0';
-          let recoveredMemo: string | null = null;
-          let tokenIdHex: string | null = null;
-
-          try {
-            // Calculate the nonce (shared secret) for amount recovery
-            const nonce = this.keyManager.calculateNonce(blindingKeyObj);
-
-            // Parse the range proof from the output data
-            const rangeProofResult = this.extractRangeProofFromOutput(outputHex);
-
-            if (rangeProofResult.rangeProofHex) {
-              const rangeProof = RangeProof.deserialize(rangeProofResult.rangeProofHex);
-
-              // Create recovery request
-              const req = new AmountRecoveryReq(rangeProof, nonce);
-
-              // Recover the amount using static method
-              const results = RangeProof.recoverAmounts([req]);
-              
-              if (results.length > 0 && results[0].isSucc) {
-                recoveredAmount = Number(results[0].amount);
-                recoveredGamma = results[0].gamma ?? '0';
-                recoveredMemo = results[0].msg || null;
-              }
-            }
-            
-            tokenIdHex = rangeProofResult.tokenIdHex;
-          } catch {
-            // Amount recovery failed; store output with zero amount
-          }
-
-          // Store output as spendable with recovered amount
-          await this.storeWalletOutput(
-            outputHash,
-            txHash,
-            outputIndex,
-            blockHeight,
-            outputHex,
-            recoveredAmount,
-            recoveredGamma,
-            recoveredMemo,
-            tokenIdHex,
-            blindingKey,
-            spendingKey,
-            false, // not spent
-            null, // spent_tx_hash
-            null // spent_block_height
-          );
         } catch {
-          // Output might not be available yet, skip for now
+          // Some providers may not expose standalone output serialization.
+          // Recovery falls back to parsing the full raw transaction below.
         }
+
+        const recoveredOutput = await this.recoverConfirmedOutput(
+          txHash,
+          outputIndex,
+          blindingKeyObj,
+          outputHex
+        );
+
+        // Store output as spendable with recovered amount
+        await this.storeWalletOutput(
+          outputHash,
+          txHash,
+          outputIndex,
+          blockHeight,
+          outputHex,
+          recoveredOutput.amount,
+          recoveredOutput.gamma,
+          recoveredOutput.memo,
+          recoveredOutput.tokenIdHex,
+          blindingKey,
+          spendingKey,
+          false, // not spent
+          null, // spent_tx_hash
+          null // spent_block_height
+        );
       }
+    }
+  }
+
+  private async recoverConfirmedOutput(
+    txHash: string,
+    outputIndex: number,
+    blindingKeyObj: any,
+    outputHex: string
+  ): Promise<{ amount: number; gamma: string; memo: string | null; tokenIdHex: string | null }> {
+    const fastRecovery = this.tryRecoverFromSerializedOutput(outputHex, blindingKeyObj);
+    if (fastRecovery !== null) {
+      return fastRecovery;
+    }
+
+    const rawTx = await this.withRetry(() => this.syncProvider.getRawTransaction(txHash));
+    if (typeof rawTx !== 'string') {
+      return {
+        amount: 0,
+        gamma: '0',
+        memo: null,
+        tokenIdHex: null,
+      };
+    }
+
+    const rawRecovery = this.tryRecoverFromRawTransaction(rawTx, outputIndex, blindingKeyObj);
+    if (rawRecovery !== null) {
+      return rawRecovery;
+    }
+
+    return {
+      amount: 0,
+      gamma: '0',
+      memo: null,
+      tokenIdHex: null,
+    };
+  }
+
+  private tryRecoverFromSerializedOutput(
+    outputHex: string,
+    blindingKeyObj: any
+  ): { amount: number; gamma: string; memo: string | null; tokenIdHex: string | null } | null {
+    if (!outputHex) {
+      return null;
+    }
+
+    const RangeProof = blsctModule.RangeProof;
+    const AmountRecoveryReq = blsctModule.AmountRecoveryReq;
+
+    try {
+      const nonce = this.keyManager!.calculateNonce(blindingKeyObj);
+      const rangeProofResult = this.extractRangeProofFromOutput(outputHex);
+      const tokenIdHex = rangeProofResult.tokenIdHex;
+
+      if (!rangeProofResult.rangeProofHex) {
+        return {
+          amount: 0,
+          gamma: '0',
+          memo: null,
+          tokenIdHex,
+        };
+      }
+
+      const rangeProof = RangeProof.deserialize(rangeProofResult.rangeProofHex);
+      const tokenId = tokenIdHex
+        ? blsctModule.TokenId.deserialize(tokenIdHex)
+        : blsctModule.TokenId.default();
+
+      const req = new AmountRecoveryReq(rangeProof, nonce, tokenId);
+      const results = RangeProof.recoverAmounts([req]);
+
+      if (results.length > 0 && results[0].isSucc) {
+        return {
+          amount: Number(results[0].amount),
+          gamma: results[0].gamma ?? '0',
+          memo: results[0].msg || null,
+          tokenIdHex,
+        };
+      }
+    } catch {
+      // Fall through to raw-transaction recovery.
+    }
+
+    return null;
+  }
+
+  private tryRecoverFromRawTransaction(
+    rawTx: string,
+    outputIndex: number,
+    blindingKeyObj: any
+  ): { amount: number; gamma: string; memo: string | null; tokenIdHex: string | null } | null {
+    const { CTx, RangeProof, AmountRecoveryReq } = blsctModule as any;
+
+    try {
+      const ctx = CTx.deserialize(rawTx);
+      const outs = ctx.getCTxOuts();
+      if (outputIndex < 0 || outputIndex >= outs.size()) {
+        return null;
+      }
+
+      const ctxOut = outs.at(outputIndex);
+      const nonce = this.keyManager!.calculateNonce(blindingKeyObj);
+      const tokenId = ctxOut.getTokenId();
+      const tokenIdHex = tokenId.serialize();
+      const rangeProof = ctxOut.getRangeProof();
+      const req = new AmountRecoveryReq(rangeProof, nonce, tokenId);
+      const results = RangeProof.recoverAmounts([req]);
+
+      if (results.length > 0 && results[0].isSucc) {
+        return {
+          amount: Number(results[0].amount),
+          gamma: results[0].gamma ?? '0',
+          memo: results[0].msg || null,
+          tokenIdHex,
+        };
+      }
+
+      return {
+        amount: 0,
+        gamma: '0',
+        memo: null,
+        tokenIdHex,
+      };
+    } catch {
+      return null;
     }
   }
 
@@ -879,12 +974,13 @@ export class TransactionKeysSync {
       // - if flags & TRANSPARENT_VALUE: transparent value (8 bytes)
       // - scriptPubKey (varint length + data)
       // - if flags & HAS_BLSCT_KEYS: rangeProof + blsctData
-      // - if flags & HAS_TOKENID: tokenId (64 bytes)
+      // - if flags & HAS_TOKENID: tokenId (40 bytes = 32-byte hash + 8-byte subid)
       // - if flags & HAS_PREDICATE: predicate (varint length + data)
 
       const MAX_AMOUNT = 0x7fffffffffffffffn;
       const HAS_BLSCT_KEYS = 1n;
       const HAS_TOKENID = 2n;
+      const TOKEN_ID_SIZE = 40;
 
       // Read value
       const value = data.readBigInt64LE(offset);
@@ -954,7 +1050,7 @@ export class TransactionKeysSync {
 
       // Extract tokenId if present
       if ((flags & HAS_TOKENID) !== 0n) {
-        tokenIdHex = data.subarray(offset, offset + 64).toString('hex');
+        tokenIdHex = data.subarray(offset, offset + TOKEN_ID_SIZE).toString('hex');
       }
 
       return { rangeProofHex, tokenIdHex };

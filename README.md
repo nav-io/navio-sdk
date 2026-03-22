@@ -10,6 +10,7 @@ TypeScript SDK for interacting with the Navio blockchain. Provides wallet manage
 - **Automatic Output Detection** - BLSCT output scanning with view tag optimization
 - **Amount Recovery** - Decrypt confidential transaction amounts
 - **Balance Tracking** - Query wallet balance and UTXOs
+- **Token/NFT Transfer, Creation & Minting** - Create collections, mint assets, send tokenized outputs, and inspect owned assets
 - **Spending Status Tracking** - Monitor spent/unspent outputs
 - **Blockchain Reorganization Handling** - Automatic reorg detection and recovery
 - **Cross-Platform Persistence** - Efficient SQLite storage (sql.js with IndexedDB for browser, better-sqlite3 for Node.js)
@@ -243,7 +244,7 @@ interface WalletOutput {
   blockHeight: number;
   amount: bigint;
   memo: string | null;
-  tokenId: string | null;
+  tokenId: string | null;           // 64-hex token hash for fungible tokens, 80-hex token ID for NFTs, or null for NAV
   blindingKey: string;
   spendingKey: string;
   isSpent: boolean;
@@ -255,6 +256,37 @@ interface WalletOutput {
 ##### `getAllOutputs(): Promise<WalletOutput[]>`
 
 Get all wallet outputs (spent and unspent).
+
+##### `getTokenBalance(tokenId: string): Promise<bigint>`
+
+Get the current balance for a specific token or NFT.
+
+##### `getTokenOutputs(tokenId: string): Promise<WalletOutput[]>`
+
+Get unspent outputs for a specific token or NFT.
+
+##### `getAssetBalances(): Promise<WalletAssetBalance[]>`
+
+Get current balances for all non-NAV assets owned by the wallet.
+
+```typescript
+interface WalletAssetBalance {
+  tokenId: string;
+  kind: 'token' | 'nft';
+  balance: bigint;
+  outputCount: number;
+  collectionTokenId: string | null;
+  nftId: bigint | null;
+}
+```
+
+##### `getTokenBalances(): Promise<WalletAssetBalance[]>`
+
+Get current balances for all fungible tokens owned by the wallet.
+
+##### `getNftBalances(): Promise<WalletAssetBalance[]>`
+
+Get current balances for all NFTs owned by the wallet.
 
 #### Accessors
 
@@ -323,6 +355,85 @@ console.log('Fee:', Number(result.fee) / 1e8, 'NAV');
 ##### `broadcastRawTransaction(rawTx: string): Promise<string>`
 
 Broadcast a pre-built raw transaction hex via the connected backend. Returns the transaction hash.
+
+##### `sendToken(options: SendTokenOptions): Promise<SendTransactionResult>`
+
+Send a fungible token. `tokenId` accepts either:
+- a 64-hex navio-core/RPC collection token hash, or
+- an 80-hex token ID in the same byte order (`token hash || subid`), which is normalized to the 64-hex token hash for fungible sends.
+
+```typescript
+const result = await client.sendToken({
+  address: 'tnav1...',
+  amount: 25n,
+  tokenId: 'fungible-token-id-hex',
+  memo: 'Token payment',
+});
+```
+
+##### `sendNft(options: SendNftOptions): Promise<SendTransactionResult>`
+
+Send a single NFT. You can pass either a full 80-hex NFT `tokenId` in navio-core/RPC byte order, or a `collectionTokenId` plus `nftId`.
+
+```typescript
+const result = await client.sendNft({
+  address: 'tnav1...',
+  collectionTokenId: 'collection-token-id-hex',
+  nftId: 1n,
+  memo: 'NFT transfer',
+});
+```
+
+Token and NFT receiving is already handled by normal wallet sync and exposed through the asset balance/output queries above.
+
+##### `createTokenCollection(options: CreateTokenCollectionOptions): Promise<CreateCollectionResult>`
+
+Create a fungible token collection definition on-chain. The wallet funds the transaction fee with NAV UTXOs and returns the derived `collectionTokenId` you will use for later minting.
+
+```typescript
+const collection = await client.createTokenCollection({
+  metadata: { name: 'Token Collection', symbol: 'TOK' },
+  totalSupply: 5_000_000,
+});
+
+console.log(collection.collectionTokenId);
+```
+
+##### `createNftCollection(options: CreateNftCollectionOptions): Promise<CreateCollectionResult>`
+
+Create an NFT collection definition on-chain. You can optionally encode a collection max supply; omitting it keeps the previous `0` behavior.
+
+```typescript
+const collection = await client.createNftCollection({
+  metadata: { collection: 'Artifacts', creator: 'navio' },
+  totalSupply: 250,
+});
+```
+
+##### `mintToken(options: MintTokenOptions): Promise<MintAssetResult>`
+
+Mint a fungible token output from an existing collection.
+
+```typescript
+const mint = await client.mintToken({
+  address: 'tnav1...',
+  collectionTokenId: collection.collectionTokenId,
+  amount: 123_456,
+});
+```
+
+##### `mintNft(options: MintNftOptions): Promise<MintAssetResult>`
+
+Mint a single NFT from an existing collection. The returned `tokenId` is the full 80-hex NFT token ID in navio-core/RPC byte order.
+
+```typescript
+const mint = await client.mintNft({
+  address: 'tnav1...',
+  collectionTokenId: collection.collectionTokenId,
+  nftId: 42n,
+  metadata: { name: 'Artifact', rarity: 'legendary' },
+});
+```
 
 #### Chain & Metadata
 

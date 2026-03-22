@@ -721,7 +721,10 @@ export class ElectrumClient {
     verbose = false,
     blockHash?: string
   ): Promise<string | any> {
-    return this.call('blockchain.transaction.get', txHash, verbose, blockHash);
+    if (blockHash !== undefined) {
+      return this.call('blockchain.transaction.get', txHash, verbose, blockHash);
+    }
+    return this.call('blockchain.transaction.get', txHash, verbose);
   }
 
   /**
