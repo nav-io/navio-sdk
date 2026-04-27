@@ -111,6 +111,43 @@ export interface SendTransactionOptions {
 }
 
 /**
+ * A single recipient when sending NAV to multiple destinations.
+ */
+export interface SendRecipient {
+  /** Destination address (bech32m encoded) */
+  address: string;
+  /** Amount to send to this recipient in satoshis */
+  amount: bigint;
+  /** Optional memo to include in this output */
+  memo?: string;
+  /**
+   * Whether this recipient should pay (a share of) the fee.
+   * When set on multiple recipients, the fee is split evenly among them
+   * (any rounding remainder is absorbed by the first such recipient).
+   * Defaults to false.
+   */
+  subtractFeeFromAmount?: boolean;
+}
+
+/**
+ * Options for sending NAV to multiple destinations in a single transaction.
+ *
+ * All recipients share the same set of selected/auto-selected NAV inputs
+ * and a single optional change output. Token/NFT sends are not supported
+ * by this helper – use `sendToken`/`sendNft` for those.
+ */
+export interface SendToManyOptions {
+  /** One or more destinations to receive NAV. Must be non-empty. */
+  recipients: SendRecipient[];
+  /**
+   * Optional list of specific UTXOs to use as inputs.
+   * Each entry must be an outputHash of an unspent, confirmed NAV output.
+   * When provided, automatic UTXO selection is skipped.
+   */
+  selectedUtxos?: string[];
+}
+
+/**
  * Options for sending a fungible token.
  */
 export interface SendTokenOptions extends Omit<SendTransactionOptions, 'tokenId'> {
@@ -200,6 +237,17 @@ export interface SendTransactionResult {
   /** Inputs used */
   inputCount: number;
   /** Outputs created (including change) */
+  outputCount: number;
+}
+
+export interface AggregateTransactionsResult {
+  /** Transaction ID (hex) of the aggregated transaction */
+  txId: string;
+  /** Serialized aggregated transaction (hex) */
+  rawTx: string;
+  /** Total inputs in the aggregated transaction */
+  inputCount: number;
+  /** Total outputs in the aggregated transaction */
   outputCount: number;
 }
 
@@ -1401,6 +1449,39 @@ export class NavioClient {
   // ============================================================
 
   /**
+   * Aggregate one or more signed transaction hex strings into a single signed transaction.
+   *
+   * This is a thin wrapper around `navio-blsct`'s `CTx.aggregateTransactions()`.
+   * The returned transaction is not broadcast automatically.
+   */
+  aggregateTransactions(txHexes: string[]): AggregateTransactionsResult {
+    if (!Array.isArray(txHexes) || txHexes.length === 0) {
+      throw new Error('Provide at least one signed transaction hex to aggregate.');
+    }
+
+    const normalizedTxHexes = txHexes.map((txHex, index) => {
+      const normalized = txHex.trim();
+      if (normalized.length === 0) {
+        throw new Error(`Transaction hex at index ${index} is empty.`);
+      }
+      if (normalized.length % 2 !== 0 || !/^[0-9a-f]+$/i.test(normalized)) {
+        throw new Error(`Transaction hex at index ${index} is not valid hex.`);
+      }
+      return normalized.toLowerCase();
+    });
+
+    const rawTx = CTx.aggregateTransactions(normalizedTxHexes);
+    const ctx = CTx.deserialize(rawTx);
+
+    return {
+      txId: ctx.getCTxId().serialize(),
+      rawTx,
+      inputCount: ctx.getCTxIns().size(),
+      outputCount: ctx.getCTxOuts().size(),
+    };
+  }
+
+  /**
    * Send NAV (or a token) to a destination address.
    *
    * Selects UTXOs, builds a confidential transaction with change,
@@ -1736,6 +1817,221 @@ export class NavioClient {
     // --- Process the mempool transaction using the same ownership detection
     //     logic as confirmed blocks (blockHeight=0 for unconfirmed). The raw
     //     tx is deserialized locally to extract keys and range proofs. ---
+    if (this.syncManager) {
+      try {
+        await this.syncManager.processMempoolTransaction(txId, rawTx);
+      } catch {
+        // Mempool tx processing is best-effort; failures are non-fatal
+      }
+    }
+
+    return {
+      txId,
+      rawTx,
+      fee,
+      inputCount: txIns.length,
+      outputCount: txOuts.length,
+    };
+  }
+
+  /**
+   * Send NAV to multiple destinations in a single confidential transaction.
+   *
+   * Selects (or accepts a manual selection of) NAV UTXOs sufficient to cover
+   * the sum of all recipient amounts plus the fee, builds one output per
+   * recipient, plus an optional change output, and broadcasts the result via
+   * the connected backend.
+   *
+   * Token and NFT sends are not supported here; use `sendToken` / `sendNft`
+   * for asset transfers.
+   *
+   * @param options - Recipients and optional manual UTXO selection
+   * @returns Transaction result with txId and details
+   *
+   * @example
+   * ```typescript
+   * const result = await client.sendToMany({
+   *   recipients: [
+   *     { address: 'tnv1...', amount: 100_000_000n, memo: 'invoice 1' },
+   *     { address: 'tnv1...', amount:  50_000_000n },
+   *     { address: 'tnv1...', amount:  25_000_000n, subtractFeeFromAmount: true },
+   *   ],
+   * });
+   * console.log('Sent tx:', result.txId);
+   * ```
+   */
+  async sendToMany(options: SendToManyOptions): Promise<SendTransactionResult> {
+    const { walletDB } = await this.ensureSpendReady();
+
+    const { recipients, selectedUtxos } = options;
+
+    if (!Array.isArray(recipients) || recipients.length === 0) {
+      throw new Error('At least one recipient is required');
+    }
+
+    const decodedRecipients = recipients.map((recipient, index) => {
+      if (recipient.amount === undefined || recipient.amount === null) {
+        throw new Error(`Recipient at index ${index} is missing an amount`);
+      }
+      if (typeof recipient.amount !== 'bigint') {
+        throw new Error(`Recipient amount at index ${index} must be a bigint`);
+      }
+      if (recipient.amount <= 0n) {
+        throw new Error(`Recipient amount at index ${index} must be positive`);
+      }
+
+      return {
+        subAddr: NavioClient.decodeAddress(recipient.address),
+        amount: recipient.amount,
+        memo: recipient.memo ?? '',
+        subtractFee: recipient.subtractFeeFromAmount === true,
+      };
+    });
+
+    const totalSendAmount = decodedRecipients.reduce((sum, r) => sum + r.amount, 0n);
+    const subtractIndices = decodedRecipients
+      .map((recipient, index) => (recipient.subtractFee ? index : -1))
+      .filter((index) => index >= 0);
+    const subtractFee = subtractIndices.length > 0;
+
+    // --- Select inputs ---
+    const allUtxos = await walletDB.getUnspentOutputs(null);
+    const confirmedUtxos = allUtxos.filter((utxo) => utxo.blockHeight > 0);
+
+    let selected: WalletOutput[];
+    let totalIn: bigint;
+
+    if (selectedUtxos && selectedUtxos.length > 0) {
+      const utxoMap = new Map(confirmedUtxos.map((utxo) => [utxo.outputHash, utxo]));
+      selected = [];
+      totalIn = 0n;
+      for (const hash of selectedUtxos) {
+        const utxo = utxoMap.get(hash);
+        if (!utxo) {
+          throw new Error(`Selected UTXO not found or not spendable: ${hash.slice(0, 16)}...`);
+        }
+        selected.push(utxo);
+        totalIn += utxo.amount;
+      }
+    } else {
+      if (confirmedUtxos.length === 0) {
+        if (allUtxos.length > 0) {
+          throw new Error('All outputs are unconfirmed. Wait for block confirmation before spending.');
+        }
+        throw new Error('No unspent outputs available');
+      }
+
+      const sorted = [...confirmedUtxos].sort((a, b) => {
+        if (b.amount > a.amount) return 1;
+        if (b.amount < a.amount) return -1;
+        return 0;
+      });
+
+      selected = [];
+      totalIn = 0n;
+      for (const utxo of sorted) {
+        selected.push(utxo);
+        totalIn += utxo.amount;
+
+        // Estimate fee against the current input count, recipients + change.
+        const numComponents = selected.length + recipients.length + 1;
+        const estimatedFee = BigInt(numComponents * DEFAULT_FEE_PER_COMPONENT);
+        const needed = subtractFee ? totalSendAmount : totalSendAmount + estimatedFee;
+        if (totalIn >= needed) {
+          break;
+        }
+      }
+    }
+
+    // Final fee uses the actual number of selected inputs and recipient outputs,
+    // assuming a change output (consistent with single-recipient sendTransaction).
+    const numComponents = selected.length + recipients.length + 1;
+    const fee = BigInt(numComponents * DEFAULT_FEE_PER_COMPONENT);
+
+    const sendAmounts = decodedRecipients.map((recipient) => recipient.amount);
+    let changeAmount: bigint;
+
+    if (subtractFee) {
+      const payerCount = BigInt(subtractIndices.length);
+      const baseShare = fee / payerCount;
+      const remainder = fee % payerCount;
+
+      for (let k = 0; k < subtractIndices.length; k++) {
+        const recipientIndex = subtractIndices[k];
+        const extra = BigInt(k) < remainder ? 1n : 0n;
+        const share = baseShare + extra;
+        const adjusted = sendAmounts[recipientIndex] - share;
+        if (adjusted <= 0n) {
+          throw new Error(
+            `Fee share (${share} sat) exceeds recipient ${recipientIndex} amount ` +
+            `(${sendAmounts[recipientIndex]} sat)`
+          );
+        }
+        sendAmounts[recipientIndex] = adjusted;
+      }
+
+      if (totalIn < totalSendAmount) {
+        throw new Error(
+          `Insufficient funds: need ${totalSendAmount} sat but only have ${totalIn} sat`
+        );
+      }
+      changeAmount = totalIn - totalSendAmount;
+    } else {
+      const needed = totalSendAmount + fee;
+      if (totalIn < needed) {
+        throw new Error(
+          `Insufficient funds: need ${needed} sat (${totalSendAmount} + ${fee} fee) but only have ${totalIn} sat`
+        );
+      }
+      changeAmount = totalIn - totalSendAmount - fee;
+    }
+
+    const navTokenId = TokenId.default();
+
+    // --- Build inputs ---
+    const txIns: InstanceType<typeof TxIn>[] = [];
+    for (const utxo of selected) {
+      txIns.push(this.buildTxInput(utxo, navTokenId));
+    }
+
+    // --- Build outputs ---
+    const txOuts: InstanceType<typeof TxOut>[] = [];
+    for (let i = 0; i < decodedRecipients.length; i++) {
+      const recipient = decodedRecipients[i];
+      txOuts.push(TxOut.generate(
+        recipient.subAddr,
+        Number(sendAmounts[i]),
+        recipient.memo,
+        navTokenId,
+        TxOutputType.Normal,
+        0,
+        false,
+        Scalar.random(),
+      ));
+    }
+
+    if (changeAmount > 0n) {
+      const changeSubAddr = this.getChangeSubAddress();
+      txOuts.push(TxOut.generate(
+        changeSubAddr,
+        Number(changeAmount),
+        '',
+        navTokenId,
+        TxOutputType.Normal,
+        0,
+        false,
+        Scalar.random(),
+      ));
+    }
+
+    const { rawTx, txId } = buildAndSerializeCTx(txIns, txOuts);
+
+    await this.broadcastRawTransaction(rawTx);
+
+    for (const utxo of selected) {
+      await walletDB.markOutputSpent(utxo.outputHash, txId, 0);
+    }
+
     if (this.syncManager) {
       try {
         await this.syncManager.processMempoolTransaction(txId, rawTx);

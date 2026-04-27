@@ -15,6 +15,7 @@ import {
   TokenId,
   TokenType,
   TxIn,
+  TxOut,
   getPredicateType,
   parseCreateTokenPredicateTokenInfo,
   parseMintNftPredicateMetadata,
@@ -58,6 +59,19 @@ function makeFundingTxIn(
     false,
     false,
   );
+}
+
+function makeSignedTransactionHex(seed: number): string {
+  const destination = SubAddr.generate(
+    new Scalar(seed + 1000),
+    PublicKey.fromScalar(new Scalar(seed + 1001)),
+    SubAddrId.generate(seed, seed),
+  );
+  const ctx = CTx.generate(
+    [makeFundingTxIn(seed, 500_000)],
+    [TxOut.generate(destination, 200_000, `memo-${seed}`)],
+  );
+  return ctx.serialize();
 }
 
 function makeWalletOutput(overrides: Partial<WalletOutput> & Pick<WalletOutput, 'outputHash' | 'txHash' | 'outputIndex'>): WalletOutput {
@@ -669,6 +683,204 @@ describe('NavioClient', () => {
     ]);
     expect(tokens).toEqual([assets[0]]);
     expect(nfts).toEqual([assets[1]]);
+  });
+
+  it('should aggregate signed transaction hex strings', () => {
+    const client = new NavioClient({
+      network: 'testnet',
+      backend: 'electrum',
+      electrum: {
+        host: 'testnet.nav.io',
+        port: 50005,
+      },
+      walletDbPath: 'test-client-wallet.db',
+    });
+
+    const txHexA = makeSignedTransactionHex(41);
+    const txHexB = makeSignedTransactionHex(42);
+    const txA = CTx.deserialize(txHexA);
+    const txB = CTx.deserialize(txHexB);
+
+    const result = client.aggregateTransactions([txHexA, txHexB]);
+    const aggregated = CTx.deserialize(result.rawTx);
+
+    expect(result.txId).toBe(aggregated.getCTxId().serialize());
+    expect(result.rawTx).not.toBe(txHexA);
+    expect(result.rawTx).not.toBe(txHexB);
+    expect(result.inputCount).toBe(txA.getCTxIns().size() + txB.getCTxIns().size());
+    expect(result.outputCount).toBe(aggregated.getCTxOuts().size());
+    expect(result.outputCount).toBeGreaterThan(0);
+  });
+
+  it('should reject empty transaction aggregation requests', () => {
+    const client = new NavioClient({
+      network: 'testnet',
+      backend: 'electrum',
+      electrum: {
+        host: 'testnet.nav.io',
+        port: 50005,
+      },
+      walletDbPath: 'test-client-wallet.db',
+    });
+
+    expect(() => client.aggregateTransactions([])).toThrow(
+      'Provide at least one signed transaction hex to aggregate.',
+    );
+  });
+
+  it('should send NAV to multiple destinations in one transaction', async () => {
+    const client = new NavioClient({
+      network: 'testnet',
+      backend: 'electrum',
+      electrum: {
+        host: 'testnet.nav.io',
+        port: 50005,
+      },
+      walletDbPath: 'test-client-wallet.db',
+    });
+
+    const fundingUtxos: WalletOutput[] = [
+      makeWalletOutput({
+        outputHash: 'aa'.repeat(32),
+        txHash: 'bb'.repeat(32),
+        outputIndex: 0,
+        blockHeight: 100,
+        amount: 5_000_000n,
+        tokenId: null,
+      }),
+    ];
+
+    const walletDB = {
+      getUnspentOutputs: vi.fn().mockResolvedValue(fundingUtxos),
+      markOutputSpent: vi.fn().mockResolvedValue(undefined),
+    };
+
+    const processMempoolTransaction = vi.fn().mockResolvedValue(undefined);
+    const broadcastRawTransaction = vi.fn().mockResolvedValue('broadcast-hash');
+
+    let nextSeed = 71;
+    const buildTxInput = vi.fn().mockImplementation((output: WalletOutput, tokenId: InstanceType<typeof TokenId>) =>
+      makeFundingTxIn(nextSeed++, Number(output.amount), tokenId)
+    );
+
+    (client as any).initialized = true;
+    (client as any).walletDB = walletDB;
+    (client as any).keyManager = {
+      isUnlocked: () => true,
+      getSubAddress: () => SubAddr.generate(
+        new Scalar(601),
+        PublicKey.fromScalar(new Scalar(602)),
+        SubAddrId.generate(-1, 0),
+      ),
+    };
+    (client as any).syncProvider = { isConnected: () => true };
+    (client as any).syncManager = { processMempoolTransaction };
+    (client as any).buildTxInput = buildTxInput;
+    (client as any).broadcastRawTransaction = broadcastRawTransaction;
+
+    const result = await client.sendToMany({
+      recipients: [
+        { address: makeTestAddress(), amount: 100_000n, memo: 'first' },
+        { address: makeTestAddress(), amount: 250_000n },
+        { address: makeTestAddress(), amount:  50_000n, memo: 'third' },
+      ],
+    });
+
+    // 1 input + 3 recipient outputs + 1 change output
+    expect(result.inputCount).toBe(1);
+    expect(result.outputCount).toBe(4);
+    expect(result.fee).toBeGreaterThan(0n);
+    expect(broadcastRawTransaction).toHaveBeenCalledWith(result.rawTx);
+    expect(walletDB.markOutputSpent).toHaveBeenCalledWith('aa'.repeat(32), result.txId, 0);
+    expect(processMempoolTransaction).toHaveBeenCalledWith(result.txId, result.rawTx);
+
+    // Resulting CTx is parseable and matches the broadcast hex
+    const ctx = CTx.deserialize(result.rawTx);
+    expect(ctx.getCTxIns().size()).toBe(1);
+  });
+
+  it('should reject sendToMany with no recipients', async () => {
+    const client = new NavioClient({
+      network: 'testnet',
+      backend: 'electrum',
+      electrum: {
+        host: 'testnet.nav.io',
+        port: 50005,
+      },
+      walletDbPath: 'test-client-wallet.db',
+    });
+
+    (client as any).initialized = true;
+    (client as any).walletDB = {
+      getUnspentOutputs: vi.fn().mockResolvedValue([]),
+    };
+    (client as any).keyManager = { isUnlocked: () => true };
+    (client as any).syncProvider = { isConnected: () => true };
+
+    await expect(client.sendToMany({ recipients: [] })).rejects.toThrow(
+      'At least one recipient is required',
+    );
+  });
+
+  it('should split the fee across recipients flagged with subtractFeeFromAmount', async () => {
+    const client = new NavioClient({
+      network: 'testnet',
+      backend: 'electrum',
+      electrum: {
+        host: 'testnet.nav.io',
+        port: 50005,
+      },
+      walletDbPath: 'test-client-wallet.db',
+    });
+
+    const fundingUtxos: WalletOutput[] = [
+      makeWalletOutput({
+        outputHash: 'cc'.repeat(32),
+        txHash: 'dd'.repeat(32),
+        outputIndex: 0,
+        blockHeight: 100,
+        amount: 5_000_000n,
+        tokenId: null,
+      }),
+    ];
+
+    const walletDB = {
+      getUnspentOutputs: vi.fn().mockResolvedValue(fundingUtxos),
+      markOutputSpent: vi.fn().mockResolvedValue(undefined),
+    };
+
+    let nextSeed = 91;
+    (client as any).initialized = true;
+    (client as any).walletDB = walletDB;
+    (client as any).keyManager = {
+      isUnlocked: () => true,
+      getSubAddress: () => SubAddr.generate(
+        new Scalar(701),
+        PublicKey.fromScalar(new Scalar(702)),
+        SubAddrId.generate(-1, 0),
+      ),
+    };
+    (client as any).syncProvider = { isConnected: () => true };
+    (client as any).syncManager = { processMempoolTransaction: vi.fn() };
+    (client as any).buildTxInput = vi.fn().mockImplementation((output: WalletOutput, tokenId: InstanceType<typeof TokenId>) =>
+      makeFundingTxIn(nextSeed++, Number(output.amount), tokenId)
+    );
+    (client as any).broadcastRawTransaction = vi.fn().mockResolvedValue('broadcast-hash');
+
+    // Each recipient amount is large enough to absorb a fee share.
+    const result = await client.sendToMany({
+      recipients: [
+        { address: makeTestAddress(), amount: 2_000_000n, subtractFeeFromAmount: true },
+        { address: makeTestAddress(), amount: 1_500_000n, subtractFeeFromAmount: true },
+        { address: makeTestAddress(), amount: 1_000_000n },
+      ],
+    });
+
+    // Funding 5_000_000n covers full sum 4_500_000n with fee absorbed by the
+    // first two recipients, leaving 500_000n change.
+    expect(result.inputCount).toBe(1);
+    expect(result.outputCount).toBe(4);
+    expect(result.fee).toBeGreaterThan(0n);
   });
 
   it('should fund fungible token sends with NAV inputs for the fee', async () => {

@@ -251,6 +251,17 @@ export class ElectrumClient {
    */
   private subscriptionCallbacks = new Map<string, Set<SubscriptionCallback>>();
 
+  /**
+   * Single handler to update cached chain tip from `blockchain.headers.subscribe` notifications.
+   * (Stable reference so the Set does not grow when re-subscribing after reconnect.)
+   */
+  private onChainTipCacheUpdate: SubscriptionCallback = (params: any) => {
+    const header = Array.isArray(params) ? params[0] : params;
+    if (header && typeof header.height === 'number') {
+      this.cachedChainTip = { height: header.height, hex: header.hex || '' };
+    }
+  };
+
   constructor(options: ElectrumOptions = {}) {
     this.options = {
       host: options.host || 'localhost',
@@ -288,6 +299,9 @@ export class ElectrumClient {
           // Send server.version as required by Electrum protocol
           try {
             await this.call('server.version', this.options.clientName, this.options.clientVersion);
+            // Re-register Electrum-side subscriptions; WebSocket sessions do not preserve them
+            // after a drop, and we intentionally keep app callbacks across unexpected close.
+            await this.renewSubscriptionsAfterReconnect();
             resolve();
           } catch (error) {
             reject(error);
@@ -322,8 +336,9 @@ export class ElectrumClient {
             reject(new Error('Connection closed'));
           }
           this.pendingRequests.clear();
-          // Clear subscription callbacks on disconnect
-          this.subscriptionCallbacks.clear();
+          // Do not clear `subscriptionCallbacks` here — app handlers must survive
+          // transient disconnects so we can re-send `blockchain.headers.subscribe` on reconnect.
+          // Explicit `disconnect()` still clears callbacks.
         });
       } catch (error) {
         reject(error);
@@ -359,6 +374,19 @@ export class ElectrumClient {
         resolve(response.result);
       }
     }
+  }
+
+  /**
+   * After a new WebSocket is open, re-establish server-side Electrum subscriptions.
+   * Local callback refs are kept across unexpected closes; the server only remembers
+   * subscriptions for the current session.
+   */
+  private async renewSubscriptionsAfterReconnect(): Promise<void> {
+    if (!this.hasBlockHeaderSubscriptions()) {
+      return;
+    }
+    this.chainTipSubscribed = false;
+    await this.ensureChainTipSubscription();
   }
 
   /**
@@ -569,12 +597,7 @@ export class ElectrumClient {
     if (!this.subscriptionCallbacks.has(method)) {
       this.subscriptionCallbacks.set(method, new Set());
     }
-    this.subscriptionCallbacks.get(method)!.add((params: any) => {
-      const header = Array.isArray(params) ? params[0] : params;
-      if (header && typeof header.height === 'number') {
-        this.cachedChainTip = { height: header.height, hex: header.hex || '' };
-      }
-    });
+    this.subscriptionCallbacks.get(method)!.add(this.onChainTipCacheUpdate);
 
     this.chainTipSubscribed = true;
   }

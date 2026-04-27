@@ -352,9 +352,56 @@ console.log('Sent tx:', result.txId);
 console.log('Fee:', Number(result.fee) / 1e8, 'NAV');
 ```
 
+##### `sendToMany(options: SendToManyOptions): Promise<SendTransactionResult>`
+
+Build and broadcast a single confidential NAV transaction with multiple destinations. All recipients share the same set of (auto- or manually-selected) NAV inputs and a single optional change output.
+
+```typescript
+interface SendRecipient {
+  address: string;                   // Destination address (bech32m encoded)
+  amount: bigint;                    // Amount in satoshis (must be > 0)
+  memo?: string;                     // Optional memo for this output
+  subtractFeeFromAmount?: boolean;   // If true, this recipient pays a share of the fee
+}
+
+interface SendToManyOptions {
+  recipients: SendRecipient[];       // One or more recipients (must be non-empty)
+  selectedUtxos?: string[];          // Optional manual UTXO selection (NAV outputHashes)
+}
+```
+
+When `subtractFeeFromAmount` is set on more than one recipient, the fee is split evenly between them (any rounding remainder goes to the first such recipient). Token and NFT sends are not supported by this helper – use `sendToken` / `sendNft` for those.
+
+```typescript
+const result = await client.sendToMany({
+  recipients: [
+    { address: 'tnav1...', amount: 100_000_000n, memo: 'invoice 1' },
+    { address: 'tnav1...', amount:  50_000_000n },
+    { address: 'tnav1...', amount:  25_000_000n, subtractFeeFromAmount: true },
+  ],
+});
+
+console.log('Sent tx:', result.txId);
+console.log('Outputs:', result.outputCount); // recipients + change
+```
+
 ##### `broadcastRawTransaction(rawTx: string): Promise<string>`
 
 Broadcast a pre-built raw transaction hex via the connected backend. Returns the transaction hash.
+
+##### `aggregateTransactions(txHexes: string[]): AggregateTransactionsResult`
+
+Aggregate one or more signed transaction hex strings into a single signed transaction using `navio-blsct`'s `CTx.aggregateTransactions()` helper. This does not broadcast automatically.
+
+```typescript
+const aggregated = client.aggregateTransactions([
+  signedTxHexA,
+  signedTxHexB,
+]);
+
+console.log(aggregated.txId);
+await client.broadcastRawTransaction(aggregated.rawTx);
+```
 
 ##### `sendToken(options: SendTokenOptions): Promise<SendTransactionResult>`
 
@@ -1026,6 +1073,17 @@ const result2 = await client.sendTransaction({
   amount: 50_000_000n,
   subtractFeeFromAmount: true,
 });
+
+// Send to multiple destinations in a single transaction
+const result3 = await client.sendToMany({
+  recipients: [
+    { address: 'tnav1...', amount: 100_000_000n, memo: 'rent' },
+    { address: 'tnav1...', amount:  50_000_000n },
+    { address: 'tnav1...', amount:  25_000_000n, subtractFeeFromAmount: true },
+  ],
+});
+
+console.log('Multi-send tx:', result3.txId);
 ```
 
 ### Query Wallet Outputs
