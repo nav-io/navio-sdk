@@ -68,7 +68,7 @@ function makeSignedTransactionHex(seed: number): string {
     SubAddrId.generate(seed, seed),
   );
   const ctx = CTx.generate(
-    [makeFundingTxIn(seed, 500_000)],
+    [makeFundingTxIn(seed, 2_000_000)],
     [TxOut.generate(destination, 200_000, `memo-${seed}`)],
   );
   return ctx.serialize();
