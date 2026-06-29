@@ -1734,77 +1734,71 @@ export class NavioClient {
       ({ selected, totalIn } = NavioClient.selectInputs(confirmedUtxos, amount, subtractFeeFromAmount));
     }
 
-    // Calculate fee: (inputs + 2 outputs) * DEFAULT_FEE_PER_COMPONENT
-    // 2 outputs = destination + change (change may be zero but the fee estimate includes it)
-    const numComponents = selected.length + 2;
-    const fee = BigInt(numComponents * DEFAULT_FEE_PER_COMPONENT);
-
-    let sendAmount: bigint;
-    let changeAmount: bigint;
-
-    if (subtractFeeFromAmount) {
-      sendAmount = amount - fee;
-      if (sendAmount <= 0n) {
-        throw new Error(`Fee (${fee} sat) exceeds send amount (${amount} sat)`);
-      }
-      changeAmount = totalIn - amount;
-    } else {
-      sendAmount = amount;
-      const needed = amount + fee;
-      if (totalIn < needed) {
-        throw new Error(
-          `Insufficient funds: need ${needed} sat (${amount} + ${fee} fee) but only have ${totalIn} sat`
-        );
-      }
-      changeAmount = totalIn - amount - fee;
-    }
-
     // --- Build token ID ---
     const blsctTokenId = normalizedTokenId
       ? TokenId.deserialize(publicToStoredTokenIdHex(normalizedTokenId))
       : TokenId.default();
 
-    // --- Build inputs ---
+    // --- Build inputs (independent of the fee) ---
     const txIns: InstanceType<typeof TxIn>[] = [];
     for (const utxo of selected) {
       const txIn = this.buildTxInput(utxo, blsctTokenId);
       txIns.push(txIn);
     }
 
-    // --- Build outputs ---
-    const txOuts: InstanceType<typeof TxOut>[] = [];
+    // Build the dest+change outputs and serialize the tx for a given fee. The
+    // implicit on-chain fee is totalIn - sum(output values), so settling the
+    // fee here settles the change.
+    const buildForFee = (fee: bigint): { rawTx: string; txId: string; bytes: number; sendAmount: bigint; changeAmount: bigint } => {
+      let sendAmount: bigint;
+      let changeAmount: bigint;
+      if (subtractFeeFromAmount) {
+        sendAmount = amount - fee;
+        if (sendAmount <= 0n) {
+          throw new Error(`Fee (${fee} sat) exceeds send amount (${amount} sat)`);
+        }
+        changeAmount = totalIn - amount;
+      } else {
+        sendAmount = amount;
+        const needed = amount + fee;
+        if (totalIn < needed) {
+          throw new Error(
+            `Insufficient funds: need ${needed} sat (${amount} + ${fee} fee) but only have ${totalIn} sat`
+          );
+        }
+        changeAmount = totalIn - amount - fee;
+      }
 
-    // Destination output
-    const destTxOut = TxOut.generate(
-      destSubAddr,
-      Number(sendAmount),
-      memo,
-      blsctTokenId,
-      TxOutputType.Normal,
-      0,
-      false,
-      Scalar.random(),
-    );
-    txOuts.push(destTxOut);
-
-    // Change output (send back to ourselves at a change sub-address)
-    if (changeAmount > 0n) {
-      const changeSubAddr = this.getChangeSubAddress();
-      const changeTxOut = TxOut.generate(
-        changeSubAddr,
-        Number(changeAmount),
-        '',
-        blsctTokenId,
-        TxOutputType.Normal,
-        0,
-        false,
-        Scalar.random(),
+      const txOuts: InstanceType<typeof TxOut>[] = [];
+      txOuts.push(
+        TxOut.generate(destSubAddr, Number(sendAmount), memo, blsctTokenId, TxOutputType.Normal, 0, false, Scalar.random()),
       );
-      txOuts.push(changeTxOut);
-    }
+      if (changeAmount > 0n) {
+        const changeSubAddr = this.getChangeSubAddress();
+        txOuts.push(
+          TxOut.generate(changeSubAddr, Number(changeAmount), '', blsctTokenId, TxOutputType.Normal, 0, false, Scalar.random()),
+        );
+      }
+      const { rawTx, txId } = buildAndSerializeCTx(txIns, txOuts);
+      return { rawTx, txId, bytes: rawTx.length / 2, sendAmount, changeAmount };
+    };
 
-    // --- Build and serialize the confidential transaction ---
-    const { rawTx, txId } = buildAndSerializeCTx(txIns, txOuts);
+    // Consensus rule (blsct::VerifyTx): nFee >= GetTransactionWeight(tx) *
+    // nBLSCTDefaultFee, where the weight is the fully serialized byte length of
+    // the broadcast tx. A flat per-component estimate underprices BLSCT outputs
+    // (each range proof is hundreds of bytes) and the node rejects with
+    // `blsct-fee-below-min`. Iterate to a fixpoint on the actual serialized
+    // size: raising the fee shrinks the change (and thus the tx) monotonically,
+    // so this converges in a couple of rounds.
+    let fee = BigInt((selected.length + 2) * DEFAULT_FEE_PER_COMPONENT);
+    let built = buildForFee(fee);
+    for (let i = 0; i < 6; i++) {
+      const required = BigInt(built.bytes) * BLSCT_DEFAULT_FEE_RATE;
+      if (fee >= required) break;
+      fee = required;
+      built = buildForFee(fee);
+    }
+    const { rawTx, txId } = built;
 
     // --- Broadcast ---
     await this.broadcastRawTransaction(rawTx);
@@ -1830,7 +1824,7 @@ export class NavioClient {
       rawTx,
       fee,
       inputCount: txIns.length,
-      outputCount: txOuts.length,
+      outputCount: built.changeAmount > 0n ? 2 : 1,
     };
   }
 
@@ -2497,8 +2491,23 @@ export class NavioClient {
     inputs: Array<{ output: WalletOutput; tokenId: InstanceType<typeof TokenId> }>,
     outputs: InstanceType<typeof UnsignedOutput>[],
   ): bigint {
-    const { rawTx } = this.signUnsignedTransaction(inputs, outputs, 0n);
-    return BigInt(rawTx.length / 2) * BLSCT_DEFAULT_FEE_RATE;
+    // Consensus requires nFee >= GetTransactionWeight(tx) * BLSCT_DEFAULT_FEE_RATE,
+    // where the weight is the *fully serialized* (witness-inclusive) byte length
+    // of the broadcast transaction. The BLSCT fee output encodes the fee amount
+    // as a variable-length script push, so a tx signed with fee=0 serializes
+    // smaller than the final fee-bearing tx — estimating at fee=0 underpays and
+    // the node rejects with `blsct-fee-below-min`. Iterate to a fixpoint: sign
+    // with the current fee, measure the actual size, and bump until the
+    // size-implied requirement stops growing (converges in 2-3 rounds since the
+    // fee value's encoded length grows only logarithmically).
+    let fee = 0n;
+    for (let i = 0; i < 5; i++) {
+      const { rawTx } = this.signUnsignedTransaction(inputs, outputs, fee);
+      const required = BigInt(rawTx.length / 2) * BLSCT_DEFAULT_FEE_RATE;
+      if (required <= fee) break;
+      fee = required;
+    }
+    return fee;
   }
 
   private async signAndBroadcastUnsignedTransaction(
