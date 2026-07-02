@@ -786,17 +786,27 @@ describe('NavioClient', () => {
       ],
     });
 
-    // 1 input + 3 recipient outputs + 1 change output
+    // 1 input; 3 recipient outputs + 1 change output + 1 fee output = 5.
+    // (No spurious burn-address change output — see the build_ctx note in
+    // sendToMany.)
     expect(result.inputCount).toBe(1);
-    expect(result.outputCount).toBe(4);
+    expect(result.outputCount).toBe(5);
     expect(result.fee).toBeGreaterThan(0n);
     expect(broadcastRawTransaction).toHaveBeenCalledWith(result.rawTx);
     expect(walletDB.markOutputSpent).toHaveBeenCalledWith('aa'.repeat(32), result.txId, 0);
     expect(processMempoolTransaction).toHaveBeenCalledWith(result.txId, result.rawTx);
 
-    // Resulting CTx is parseable and matches the broadcast hex
+    // Resulting CTx is parseable and its real on-chain output count matches
+    // the reported count (exactly one fee output, no phantom output).
     const ctx = CTx.deserialize(result.rawTx);
     expect(ctx.getCTxIns().size()).toBe(1);
+    expect(ctx.getCTxOuts().size()).toBe(5);
+    let feeOutputs = 0;
+    for (let i = 0; i < ctx.getCTxOuts().size(); i++) {
+      const pred = ctx.getCTxOuts().at(i).getVectorPredicate();
+      if (pred && pred.length > 0) feeOutputs++;
+    }
+    expect(feeOutputs).toBe(1);
   });
 
   it('should reject sendToMany with no recipients', async () => {
@@ -878,9 +888,13 @@ describe('NavioClient', () => {
 
     // Funding 5_000_000n covers full sum 4_500_000n with fee absorbed by the
     // first two recipients, leaving 500_000n change.
+    // 3 recipient outputs + 1 change output + 1 fee output = 5.
     expect(result.inputCount).toBe(1);
-    expect(result.outputCount).toBe(4);
+    expect(result.outputCount).toBe(5);
     expect(result.fee).toBeGreaterThan(0n);
+
+    const ctx = CTx.deserialize(result.rawTx);
+    expect(ctx.getCTxOuts().size()).toBe(5);
   });
 
   it('should fund fungible token sends with NAV inputs for the fee', async () => {

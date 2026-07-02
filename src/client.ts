@@ -30,44 +30,7 @@ const {
   CTx, UnsignedInput, UnsignedOutput, UnsignedTransaction,
   TokenInfo, TokenType,
   calcCollectionTokenHashHex, deriveCollectionTokenKeyFromMaster, deriveCollectionTokenPublicKeyFromMaster,
-  buildCTx, createTxInVec, addToTxInVec, createTxOutVec, addToTxOutVec,
-  deleteTxInVec, deleteTxOutVec, freeObj, getCTxId, serializeCTx,
 } = blsctModule as any;
-
-/**
- * Build a confidential transaction and return its serialized hex.
- * Uses serializeCTx + getCTxId from navio-blsct (works in both Node and WASM).
- */
-function buildAndSerializeCTx(
-  txIns: InstanceType<typeof TxIn>[],
-  txOuts: InstanceType<typeof TxOut>[],
-): { rawTx: string; txId: string } {
-  const txInVec = createTxInVec();
-  for (const txIn of txIns) addToTxInVec(txInVec, txIn.value());
-  const txOutVec = createTxOutVec();
-  for (const txOut of txOuts) addToTxOutVec(txOutVec, txOut.value());
-
-  const rv = buildCTx(txInVec, txOutVec);
-
-  if (rv.result !== 0) {
-    deleteTxInVec(txInVec);
-    deleteTxOutVec(txOutVec);
-    const msg = `building tx failed. Error code = ${rv.result}`;
-    freeObj(rv);
-    throw new Error(msg);
-  }
-
-  const ctxPtr = rv.ctx;
-  freeObj(rv);
-
-  const rawTx: string = serializeCTx(ctxPtr);
-  const txId: string = getCTxId(ctxPtr);
-
-  deleteTxInVec(txInVec);
-  deleteTxOutVec(txOutVec);
-
-  return { rawTx, txId };
-}
 
 /**
  * Network type for Navio
@@ -87,6 +50,25 @@ const DEFAULT_NAV_STORED_TOKEN_ID_HEX = DEFAULT_NAV_TOKEN_HASH_HEX + TOKEN_ID_NO
 const MAX_UINT64 = (1n << 64n) - 1n;
 const MAX_SAFE_INTEGER_BIGINT = BigInt(Number.MAX_SAFE_INTEGER);
 const BLSCT_DEFAULT_FEE_RATE = 125n;
+
+/**
+ * Consensus (blsct::VerifyTx) requires
+ *   nFee >= GetTransactionWeight(tx) * nBLSCTDefaultFee
+ * where the weight is `GetSerializeSize(TX_WITH_WITNESS(tx))` — the witness-
+ * inclusive serialization. The light-client `serializeCTx` produces the
+ * base (non-witness) form, which is a handful of bytes shorter (BLSCT witness
+ * framing the binding does not expose a size for), so fee = base_bytes * rate
+ * lands just under the consensus minimum and the node rejects the tx with
+ * `blsct-fee-below-min`. Add headroom — the larger of 10% or 256 bytes — over
+ * the measured base size. BLSCT outputs are large (range proofs), so the
+ * overpay is a negligible fraction of the fee while guaranteeing acceptance
+ * regardless of input/output count.
+ */
+function requiredBlsctFee(baseBytes: number): bigint {
+  const bytes = BigInt(baseBytes);
+  const headroom = bytes / 10n > 256n ? bytes / 10n : 256n;
+  return (bytes + headroom) * BLSCT_DEFAULT_FEE_RATE;
+}
 
 /**
  * Options for sending a transaction
@@ -1740,16 +1722,16 @@ export class NavioClient {
       : TokenId.default();
 
     // --- Build inputs (independent of the fee) ---
-    const txIns: InstanceType<typeof TxIn>[] = [];
-    for (const utxo of selected) {
-      const txIn = this.buildTxInput(utxo, blsctTokenId);
-      txIns.push(txIn);
-    }
+    const inputs = selected.map((utxo) => ({ output: utxo, tokenId: blsctTokenId }));
 
-    // Build the dest+change outputs and serialize the tx for a given fee. The
-    // implicit on-chain fee is totalIn - sum(output values), so settling the
-    // fee here settles the change.
-    const buildForFee = (fee: bigint): { rawTx: string; txId: string; bytes: number; sendAmount: bigint; changeAmount: bigint } => {
+    // Build the dest + change outputs for a given fee via the manual
+    // UnsignedTransaction path. NOTE: we do *not* use build_ctx here — that
+    // native helper appends its own change output (to a zero/burn destination)
+    // for any input-vs-output surplus and recomputes the fee itself, so any fee
+    // we overpay is siphoned into a spurious extra output (an unspendable burn)
+    // instead of being paid as fee. The unsigned path emits exactly the outputs
+    // we specify plus a single fee output whose value is the fee we set.
+    const buildOutputs = (fee: bigint): { outputs: InstanceType<typeof UnsignedOutput>[]; changeAmount: bigint } => {
       let sendAmount: bigint;
       let changeAmount: bigint;
       if (subtractFeeFromAmount) {
@@ -1769,63 +1751,35 @@ export class NavioClient {
         changeAmount = totalIn - amount - fee;
       }
 
-      const txOuts: InstanceType<typeof TxOut>[] = [];
-      txOuts.push(
+      const outputs: InstanceType<typeof UnsignedOutput>[] = [];
+      outputs.push(UnsignedOutput.fromTxOut(
         TxOut.generate(destSubAddr, Number(sendAmount), memo, blsctTokenId, TxOutputType.Normal, 0, false, Scalar.random()),
-      );
+      ));
       if (changeAmount > 0n) {
-        const changeSubAddr = this.getChangeSubAddress();
-        txOuts.push(
-          TxOut.generate(changeSubAddr, Number(changeAmount), '', blsctTokenId, TxOutputType.Normal, 0, false, Scalar.random()),
-        );
+        outputs.push(UnsignedOutput.fromTxOut(
+          TxOut.generate(this.getChangeSubAddress(), Number(changeAmount), '', blsctTokenId, TxOutputType.Normal, 0, false, Scalar.random()),
+        ));
       }
-      const { rawTx, txId } = buildAndSerializeCTx(txIns, txOuts);
-      return { rawTx, txId, bytes: rawTx.length / 2, sendAmount, changeAmount };
+      return { outputs, changeAmount };
     };
 
     // Consensus rule (blsct::VerifyTx): nFee >= GetTransactionWeight(tx) *
-    // nBLSCTDefaultFee, where the weight is the fully serialized byte length of
-    // the broadcast tx. A flat per-component estimate underprices BLSCT outputs
-    // (each range proof is hundreds of bytes) and the node rejects with
-    // `blsct-fee-below-min`. Iterate to a fixpoint on the actual serialized
-    // size: raising the fee shrinks the change (and thus the tx) monotonically,
-    // so this converges in a couple of rounds.
+    // nBLSCTDefaultFee. Unlike build_ctx, the fee we set here is the literal
+    // on-chain fee, so it must clear the consensus minimum. Iterate to a
+    // fixpoint on the actual signed (witness-inclusive) serialized size; raising
+    // the fee shrinks the change (and thus the tx) monotonically, so this
+    // converges in a couple of rounds.
     let fee = BigInt((selected.length + 2) * DEFAULT_FEE_PER_COMPONENT);
-    let built = buildForFee(fee);
+    let { outputs } = buildOutputs(fee);
     for (let i = 0; i < 6; i++) {
-      const required = BigInt(built.bytes) * BLSCT_DEFAULT_FEE_RATE;
+      const { rawTx } = this.signUnsignedTransaction(inputs, outputs, fee);
+      const required = requiredBlsctFee(rawTx.length / 2);
       if (fee >= required) break;
       fee = required;
-      built = buildForFee(fee);
-    }
-    const { rawTx, txId } = built;
-
-    // --- Broadcast ---
-    await this.broadcastRawTransaction(rawTx);
-
-    // --- Mark spent inputs immediately (safety net) ---
-    for (const utxo of selected) {
-      await walletDB.markOutputSpent(utxo.outputHash, txId, 0);
+      ({ outputs } = buildOutputs(fee));
     }
 
-    // --- Process the mempool transaction using the same ownership detection
-    //     logic as confirmed blocks (blockHeight=0 for unconfirmed). The raw
-    //     tx is deserialized locally to extract keys and range proofs. ---
-    if (this.syncManager) {
-      try {
-        await this.syncManager.processMempoolTransaction(txId, rawTx);
-      } catch {
-        // Mempool tx processing is best-effort; failures are non-fatal
-      }
-    }
-
-    return {
-      txId,
-      rawTx,
-      fee,
-      inputCount: txIns.length,
-      outputCount: built.changeAmount > 0n ? 2 : 1,
-    };
+    return this.signAndBroadcastUnsignedTransaction(walletDB, inputs, outputs, fee);
   }
 
   /**
@@ -1937,110 +1891,101 @@ export class NavioClient {
       }
     }
 
-    // Final fee uses the actual number of selected inputs and recipient outputs,
-    // assuming a change output (consistent with single-recipient sendTransaction).
-    const numComponents = selected.length + recipients.length + 1;
-    const fee = BigInt(numComponents * DEFAULT_FEE_PER_COMPONENT);
+    const navTokenId = TokenId.default();
+    const inputs = selected.map((utxo) => ({ output: utxo, tokenId: navTokenId }));
+    const baseAmounts = decodedRecipients.map((recipient) => recipient.amount);
 
-    const sendAmounts = decodedRecipients.map((recipient) => recipient.amount);
-    let changeAmount: bigint;
+    // Build the recipient + change outputs for a candidate fee. Uses the manual
+    // UnsignedTransaction path (not build_ctx): the tx then contains exactly the
+    // recipient outputs, a single change output, and a single fee output.
+    // build_ctx instead appends its own change output to a zero/burn destination
+    // for any input-vs-output surplus and recomputes the fee itself, so an
+    // overpaid fee would be siphoned into a spurious, unspendable extra output.
+    const buildOutputs = (fee: bigint): { outputs: InstanceType<typeof UnsignedOutput>[]; changeAmount: bigint } => {
+      const sendAmounts = [...baseAmounts];
+      let changeAmount: bigint;
 
-    if (subtractFee) {
-      const payerCount = BigInt(subtractIndices.length);
-      const baseShare = fee / payerCount;
-      const remainder = fee % payerCount;
+      if (subtractFee) {
+        const payerCount = BigInt(subtractIndices.length);
+        const baseShare = fee / payerCount;
+        const remainder = fee % payerCount;
 
-      for (let k = 0; k < subtractIndices.length; k++) {
-        const recipientIndex = subtractIndices[k];
-        const extra = BigInt(k) < remainder ? 1n : 0n;
-        const share = baseShare + extra;
-        const adjusted = sendAmounts[recipientIndex] - share;
-        if (adjusted <= 0n) {
+        for (let k = 0; k < subtractIndices.length; k++) {
+          const recipientIndex = subtractIndices[k];
+          const extra = BigInt(k) < remainder ? 1n : 0n;
+          const share = baseShare + extra;
+          const adjusted = sendAmounts[recipientIndex] - share;
+          if (adjusted <= 0n) {
+            throw new Error(
+              `Fee share (${share} sat) exceeds recipient ${recipientIndex} amount ` +
+              `(${baseAmounts[recipientIndex]} sat)`
+            );
+          }
+          sendAmounts[recipientIndex] = adjusted;
+        }
+
+        if (totalIn < totalSendAmount) {
           throw new Error(
-            `Fee share (${share} sat) exceeds recipient ${recipientIndex} amount ` +
-            `(${sendAmounts[recipientIndex]} sat)`
+            `Insufficient funds: need ${totalSendAmount} sat but only have ${totalIn} sat`
           );
         }
-        sendAmounts[recipientIndex] = adjusted;
+        changeAmount = totalIn - totalSendAmount;
+      } else {
+        const needed = totalSendAmount + fee;
+        if (totalIn < needed) {
+          throw new Error(
+            `Insufficient funds: need ${needed} sat (${totalSendAmount} + ${fee} fee) but only have ${totalIn} sat`
+          );
+        }
+        changeAmount = totalIn - totalSendAmount - fee;
       }
 
-      if (totalIn < totalSendAmount) {
-        throw new Error(
-          `Insufficient funds: need ${totalSendAmount} sat but only have ${totalIn} sat`
-        );
+      const outputs: InstanceType<typeof UnsignedOutput>[] = [];
+      for (let i = 0; i < decodedRecipients.length; i++) {
+        const recipient = decodedRecipients[i];
+        outputs.push(UnsignedOutput.fromTxOut(TxOut.generate(
+          recipient.subAddr,
+          Number(sendAmounts[i]),
+          recipient.memo,
+          navTokenId,
+          TxOutputType.Normal,
+          0,
+          false,
+          Scalar.random(),
+        )));
       }
-      changeAmount = totalIn - totalSendAmount;
-    } else {
-      const needed = totalSendAmount + fee;
-      if (totalIn < needed) {
-        throw new Error(
-          `Insufficient funds: need ${needed} sat (${totalSendAmount} + ${fee} fee) but only have ${totalIn} sat`
-        );
+
+      if (changeAmount > 0n) {
+        outputs.push(UnsignedOutput.fromTxOut(TxOut.generate(
+          this.getChangeSubAddress(),
+          Number(changeAmount),
+          '',
+          navTokenId,
+          TxOutputType.Normal,
+          0,
+          false,
+          Scalar.random(),
+        )));
       }
-      changeAmount = totalIn - totalSendAmount - fee;
-    }
 
-    const navTokenId = TokenId.default();
-
-    // --- Build inputs ---
-    const txIns: InstanceType<typeof TxIn>[] = [];
-    for (const utxo of selected) {
-      txIns.push(this.buildTxInput(utxo, navTokenId));
-    }
-
-    // --- Build outputs ---
-    const txOuts: InstanceType<typeof TxOut>[] = [];
-    for (let i = 0; i < decodedRecipients.length; i++) {
-      const recipient = decodedRecipients[i];
-      txOuts.push(TxOut.generate(
-        recipient.subAddr,
-        Number(sendAmounts[i]),
-        recipient.memo,
-        navTokenId,
-        TxOutputType.Normal,
-        0,
-        false,
-        Scalar.random(),
-      ));
-    }
-
-    if (changeAmount > 0n) {
-      const changeSubAddr = this.getChangeSubAddress();
-      txOuts.push(TxOut.generate(
-        changeSubAddr,
-        Number(changeAmount),
-        '',
-        navTokenId,
-        TxOutputType.Normal,
-        0,
-        false,
-        Scalar.random(),
-      ));
-    }
-
-    const { rawTx, txId } = buildAndSerializeCTx(txIns, txOuts);
-
-    await this.broadcastRawTransaction(rawTx);
-
-    for (const utxo of selected) {
-      await walletDB.markOutputSpent(utxo.outputHash, txId, 0);
-    }
-
-    if (this.syncManager) {
-      try {
-        await this.syncManager.processMempoolTransaction(txId, rawTx);
-      } catch {
-        // Mempool tx processing is best-effort; failures are non-fatal
-      }
-    }
-
-    return {
-      txId,
-      rawTx,
-      fee,
-      inputCount: txIns.length,
-      outputCount: txOuts.length,
+      return { outputs, changeAmount };
     };
+
+    // Fee fixpoint on the actual signed (witness-inclusive) size. The flat
+    // per-component estimate underprices BLSCT range proofs and the node rejects
+    // with `blsct-fee-below-min`; iterate until the size-implied requirement
+    // stops growing (raising the fee shrinks change and thus the tx).
+    let fee = BigInt((selected.length + recipients.length + 1) * DEFAULT_FEE_PER_COMPONENT);
+    let { outputs } = buildOutputs(fee);
+    for (let i = 0; i < 6; i++) {
+      const { rawTx } = this.signUnsignedTransaction(inputs, outputs, fee);
+      const required = requiredBlsctFee(rawTx.length / 2);
+      if (fee >= required) break;
+      fee = required;
+      ({ outputs } = buildOutputs(fee));
+    }
+
+    return this.signAndBroadcastUnsignedTransaction(walletDB, inputs, outputs, fee);
   }
 
   /**
@@ -2503,7 +2448,7 @@ export class NavioClient {
     let fee = 0n;
     for (let i = 0; i < 5; i++) {
       const { rawTx } = this.signUnsignedTransaction(inputs, outputs, fee);
-      const required = BigInt(rawTx.length / 2) * BLSCT_DEFAULT_FEE_RATE;
+      const required = requiredBlsctFee(rawTx.length / 2);
       if (required <= fee) break;
       fee = required;
     }
