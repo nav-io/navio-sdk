@@ -55,6 +55,17 @@ describe('KeyManager', () => {
       expect(viewKey).toBeDefined();
     });
 
+    it('should export the private view key as 32-byte hex', () => {
+      const keyManager = new KeyManager();
+      const seed = keyManager.generateNewSeed();
+      keyManager.setHDSeed(seed);
+
+      const viewKeyHex = keyManager.getPrivateViewKeyHex();
+
+      expect(viewKeyHex).toMatch(/^[0-9a-f]{64}$/);
+      expect(viewKeyHex).toBe(keyManager.getPrivateViewKey().serialize().padStart(64, '0'));
+    });
+
     it('should get public spending key after setting HD seed', () => {
       const keyManager = new KeyManager();
       const seed = keyManager.generateNewSeed();
@@ -73,6 +84,28 @@ describe('KeyManager', () => {
       expect(chain).not.toBeNull();
       expect(chain?.version).toBe(1);
       expect(chain?.seedId).toBeDefined();
+    });
+
+    it('should export the audit key in navio-core getblsctauditkey format', () => {
+      const keyManager = new KeyManager();
+      const seed = keyManager.generateNewSeed();
+      keyManager.setHDSeed(seed);
+
+      const auditKeyHex = keyManager.getAuditKeyHex();
+      const viewKeyHex = keyManager.getPrivateViewKeyHex();
+      const spendingKeyHex = keyManager.getPublicSpendingKey().serialize().padStart(96, '0');
+
+      expect(auditKeyHex).toMatch(/^[0-9a-f]{160}$/);
+      expect(auditKeyHex.slice(0, 64)).toBe(viewKeyHex);
+      expect(auditKeyHex.slice(64)).toBe(spendingKeyHex);
+    });
+
+    it('should keep the wallet view key export as an alias of the audit key', () => {
+      const keyManager = new KeyManager();
+      const seed = keyManager.generateNewSeed();
+      keyManager.setHDSeed(seed);
+
+      expect(keyManager.getWalletViewKeyHex()).toBe(keyManager.getAuditKeyHex());
     });
   });
 

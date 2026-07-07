@@ -203,6 +203,29 @@ describe('ElectrumClient', () => {
       expect(client.hasBlockHeaderSubscriptions()).toBe(false);
     });
 
+    it('should still receive block header notifications after WebSocket close and reconnect', async () => {
+      const client = new ElectrumClient({ host: 'localhost', port: 50001 });
+      await client.connect();
+
+      const callback = vi.fn();
+      await client.subscribeBlockHeaders(callback);
+
+      const ws1 = MockWebSocket.getLastInstance()!;
+      ws1.close();
+      await new Promise((resolve) => setTimeout(resolve, 20));
+
+      await client.connect();
+      const ws2 = MockWebSocket.getLastInstance()!;
+      expect(ws2).not.toBe(ws1);
+      // Allow open handler: server.version + re-subscription responses
+      await new Promise((resolve) => setTimeout(resolve, 30));
+
+      ws2.simulateNotification('blockchain.headers.subscribe', { height: 100100, hex: 'aa'.repeat(80) });
+      await new Promise((resolve) => setTimeout(resolve, 20));
+
+      expect(callback).toHaveBeenCalled();
+    });
+
     it('should handle errors in subscription callbacks gracefully', async () => {
       const client = new ElectrumClient({ host: 'localhost', port: 50001 });
       await client.connect();

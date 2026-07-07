@@ -1,4 +1,21 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import {
+  CTx,
+  CTxId,
+  OutPoint,
+  Point,
+  PublicKey,
+  Scalar,
+  TokenId,
+  TxIn,
+  UnsignedInput,
+  UnsignedOutput,
+  UnsignedTransaction,
+  calcCollectionTokenHashHex,
+  deriveCollectionTokenKeyFromMaster,
+  deriveCollectionTokenPublicKeyFromMaster,
+  getCTxOutBlindingKey,
+} from 'navio-blsct';
 import { TransactionKeysSync, SyncState } from './tx-keys-sync';
 import { WalletDB } from './wallet-db';
 import { SyncProvider, ChainTip, BlockHeadersResult } from './sync-provider';
@@ -172,6 +189,72 @@ describe('TransactionKeysSync', () => {
       // Verify output is still unspent
       const result = await db.exec("SELECT is_spent FROM wallet_outputs WHERE output_hash = 'unspent-output-hash'");
       expect(result[0].values[0][0]).toBe(0);
+    });
+  });
+
+  describe('token id extraction', () => {
+    it('should extract 40-byte token ids from serialized outputs', async () => {
+      syncProvider = createMockSyncProvider({ chainTipHeight: 100 });
+      syncManager = new TransactionKeysSync(walletDB, syncProvider);
+
+      const maxAmountHex = 'ffffffffffffff7f';
+      const flagsHex = '0200000000000000'; // HAS_TOKENID
+      const scriptLenHex = '00';
+      const tokenIdHex = '11'.repeat(40);
+      const outputHex = maxAmountHex + flagsHex + scriptLenHex + tokenIdHex;
+
+      const result = (syncManager as any).extractRangeProofFromOutput(outputHex);
+
+      expect(result.rangeProofHex).toBeNull();
+      expect(result.tokenIdHex).toBe(tokenIdHex);
+    });
+
+    it('should recover token amounts from raw transactions when standalone output recovery is unavailable', async () => {
+      const keyManager = walletDB.getKeyManager();
+      if (!keyManager) {
+        throw new Error('expected wallet key manager');
+      }
+
+      const destination = keyManager.getSubAddress({ account: 0, address: 0 });
+      const masterTokenKey = keyManager.getMasterTokenKey();
+      const collectionTokenHashHex = calcCollectionTokenHashHex({ name: 'Mintable', symbol: 'TOK' }, 1_000_000);
+      const tokenKey = deriveCollectionTokenKeyFromMaster(masterTokenKey, collectionTokenHashHex);
+      const tokenPublicKey = deriveCollectionTokenPublicKeyFromMaster(masterTokenKey, collectionTokenHashHex);
+
+      const unsignedTx = UnsignedTransaction.create();
+      const outPoint = OutPoint.generate(CTxId.deserialize('33'.repeat(32)));
+      const fundingTxIn = TxIn.generate(
+        1_000_000,
+        new Scalar(444),
+        new Scalar(555),
+        TokenId.default(),
+        outPoint,
+        false,
+        false,
+      );
+      unsignedTx.addInput(UnsignedInput.fromTxIn(fundingTxIn));
+      unsignedTx.addOutput(UnsignedOutput.mintToken(destination, 123_456, new Scalar(777), tokenKey, tokenPublicKey));
+      unsignedTx.setFee(1000);
+
+      const rawTx = unsignedTx.sign();
+      const ctx = CTx.deserialize(rawTx);
+      const ctxOut = ctx.getCTxOuts().at(0);
+      const blindingKeyObj = PublicKey.fromPoint(Point.fromObj(getCTxOutBlindingKey((ctxOut as any).obj)));
+
+      syncProvider = createMockSyncProvider({ chainTipHeight: 100 });
+      syncProvider.getRawTransaction = vi.fn().mockResolvedValue(rawTx);
+      syncManager = new TransactionKeysSync(walletDB, syncProvider);
+      syncManager.setKeyManager(keyManager);
+
+      const recovered = await (syncManager as any).recoverConfirmedOutput(
+        'minted-token-tx',
+        0,
+        blindingKeyObj,
+        '',
+      );
+
+      expect(recovered.amount).toBe(123_456);
+      expect(recovered.tokenIdHex).toBe(ctxOut.getTokenId().serialize());
     });
   });
 

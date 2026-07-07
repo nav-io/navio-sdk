@@ -26,7 +26,7 @@ h2 { margin-bottom: 0.75rem; font-size: 1.1rem; color: #bbb; }
 .field label { display: block; font-size: 0.85rem; color: #888; margin-bottom: 0.25rem; }
 .field .hint { color: #555; font-size: 0.8rem; }
 
-input, textarea {
+input, textarea, select {
   width: 100%;
   padding: 0.5rem;
   background: #0f1117;
@@ -37,6 +37,7 @@ input, textarea {
   font-family: inherit;
 }
 textarea { resize: vertical; }
+.field-help { margin-top: 0.35rem; font-size: 0.75rem; color: #666; }
 
 .row { display: flex; gap: 0.5rem; flex-wrap: wrap; }
 
@@ -157,6 +158,66 @@ dd { word-break: break-all; }
 .send-status.ok { color: #86efac; }
 .send-status.error { color: #fca5a5; }
 
+/* Asset list */
+.assets-container { display: grid; gap: 0.55rem; }
+.asset-item {
+  background: #0f1117;
+  border: 1px solid #1f222d;
+  border-radius: 6px;
+  padding: 0.7rem;
+}
+.asset-item-header {
+  display: flex;
+  justify-content: space-between;
+  gap: 0.75rem;
+  align-items: center;
+}
+.asset-title {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  min-width: 0;
+}
+.asset-name {
+  font-weight: 600;
+  color: #e5e7eb;
+}
+.asset-kind {
+  display: inline-block;
+  padding: 0.1rem 0.35rem;
+  border-radius: 999px;
+  font-size: 0.65rem;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+.asset-kind.token { background: #1e3a8a; color: #bfdbfe; }
+.asset-kind.nft { background: #5b21b6; color: #ddd6fe; }
+.asset-balance {
+  font-family: 'SF Mono', 'Fira Code', monospace;
+  color: #86efac;
+  font-size: 0.82rem;
+  white-space: nowrap;
+}
+.asset-meta {
+  margin-top: 0.35rem;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.6rem;
+  font-size: 0.72rem;
+  color: #666;
+}
+.asset-token-id {
+  font-family: 'SF Mono', 'Fira Code', monospace;
+  color: #888;
+  word-break: break-all;
+}
+.asset-action {
+  margin-top: 0.55rem;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.45rem;
+}
+
 /* UTXO table */
 .utxo-container { max-height: 400px; overflow-y: auto; }
 
@@ -190,6 +251,7 @@ dd { word-break: break-all; }
 .utxo-table .utxo-amount { text-align: right; color: #86efac; }
 .utxo-table .utxo-spent .utxo-amount { color: #fca5a5; }
 .utxo-table .utxo-height { text-align: right; }
+.utxo-table .utxo-asset { color: #93c5fd; }
 .utxo-count { font-size: 0.75rem; color: #555; margin-top: 0.35rem; }
 
 /* Transaction history */
@@ -253,6 +315,22 @@ dd { word-break: break-all; }
   color: #a78bfa;
   font-style: italic;
 }
+.tx-assets {
+  margin-top: 0.35rem;
+  display: grid;
+  gap: 0.2rem;
+}
+.tx-asset-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 0.75rem;
+  font-family: 'SF Mono', 'Fira Code', monospace;
+  font-size: 0.72rem;
+}
+.tx-asset-name { color: #888; }
+.tx-asset-amount.positive { color: #86efac; }
+.tx-asset-amount.negative { color: #fca5a5; }
+.tx-asset-amount.neutral { color: #93c5fd; }
 
 .toggle-label {
   font-size: 0.75rem;

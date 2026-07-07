@@ -745,6 +745,14 @@ export class KeyManager {
   }
 
   /**
+   * Get the private view key as a fixed-width hex string.
+   * Matches navio-core's 32-byte private view key encoding.
+   */
+  getPrivateViewKeyHex(): string {
+    return this.getPrivateViewKey().serialize().padStart(64, '0');
+  }
+
+  /**
    * Get the public spending key
    * @returns The public spending key
    */
@@ -753,6 +761,26 @@ export class KeyManager {
       throw new Error('Spending key is not available');
     }
     return this.spendPublicKey;
+  }
+
+  /**
+   * Export the BLSCT audit key as fixed-width hex.
+   * Matches navio-core getblsctauditkey / IMPORT_VIEW_KEY format:
+   *   32-byte private view key || 48-byte public spending key
+   */
+  getAuditKeyHex(): string {
+    const viewKeyHex = this.getPrivateViewKeyHex();
+    const spendingKeyHex = this.getPublicSpendingKey().serialize().padStart(96, '0');
+
+    return viewKeyHex + spendingKeyHex;
+  }
+
+  /**
+   * Backward-compatible alias for the audit key export.
+   * @deprecated Use getAuditKeyHex()
+   */
+  getWalletViewKeyHex(): string {
+    return this.getAuditKeyHex();
   }
 
   /**
@@ -829,10 +857,6 @@ export class KeyManager {
    * @returns The generated sub-address and its identifier
    */
   generateNewSubAddress(account: number): { subAddress: SubAddrType; id: SubAddressIdentifier } {
-    if (!this.canGenerateKeys()) {
-      throw new Error('Cannot generate keys - HD not enabled');
-    }
-
     if (!this.viewKey || !this.spendPublicKey) {
       throw new Error('View key or spending public key not available');
     }
