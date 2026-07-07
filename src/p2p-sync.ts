@@ -155,6 +155,7 @@ export class P2PSyncProvider extends BaseSyncProvider {
     this.headersByHash.clear();
     this.headersByHeight.clear();
     this.blockCache.clear();
+    this.outputDataCache.clear();
     this.chainTipHeight = -1;
   }
 
@@ -175,9 +176,11 @@ export class P2PSyncProvider extends BaseSyncProvider {
    * sync) observe blocks mined after the connection was established.
    */
   async getChainTipHeight(): Promise<number> {
-    // No headers synced yet: use the peer's handshake-reported height
-    if (this.chainTipHeight < 0) {
-      return this.client.getPeerStartHeight();
+    // No headers synced yet (connect() seeds chainTipHeight from the
+    // handshake before any header round-trip): report the peer's height
+    // without triggering a refresh.
+    if (this.chainTipHeight < 0 || this.headersByHeight.size === 0) {
+      return this.chainTipHeight < 0 ? this.client.getPeerStartHeight() : this.chainTipHeight;
     }
 
     const now = Date.now();
@@ -212,6 +215,24 @@ export class P2PSyncProvider extends BaseSyncProvider {
     const cached = this.headersByHeight.get(height);
     if (cached) {
       return cached.rawHex;
+    }
+
+    // getheaders never returns the genesis block itself, so serve height 0
+    // by fetching the genesis block (hash learned from block 1's prevHash)
+    // and slicing its 80-byte header. Deep reorg checks probe down to
+    // height 0 on short chains (e.g. regtest).
+    if (height === 0 && this.genesisHash) {
+      const blockData = await this.fetchBlock(this.genesisHash);
+      const rawHex = blockData.subarray(0, 80).toString('hex');
+      const header: CachedHeader = {
+        height: 0,
+        hash: this.genesisHash,
+        rawHex,
+        prevHash: '0'.repeat(64),
+      };
+      this.headersByHash.set(this.genesisHash, header);
+      this.headersByHeight.set(0, header);
+      return rawHex;
     }
 
     // Need to fetch headers up to this height

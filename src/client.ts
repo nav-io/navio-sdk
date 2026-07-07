@@ -2290,7 +2290,7 @@ export class NavioClient {
     const res = await electrum.rfqRequestQuote(
       NavioClient.toDaemonToken(options.buyTokenId),
       NavioClient.toDaemonToken(options.sellTokenId),
-      Number(options.amount),
+      toSafeInteger(options.amount, 'amount'),
       options.expiry,
     );
     return { uuid: res.uuid, replyKey: res.reply_key };
@@ -2381,9 +2381,9 @@ export class NavioClient {
     return electrum.swapSetIntent(
       NavioClient.toDaemonToken(options.tokenInId),
       NavioClient.toDaemonToken(options.tokenOutId),
-      Number(options.minSize),
-      Number(options.maxSize),
-      Number(options.priceMin),
+      toSafeInteger(options.minSize, 'minSize'),
+      toSafeInteger(options.maxSize, 'maxSize'),
+      toSafeInteger(options.priceMin, 'priceMin'),
       options.expiry,
     );
   }
@@ -2469,8 +2469,8 @@ export class NavioClient {
       halfHex,
       NavioClient.toDaemonToken(request.buyTokenId),
       NavioClient.toDaemonToken(request.sellTokenId),
-      Number(request.fill),
-      Number(request.sellCost),
+      toSafeInteger(request.fill, 'fill'),
+      toSafeInteger(request.sellCost, 'sellCost'),
       orderExpiry,
     );
 
@@ -2502,9 +2502,9 @@ export class NavioClient {
     const quoteId = await electrum.swapBroadcastOrder(
       halfHex,
       NavioClient.toDaemonToken(options.offerTokenId),
-      Number(options.offerAmount),
+      toSafeInteger(options.offerAmount, 'offerAmount'),
       NavioClient.toDaemonToken(options.wantTokenId),
-      Number(options.wantAmount),
+      toSafeInteger(options.wantAmount, 'wantAmount'),
       options.expiry,
     );
 
@@ -2605,18 +2605,18 @@ export class NavioClient {
       const outputs: InstanceType<typeof UnsignedOutput>[] = [];
       // The received leg: an output with no matching input in this half.
       outputs.push(UnsignedOutput.fromTxOut(TxOut.generate(
-        recvDestination, Number(recvAmount), 'swap-recv', recv.blsct,
+        recvDestination, toSafeInteger(recvAmount, 'recvAmount'), 'swap-recv', recv.blsct,
         TxOutputType.Normal, 0, false, Scalar.random(),
       )));
       if (payChange > 0n) {
         outputs.push(UnsignedOutput.fromTxOut(TxOut.generate(
-          changeSubAddr, Number(payChange), '', pay.blsct,
+          changeSubAddr, toSafeInteger(payChange, 'pay change'), '', pay.blsct,
           TxOutputType.Normal, 0, false, Scalar.random(),
         )));
       }
       if (navChange > 0n) {
         outputs.push(UnsignedOutput.fromTxOut(TxOut.generate(
-          changeSubAddr, Number(navChange), '', TokenId.default(),
+          changeSubAddr, toSafeInteger(navChange, 'NAV change'), '', TokenId.default(),
           TxOutputType.Normal, 0, false, Scalar.random(),
         )));
       }
