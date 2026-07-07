@@ -861,66 +861,6 @@ export class TransactionKeysSync {
           outputHex = await this.withRetry(() =>
             this.syncProvider.getTransactionOutput(outputHash)
           );
-<<<<<<< HEAD
-
-          // Recover the amount from the range proof
-          const RangeProof = blsctModule.RangeProof;
-          const AmountRecoveryReq = blsctModule.AmountRecoveryReq;
-          
-          let recoveredAmount = 0;
-          let recoveredGamma = '0';
-          let recoveredMemo: string | null = null;
-          let tokenIdHex: string | null = null;
-
-          try {
-            // Calculate the nonce (shared secret) for amount recovery
-            const nonce = this.keyManager.calculateNonce(blindingKeyObj);
-
-            // Parse the range proof from the output data
-            const rangeProofResult = this.extractRangeProofFromOutput(outputHex);
-
-            if (rangeProofResult.rangeProofHex) {
-              const rangeProof = RangeProof.deserialize(rangeProofResult.rangeProofHex);
-
-              // Create recovery request
-              const req = new AmountRecoveryReq(rangeProof, nonce);
-
-              // Recover the amount using static method
-              const results = RangeProof.recoverAmounts([req]);
-              
-              if (results.length > 0 && results[0].isSucc) {
-                recoveredAmount = Number(results[0].amount);
-                recoveredGamma = results[0].gamma ?? '0';
-                recoveredMemo = results[0].msg || null;
-              }
-            }
-            
-            tokenIdHex = rangeProofResult.tokenIdHex;
-          } catch {
-            // Amount recovery failed; store output with zero amount
-          }
-
-          // Store output as spendable with recovered amount
-          await this.storeWalletOutput(
-            outputHash,
-            txHash,
-            outputIndex,
-            blockHeight,
-            outputHex,
-            recoveredAmount,
-            recoveredGamma,
-            recoveredMemo,
-            tokenIdHex,
-            blindingKey,
-            spendingKey,
-            false, // not spent
-            null, // spent_tx_hash
-            null, // spent_block_height
-            txType,
-            blockTimestamp
-          );
-=======
->>>>>>> origin/master
         } catch {
           // Some providers may not expose standalone output serialization.
           // Recovery falls back to parsing the full raw transaction below.
@@ -948,7 +888,9 @@ export class TransactionKeysSync {
           spendingKey,
           false, // not spent
           null, // spent_tx_hash
-          null // spent_block_height
+          null, // spent_block_height
+          txType,
+          blockTimestamp
         );
       }
     }
