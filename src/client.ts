@@ -22,6 +22,19 @@ import * as blsctModule from 'navio-blsct';
 import { BlsctChain, setChain } from 'navio-blsct';
 import { sha256 } from '@noble/hashes/sha256';
 import type { DatabaseAdapterType } from './database-adapter';
+import type {
+  RequestQuoteOptions,
+  RequestQuoteResult,
+  QuoteSummary,
+  AcceptQuoteOptions,
+  AcceptQuoteResult,
+  SwapIntentOptions,
+  SwapIntent,
+  PendingQuoteRequest,
+  ReplyQuoteOptions,
+  MakerQuoteResult,
+  BroadcastOrderOptions,
+} from './trading.types';
 
 const {
   Scalar, PublicKey, SubAddr,
@@ -41,6 +54,14 @@ export type NetworkType = 'mainnet' | 'testnet' | 'signet' | 'regtest';
  * Fee per input+output in satoshis (matches navio-core default)
  */
 const DEFAULT_FEE_PER_COMPONENT = 200_000;
+
+/**
+ * Extra fee a maker's swap half over-funds so the combined transaction (its
+ * half + the taker's fee-free half) clears the consensus minimum for the
+ * COMBINED weight. Mirrors navio-core's per-candidate allowance:
+ * aggregation::CANDIDATE_WEIGHT_ESTIMATE (2500) * BLSCT_DEFAULT_FEE (125).
+ */
+const MAKER_TAKER_FEE_ALLOWANCE = 2500n * 125n;
 const TOKEN_HASH_HEX_LENGTH = 64;
 const TOKEN_ID_HEX_LENGTH = 80;
 const TOKEN_ID_SUBID_HEX_LENGTH = 16;
@@ -2170,6 +2191,518 @@ export class NavioClient {
     }
 
     throw new Error('Connected backend does not support transaction broadcasting');
+  }
+
+  // ============================================================================
+  // RFQ / Atomic-Swap Trading (Navio p2pmsg bus)
+  //
+  // Light-wallet participation in on-chain atomic swaps, both as taker and as
+  // maker, bridged through the connected ElectrumX server. Swap halves are
+  // BLSCT transactions that deliberately output a token they do not input
+  // (the received leg); the counterparty's half supplies it, so the combined
+  // transaction balances per token and the aggregate BLS signature verifies.
+  // Halves are always built and signed locally — keys never leave the client.
+  // ============================================================================
+
+  /**
+   * Require the electrum backend and return its client. Trading needs the
+   * ElectrumX RFQ bridge; the raw P2P backend does not carry it.
+   */
+  private getTradingClient(): ElectrumClient {
+    if (!this.electrumClient) {
+      throw new Error('Trading requires the electrum backend');
+    }
+    return this.electrumClient;
+  }
+
+  /**
+   * Normalize a public tokenId to the daemon's token-hash argument:
+   * 64-hex display-order hash, or the empty string for NAV. NFT sub-ids are
+   * not supported by the swap protocol.
+   */
+  private static toDaemonToken(tokenId: string | null): string {
+    if (tokenId === null) {
+      return '';
+    }
+    const normalized = tokenId.toLowerCase().replace(/^0x/, '');
+    if (normalized.length === TOKEN_ID_HEX_LENGTH
+        && normalized.slice(TOKEN_HASH_HEX_LENGTH) !== TOKEN_ID_NO_SUBID_HEX) {
+      throw new Error('NFT token ids (with sub-id) are not supported for swaps');
+    }
+    if (normalized.length !== TOKEN_HASH_HEX_LENGTH
+        && normalized.length !== TOKEN_ID_HEX_LENGTH) {
+      throw new Error(`Invalid tokenId length: expected ${TOKEN_HASH_HEX_LENGTH} or ${TOKEN_ID_HEX_LENGTH} hex chars`);
+    }
+    const hash = normalized.slice(0, TOKEN_HASH_HEX_LENGTH);
+    return hash === DEFAULT_NAV_TOKEN_HASH_HEX ? '' : hash;
+  }
+
+  /** Map a daemon token-hash result back to a public tokenId (null = NAV). */
+  private static fromDaemonToken(tokenHash: string): string | null {
+    if (!tokenHash || tokenHash === DEFAULT_NAV_TOKEN_HASH_HEX) {
+      return null;
+    }
+    return tokenHash;
+  }
+
+  private static parseQuoteSummary(raw: any): QuoteSummary {
+    return {
+      quoteId: raw.quote_id,
+      fill: BigInt(raw.fill),
+      sellCost: BigInt(raw.sell_cost),
+      price: Number(raw.price),
+      orderExpiry: Number(raw.order_expiry),
+    };
+  }
+
+  private static parsePendingQuoteRequest(raw: any): PendingQuoteRequest {
+    return {
+      uuid: raw.uuid,
+      buyTokenId: NavioClient.fromDaemonToken(raw.buy_token),
+      sellTokenId: NavioClient.fromDaemonToken(raw.sell_token),
+      fill: BigInt(raw.fill),
+      sellCost: BigInt(raw.sell_cost),
+      replyKey: raw.reply_key,
+    };
+  }
+
+  /**
+   * Open a request-for-quote to buy `amount` of a token, paying with another
+   * (taker side). The daemon broadcasts the request over the encrypted p2p
+   * messaging bus and collects maker quotes; poll {@link listQuotes} and
+   * accept one with {@link acceptQuote} before `expiry`.
+   *
+   * @example
+   * ```typescript
+   * const req = await client.requestQuote({
+   *   buyTokenId: token, sellTokenId: null,
+   *   amount: 100_000_000n, expiry: Math.floor(Date.now() / 1000) + 300,
+   * });
+   * // later:
+   * const quotes = await client.listQuotes(req.uuid);
+   * ```
+   */
+  async requestQuote(options: RequestQuoteOptions): Promise<RequestQuoteResult> {
+    if (options.amount <= 0n) {
+      throw new Error('Amount must be positive');
+    }
+    const electrum = this.getTradingClient();
+    const res = await electrum.rfqRequestQuote(
+      NavioClient.toDaemonToken(options.buyTokenId),
+      NavioClient.toDaemonToken(options.sellTokenId),
+      Number(options.amount),
+      options.expiry,
+    );
+    return { uuid: res.uuid, replyKey: res.reply_key };
+  }
+
+  /**
+   * List maker quotes collected so far for an open request, cheapest first.
+   */
+  async listQuotes(uuid: string, minFillRatio = 1.0): Promise<QuoteSummary[]> {
+    const electrum = this.getTradingClient();
+    const quotes = await electrum.rfqListQuotes(uuid, minFillRatio);
+    return quotes.map(NavioClient.parseQuoteSummary);
+  }
+
+  /** Cancel an open request-for-quote, discarding its collected quotes. */
+  async cancelQuoteRequest(uuid: string): Promise<boolean> {
+    return this.getTradingClient().rfqCancel(uuid);
+  }
+
+  /**
+   * Accept a collected quote (taker side): builds and signs this wallet's
+   * unbalanced half — paying the quoted sell amount from its coins and
+   * receiving the quoted fill of the buy token — and submits it; the server's
+   * daemon combines it with the maker half and broadcasts the atomic swap.
+   *
+   * `maxPay` / `minRecv` are mandatory slippage bounds. The BLSCT balance
+   * proof guarantees no funds move unless both halves commit the same
+   * amounts, but it cannot protect against an unfavourable *rate* — these
+   * bounds are the taker's only trust anchor against a malicious quote.
+   */
+  async acceptQuote(options: AcceptQuoteOptions): Promise<AcceptQuoteResult> {
+    const { uuid, quoteId, maxPay, minRecv } = options;
+    if (maxPay === undefined || minRecv === undefined) {
+      throw new Error('maxPay and minRecv slippage bounds are required');
+    }
+    const electrum = this.getTradingClient();
+
+    const quotes = await this.listQuotes(uuid, 0);
+    const quote = quotes.find((q) => q.quoteId === quoteId);
+    if (!quote) {
+      throw new Error(`Quote ${quoteId} not found for request ${uuid}`);
+    }
+    if (quote.sellCost > maxPay) {
+      throw new Error(`Quote charges ${quote.sellCost} which exceeds maxPay ${maxPay}`);
+    }
+    if (quote.fill < minRecv) {
+      throw new Error(`Quote delivers ${quote.fill} which is below minRecv ${minRecv}`);
+    }
+
+    // The taker half pays no fee: the maker half over-funds the combined fee.
+    const { halfHex, fee, spentInputs } = await this.buildSwapHalf({
+      payTokenId: options.sellTokenId,
+      payAmount: quote.sellCost,
+      recvTokenId: options.buyTokenId,
+      recvAmount: quote.fill,
+      makerFee: false,
+      selectedUtxos: options.selectedUtxos,
+    });
+
+    const txId = await electrum.rfqAcceptQuote(uuid, quoteId, halfHex);
+
+    const { walletDB } = await this.ensureSpendReady();
+    for (const outputHash of spentInputs) {
+      await walletDB.markOutputSpent(outputHash, txId, 0);
+    }
+
+    return { txId, quote, fee };
+  }
+
+  /**
+   * Configure a maker swap intent on the connected daemon: offer to pay out
+   * `tokenInId` for `tokenOutId` within a size band at a minimum price.
+   * Matching inbound RFQ requests surface via
+   * {@link getPendingQuoteRequests} / {@link subscribePendingQuoteRequests}
+   * and are answered with {@link replyQuote}.
+   *
+   * Note: intents live on the daemon and are shared by all clients of the
+   * same ElectrumX server; they do not survive a daemon restart.
+   */
+  async setSwapIntent(options: SwapIntentOptions): Promise<number> {
+    if (options.minSize < 0n || options.maxSize < options.minSize) {
+      throw new Error('Invalid size band');
+    }
+    if (options.priceMin < 0n) {
+      throw new Error('priceMin must be non-negative');
+    }
+    const electrum = this.getTradingClient();
+    return electrum.swapSetIntent(
+      NavioClient.toDaemonToken(options.tokenInId),
+      NavioClient.toDaemonToken(options.tokenOutId),
+      Number(options.minSize),
+      Number(options.maxSize),
+      Number(options.priceMin),
+      options.expiry,
+    );
+  }
+
+  /** Remove a maker swap intent by id. */
+  async clearSwapIntent(intentId: number): Promise<boolean> {
+    return this.getTradingClient().swapClearIntent(intentId);
+  }
+
+  /** List the daemon's maker swap intents. */
+  async listSwapIntents(): Promise<SwapIntent[]> {
+    const intents = await this.getTradingClient().swapListIntents();
+    return intents.map((raw: any) => ({
+      id: Number(raw.id),
+      tokenIn: NavioClient.fromDaemonToken(raw.token_in),
+      tokenOut: NavioClient.fromDaemonToken(raw.token_out),
+      minSize: BigInt(raw.min_size),
+      maxSize: BigInt(raw.max_size),
+      priceMin: BigInt(raw.price_min),
+      expiry: Number(raw.expiry),
+    }));
+  }
+
+  /**
+   * List inbound RFQ requests that matched a swap intent and await a reply
+   * (maker side). Answer with {@link replyQuote}.
+   */
+  async getPendingQuoteRequests(): Promise<PendingQuoteRequest[]> {
+    const pending = await this.getTradingClient().swapPendingRequests();
+    return pending.map(NavioClient.parsePendingQuoteRequest);
+  }
+
+  /**
+   * Subscribe to pending matched RFQ requests (maker side). The callback
+   * fires with the full updated list whenever it changes.
+   * @returns The current pending list
+   */
+  async subscribePendingQuoteRequests(
+    callback: (pending: PendingQuoteRequest[]) => void,
+  ): Promise<PendingQuoteRequest[]> {
+    const electrum = this.getTradingClient();
+    const current = await electrum.subscribeSwapPendingRequests((pending) => {
+      callback((pending ?? []).map(NavioClient.parsePendingQuoteRequest));
+    });
+    return (current ?? []).map(NavioClient.parsePendingQuoteRequest);
+  }
+
+  /** Stop pending quote request notifications. */
+  async unsubscribePendingQuoteRequests(): Promise<boolean> {
+    return this.getTradingClient().unsubscribeSwapPendingRequests();
+  }
+
+  /**
+   * Answer a pending quote request (maker side): builds and signs this
+   * wallet's unbalanced half — delivering the requested fill and receiving
+   * the sell cost — and hands it to the daemon, which wraps it in a quote,
+   * encrypts it to the taker's reply key and broadcasts it over the bus.
+   *
+   * The half over-funds the transaction fee so the taker can accept with a
+   * fee-free half. The coins it spends are NOT locked: if the taker accepts,
+   * the wallet sees them spent on-chain; if the quote expires unaccepted,
+   * they remain spendable. Avoid spending them manually while a quote is
+   * outstanding, or the swap will fail to confirm.
+   */
+  async replyQuote(options: ReplyQuoteOptions): Promise<MakerQuoteResult> {
+    const { request } = options;
+    const electrum = this.getTradingClient();
+    const orderExpiry = options.orderExpiry ?? Math.floor(Date.now() / 1000) + 600;
+
+    // The maker pays what the taker buys, and receives what the taker sells.
+    const { halfHex, fee } = await this.buildSwapHalf({
+      payTokenId: request.buyTokenId,
+      payAmount: request.fill,
+      recvTokenId: request.sellTokenId,
+      recvAmount: request.sellCost,
+      makerFee: true,
+      selectedUtxos: options.selectedUtxos,
+    });
+
+    const quoteId = await electrum.swapSendQuote(
+      request.uuid,
+      request.replyKey,
+      halfHex,
+      NavioClient.toDaemonToken(request.buyTokenId),
+      NavioClient.toDaemonToken(request.sellTokenId),
+      Number(request.fill),
+      Number(request.sellCost),
+      orderExpiry,
+    );
+
+    return { quoteId, fee, halfTxHex: halfHex };
+  }
+
+  /**
+   * Publish a standing swap order (maker side): a pre-signed half offering
+   * `offerAmount` of `offerTokenId` for `wantAmount` of `wantTokenId`. Peers
+   * cache it (up to 14 days) and can answer matching RFQs with it while this
+   * wallet is offline. The same coin-locking caveat as {@link replyQuote}
+   * applies for the lifetime of the order.
+   */
+  async broadcastOrder(options: BroadcastOrderOptions): Promise<MakerQuoteResult> {
+    if (options.offerAmount <= 0n || options.wantAmount <= 0n) {
+      throw new Error('Amounts must be positive');
+    }
+    const electrum = this.getTradingClient();
+
+    const { halfHex, fee } = await this.buildSwapHalf({
+      payTokenId: options.offerTokenId,
+      payAmount: options.offerAmount,
+      recvTokenId: options.wantTokenId,
+      recvAmount: options.wantAmount,
+      makerFee: true,
+      selectedUtxos: options.selectedUtxos,
+    });
+
+    const quoteId = await electrum.swapBroadcastOrder(
+      halfHex,
+      NavioClient.toDaemonToken(options.offerTokenId),
+      Number(options.offerAmount),
+      NavioClient.toDaemonToken(options.wantTokenId),
+      Number(options.wantAmount),
+      options.expiry,
+    );
+
+    return { quoteId, fee, halfTxHex: halfHex };
+  }
+
+  /**
+   * Build and sign an unbalanced swap half: inputs cover `payAmount` of the
+   * pay token (plus the fee, when this half funds it); outputs are the
+   * received leg (recv token, no matching input — the counterparty's half
+   * supplies it), pay-token change, and NAV change when the fee is funded
+   * from separate NAV inputs.
+   *
+   * Fee: a taker half sets fee = 0 (the maker over-funds); a maker half
+   * iterates to the consensus-required fee for its own size plus a fixed
+   * allowance covering the taker's fee-free half.
+   */
+  private async buildSwapHalf(params: {
+    payTokenId: string | null;
+    payAmount: bigint;
+    recvTokenId: string | null;
+    recvAmount: bigint;
+    makerFee: boolean;
+    selectedUtxos?: string[];
+  }): Promise<{ halfHex: string; fee: bigint; spentInputs: string[] }> {
+    const { keyManager } = await this.ensureSpendReady();
+    const { payAmount, recvAmount, makerFee } = params;
+    if (payAmount <= 0n || recvAmount <= 0n) {
+      throw new Error('Swap amounts must be positive');
+    }
+
+    // Resolve token ids to the wallet's stored representation.
+    const allOutputs = await this.getAllOutputs();
+    const resolveToken = (tokenId: string | null): { publicId: string | null; blsct: InstanceType<typeof TokenId> } => {
+      if (tokenId === null) {
+        return { publicId: null, blsct: TokenId.default() };
+      }
+      const normalized = resolveRequestedTokenId(tokenId, allOutputs);
+      return { publicId: normalized, blsct: TokenId.deserialize(publicToStoredTokenIdHex(normalized)) };
+    };
+    const pay = resolveToken(params.payTokenId);
+    const recv = params.recvTokenId === null
+      ? { publicId: null, blsct: TokenId.default() }
+      : (() => {
+        // The recv token may not appear in this wallet yet; fall back to the
+        // raw public id when resolution finds no owned outputs.
+        try {
+          return resolveToken(params.recvTokenId);
+        } catch {
+          return {
+            publicId: params.recvTokenId,
+            blsct: TokenId.deserialize(publicToStoredTokenIdHex(params.recvTokenId!)),
+          };
+        }
+      })();
+
+    // resolveRequestedTokenId already yields the stored representation, so
+    // compare stored tokenIds directly (same convention as sendTransaction's
+    // token branch). NAV outputs are stored with tokenId === null.
+    const spendable = (utxo: WalletOutput, publicId: string | null): boolean =>
+      !utxo.isSpent && utxo.blockHeight > 0 && utxo.tokenId === publicId;
+    const payUtxos = allOutputs.filter((utxo) => spendable(utxo, pay.publicId));
+    const navUtxos = pay.publicId === null
+      ? payUtxos
+      : allOutputs.filter((utxo) => spendable(utxo, null));
+
+    const manualHashes = params.selectedUtxos ?? [];
+    const manualPay: WalletOutput[] = [];
+    const manualNav: WalletOutput[] = [];
+    if (manualHashes.length > 0) {
+      const payByHash = new Map(payUtxos.map((utxo) => [utxo.outputHash, utxo]));
+      const navByHash = new Map(navUtxos.map((utxo) => [utxo.outputHash, utxo]));
+      for (const hash of manualHashes) {
+        const payUtxo = payByHash.get(hash);
+        if (payUtxo) {
+          manualPay.push(payUtxo);
+          continue;
+        }
+        const navUtxo = navByHash.get(hash);
+        if (navUtxo) {
+          manualNav.push(navUtxo);
+          continue;
+        }
+        throw new Error(`Selected UTXO not found or not spendable: ${hash.slice(0, 16)}...`);
+      }
+    }
+
+    // Receive the swapped leg on the wallet's primary subaddress: it is part
+    // of the tracked subaddress pool, so the scanner detects the output when
+    // the swap confirms (a freshly generated destination would not be).
+    const recvDestination = keyManager.getSubAddress({ account: 0, address: 0 });
+    const changeSubAddr = this.getChangeSubAddress();
+
+    const buildOutputs = (
+      payChange: bigint,
+      navChange: bigint,
+    ): InstanceType<typeof UnsignedOutput>[] => {
+      const outputs: InstanceType<typeof UnsignedOutput>[] = [];
+      // The received leg: an output with no matching input in this half.
+      outputs.push(UnsignedOutput.fromTxOut(TxOut.generate(
+        recvDestination, Number(recvAmount), 'swap-recv', recv.blsct,
+        TxOutputType.Normal, 0, false, Scalar.random(),
+      )));
+      if (payChange > 0n) {
+        outputs.push(UnsignedOutput.fromTxOut(TxOut.generate(
+          changeSubAddr, Number(payChange), '', pay.blsct,
+          TxOutputType.Normal, 0, false, Scalar.random(),
+        )));
+      }
+      if (navChange > 0n) {
+        outputs.push(UnsignedOutput.fromTxOut(TxOut.generate(
+          changeSubAddr, Number(navChange), '', TokenId.default(),
+          TxOutputType.Normal, 0, false, Scalar.random(),
+        )));
+      }
+      return outputs;
+    };
+
+    const payIsNav = pay.publicId === null;
+    const feeGuess = makerFee
+      ? BigInt(4 * DEFAULT_FEE_PER_COMPONENT) + MAKER_TAKER_FEE_ALLOWANCE
+      : 0n;
+
+    // Select pay-token inputs (covering the fee too when paying in NAV).
+    let selectedPay: WalletOutput[];
+    let totalPayIn: bigint;
+    if (manualPay.length > 0) {
+      selectedPay = manualPay;
+      totalPayIn = manualPay.reduce((sum, utxo) => sum + utxo.amount, 0n);
+    } else {
+      ({ selected: selectedPay, totalIn: totalPayIn } = NavioClient.selectInputsByAmount(
+        payUtxos, payAmount + (payIsNav ? feeGuess : 0n),
+      ));
+    }
+    if (totalPayIn < payAmount) {
+      throw new Error(
+        `Insufficient funds: need ${payAmount} of the pay token but only have ${totalPayIn}`
+      );
+    }
+
+    // Select separate NAV inputs for the fee when paying with a token.
+    let selectedNav: WalletOutput[] = manualNav;
+    let totalNavIn = manualNav.reduce((sum, utxo) => sum + utxo.amount, 0n);
+    if (makerFee && !payIsNav && selectedNav.length === 0) {
+      ({ selected: selectedNav, totalIn: totalNavIn } = NavioClient.selectInputsByAmount(
+        navUtxos, feeGuess,
+      ));
+      if (totalNavIn === 0n) {
+        throw new Error('No unspent NAV outputs available to fund the swap fee');
+      }
+    }
+
+    const makeInputs = (): Array<{ output: WalletOutput; tokenId: InstanceType<typeof TokenId> }> => [
+      ...selectedPay.map((output) => ({ output, tokenId: pay.blsct })),
+      ...selectedNav.filter(() => !payIsNav).map((output) => ({ output, tokenId: TokenId.default() })),
+    ];
+
+    // Fee fixpoint. Taker halves pay 0; maker halves must clear the consensus
+    // minimum for their own signed size plus the taker allowance.
+    let fee = 0n;
+    let halfHex = '';
+    for (let i = 0; i < 6; i++) {
+      const feeFromNav = payIsNav ? fee : 0n;
+      const payChange = totalPayIn - payAmount - feeFromNav;
+      const navChange = payIsNav ? 0n : totalNavIn - fee;
+      if (payChange < 0n) {
+        throw new Error(
+          `Insufficient funds: need ${payAmount + feeFromNav} (amount + fee) but only have ${totalPayIn}`
+        );
+      }
+      if (navChange < 0n) {
+        throw new Error(
+          `Insufficient NAV funds for the swap fee: need ${fee} but only have ${totalNavIn}`
+        );
+      }
+
+      const outputs = buildOutputs(payChange, navChange);
+      const { rawTx } = this.signUnsignedTransaction(makeInputs(), outputs, fee);
+      halfHex = rawTx;
+
+      if (!makerFee) {
+        break;
+      }
+      const required = requiredBlsctFee(rawTx.length / 2) + MAKER_TAKER_FEE_ALLOWANCE;
+      if (fee >= required) {
+        break;
+      }
+      fee = required;
+    }
+
+    return {
+      halfHex,
+      fee,
+      spentInputs: [
+        ...selectedPay.map((utxo) => utxo.outputHash),
+        ...(payIsNav ? [] : selectedNav.map((utxo) => utxo.outputHash)),
+      ],
+    };
   }
 
   /**

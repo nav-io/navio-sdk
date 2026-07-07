@@ -792,6 +792,157 @@ export class ElectrumClient {
   }
 
   // ============================================================================
+  // RFQ / Atomic-Swap Bridge Methods (Navio p2pmsg bus)
+  // ============================================================================
+
+  /**
+   * Get the daemon's p2p messaging subsystem state.
+   * @returns Object with `enabled` and, when enabled, `inbox_pubkey`
+   */
+  async p2pmsgInfo(): Promise<{ enabled: boolean; inbox_pubkey?: string }> {
+    return this.call('blockchain.p2pmsg.info');
+  }
+
+  /**
+   * Open a request-for-quote (taker side). The daemon broadcasts it over the
+   * encrypted bus and collects maker quotes on our behalf.
+   * @param buyToken - Token hash hex to receive, '' for NAV
+   * @param sellToken - Token hash hex to pay with, '' for NAV
+   * @param size - Amount of the buy token wanted (base units)
+   * @param expiry - Unix time the collection window closes
+   * @returns Object with `uuid` and `reply_key`
+   */
+  async rfqRequestQuote(
+    buyToken: string,
+    sellToken: string,
+    size: number,
+    expiry: number
+  ): Promise<{ uuid: string; reply_key: string }> {
+    return this.call('blockchain.rfq.request_quote', buyToken, sellToken, size, expiry);
+  }
+
+  /**
+   * List quotes collected for an open request, ranked cheapest first.
+   * @param uuid - The request uuid
+   * @param minFillRatio - Drop quotes filling less than this fraction of size
+   */
+  async rfqListQuotes(uuid: string, minFillRatio = 1.0): Promise<any[]> {
+    return this.call('blockchain.rfq.list_quotes', uuid, minFillRatio);
+  }
+
+  /**
+   * Accept a collected quote: submit the locally built and signed taker half;
+   * the daemon combines it with the maker half and broadcasts the swap.
+   * @returns Transaction id of the broadcast swap
+   */
+  async rfqAcceptQuote(uuid: string, quoteId: string, takerHalfHex: string): Promise<string> {
+    return this.call('blockchain.rfq.accept_quote', uuid, quoteId, takerHalfHex);
+  }
+
+  /**
+   * Cancel an open request-for-quote, discarding its collected quotes.
+   */
+  async rfqCancel(uuid: string): Promise<boolean> {
+    return this.call('blockchain.rfq.cancel', uuid);
+  }
+
+  /**
+   * Configure a maker swap intent on the daemon (maker side). Inbound RFQ
+   * requests matching it are queued for this client to answer.
+   * @returns The numeric intent id
+   */
+  async swapSetIntent(
+    tokenIn: string,
+    tokenOut: string,
+    minSize: number,
+    maxSize: number,
+    priceMin: number,
+    expiry: number
+  ): Promise<number> {
+    return this.call(
+      'blockchain.swap.set_intent', tokenIn, tokenOut, minSize, maxSize, priceMin, expiry
+    );
+  }
+
+  /** Remove a maker swap intent by id. */
+  async swapClearIntent(intentId: number): Promise<boolean> {
+    return this.call('blockchain.swap.clear_intent', intentId);
+  }
+
+  /** List the daemon's maker swap intents. */
+  async swapListIntents(): Promise<any[]> {
+    return this.call('blockchain.swap.list_intents');
+  }
+
+  /** List inbound RFQ requests that matched a local intent and await a reply. */
+  async swapPendingRequests(): Promise<any[]> {
+    return this.call('blockchain.swap.pending_requests');
+  }
+
+  /**
+   * Send a maker quote (maker side). The half is built and signed locally;
+   * the daemon wraps it, encrypts it to the taker's reply key and broadcasts.
+   * @returns The quote id
+   */
+  async swapSendQuote(
+    uuid: string,
+    replyKey: string,
+    halfTxHex: string,
+    buyToken: string,
+    sellToken: string,
+    fill: number,
+    sellCost: number,
+    orderExpiry: number
+  ): Promise<string> {
+    return this.call(
+      'blockchain.swap.send_quote', uuid, replyKey, halfTxHex,
+      buyToken, sellToken, fill, sellCost, orderExpiry
+    );
+  }
+
+  /**
+   * Publish a standing swap order (maker side) that peers cache and can use
+   * to answer matching RFQs while this wallet is offline.
+   * @returns The quote id of the standing order
+   */
+  async swapBroadcastOrder(
+    halfTxHex: string,
+    offerToken: string,
+    offerAmount: number,
+    wantToken: string,
+    wantAmount: number,
+    expiry: number
+  ): Promise<string> {
+    return this.call(
+      'blockchain.swap.broadcast_order', halfTxHex,
+      offerToken, offerAmount, wantToken, wantAmount, expiry
+    );
+  }
+
+  /**
+   * Subscribe to pending matched RFQ requests (maker side). The callback
+   * receives the full updated pending list whenever it changes server-side.
+   * @returns The current pending list
+   */
+  async subscribeSwapPendingRequests(callback: (pending: any[]) => void): Promise<any[]> {
+    const method = 'blockchain.swap.pending.subscribe';
+    if (!this.subscriptionCallbacks.has(method)) {
+      this.subscriptionCallbacks.set(method, new Set());
+    }
+    // Notifications carry the pending list as the first params element.
+    this.subscriptionCallbacks.get(method)!.add((params: any) => {
+      callback(Array.isArray(params) ? params[0] : params);
+    });
+    return this.call(method);
+  }
+
+  /** Stop pending matched RFQ request notifications. */
+  async unsubscribeSwapPendingRequests(): Promise<boolean> {
+    this.subscriptionCallbacks.delete('blockchain.swap.pending.subscribe');
+    return this.call('blockchain.swap.pending.unsubscribe');
+  }
+
+  // ============================================================================
   // Utility Methods
   // ============================================================================
 

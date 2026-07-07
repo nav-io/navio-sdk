@@ -1,6 +1,6 @@
 {
     "name": "navio-sdk",
-    "version": "0.1.17",
+    "version": "0.1.18",
     "description": "TypeScript SDK for interacting with the Navio blockchain",
     "main": "dist/index.js",
     "module": "dist/index.mjs",
@@ -35,6 +35,7 @@
         "test:p2p": "tsx scripts/test-p2p-sync.ts",
         "test:client:p2p": "tsx scripts/test-client-p2p.ts",
         "test:encryption": "tsx scripts/test-encryption.ts",
+        "test:swap-live": "tsx scripts/test-swap-live.ts",
         "lint": "eslint src --ext .ts",
         "lint:fix": "eslint src --ext .ts --fix",
         "format": "prettier --write \"src/**/*.ts\" \"scripts/**/*.ts\"",
