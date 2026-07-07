@@ -163,6 +163,10 @@ export interface BlockTransactionKeys {
   height: number;
   /** Transaction keys for this block */
   txKeys: TransactionKeys[];
+  /** Unix epoch timestamp from the block header */
+  timestamp?: number;
+  /** Whether this block is a Proof-of-Stake block */
+  isPoS?: boolean;
 }
 
 /**
