@@ -29,6 +29,9 @@ export {
 // IndexedDB Adapter (browser, no WASM)
 export { IndexedDBWalletDB } from './adapters/indexeddb-wallet-db';
 
+// RFQ / Atomic-Swap Trading
+export * from './trading.types';
+
 // Sync Provider Architecture
 export * from './sync-provider';
 export * from './electrum-sync';

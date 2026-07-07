@@ -78,12 +78,22 @@ export class P2PSyncProvider extends BaseSyncProvider {
   private headersByHash: Map<string, CachedHeader> = new Map();
   private headersByHeight: Map<number, CachedHeader> = new Map();
   private chainTipHeight: number = -1;
+  private lastTipRefreshMs = 0;
+  /** Minimum interval between peer round-trips triggered by getChainTipHeight. */
+  private static readonly TIP_REFRESH_INTERVAL_MS = 5000;
   private chainTipHash: string = '';
   private genesisHash: string = '';
 
   // Block cache (limited size)
   private blockCache: Map<string, Buffer> = new Map();
   private maxBlockCacheSize = 10;
+
+  // Serialized-output cache, keyed by display-hex output hash. Populated
+  // while parsing blocks so wallet amount recovery can read outputs we have
+  // already downloaded: the daemon's getoutputdata only serves the mempool
+  // and the most recent block, so historical outputs must come from here.
+  private outputDataCache: Map<string, string> = new Map();
+  private maxOutputDataCacheSize = 50000;
 
   // Pending block requests
   private pendingBlocks: Map<string, Promise<Buffer>> = new Map();
@@ -145,6 +155,7 @@ export class P2PSyncProvider extends BaseSyncProvider {
     this.headersByHash.clear();
     this.headersByHeight.clear();
     this.blockCache.clear();
+    this.outputDataCache.clear();
     this.chainTipHeight = -1;
   }
 
@@ -157,15 +168,33 @@ export class P2PSyncProvider extends BaseSyncProvider {
 
   /**
    * Get current chain tip height
+   *
+   * The cached tip only advances when headers are synced, and unsolicited
+   * block/header announcements are not processed, so a long-lived provider
+   * would otherwise report the tip from connect time forever. Refresh from
+   * the peer (rate-limited) so polling callers (isSyncNeeded, background
+   * sync) observe blocks mined after the connection was established.
    */
   async getChainTipHeight(): Promise<number> {
-    // If we have synced headers, use that
-    if (this.chainTipHeight >= 0) {
-      return this.chainTipHeight;
+    // No headers synced yet (connect() seeds chainTipHeight from the
+    // handshake before any header round-trip): report the peer's height
+    // without triggering a refresh.
+    if (this.chainTipHeight < 0 || this.headersByHeight.size === 0) {
+      return this.chainTipHeight < 0 ? this.client.getPeerStartHeight() : this.chainTipHeight;
     }
 
-    // Otherwise use peer's reported height
-    return this.client.getPeerStartHeight();
+    const now = Date.now();
+    if (now - this.lastTipRefreshMs >= P2PSyncProvider.TIP_REFRESH_INTERVAL_MS) {
+      this.lastTipRefreshMs = now;
+      try {
+        await this.syncHeaders(this.chainTipHeight + 1, this.options.maxHeadersPerRequest);
+      } catch (err: any) {
+        // Keep serving the cached tip; the next poll retries.
+        this.log(`Tip refresh failed: ${err?.message ?? err}`);
+      }
+    }
+
+    return this.chainTipHeight;
   }
 
   /**
@@ -186,6 +215,24 @@ export class P2PSyncProvider extends BaseSyncProvider {
     const cached = this.headersByHeight.get(height);
     if (cached) {
       return cached.rawHex;
+    }
+
+    // getheaders never returns the genesis block itself, so serve height 0
+    // by fetching the genesis block (hash learned from block 1's prevHash)
+    // and slicing its 80-byte header. Deep reorg checks probe down to
+    // height 0 on short chains (e.g. regtest).
+    if (height === 0 && this.genesisHash) {
+      const blockData = await this.fetchBlock(this.genesisHash);
+      const rawHex = blockData.subarray(0, 80).toString('hex');
+      const header: CachedHeader = {
+        height: 0,
+        hash: this.genesisHash,
+        rawHex,
+        prevHash: '0'.repeat(64),
+      };
+      this.headersByHash.set(this.genesisHash, header);
+      this.headersByHeight.set(0, header);
+      return rawHex;
     }
 
     // Need to fetch headers up to this height
@@ -293,11 +340,13 @@ export class P2PSyncProvider extends BaseSyncProvider {
         const prevHeader = this.headersByHash.get(prevHash)!;
         headerHeight = prevHeader.height + 1;
       } else if (i === 0 && this.headersByHeight.size === 0) {
-        // First header in initial sync - this is genesis (height 0)
-        // Genesis block in Navio might have a non-zero prevHash for the PoS genesis
-        this.log(`Initial sync: first header is genesis (height 0)`);
-        headerHeight = 0;
-        this.genesisHash = hash;
+        // First header of the initial sync. getheaders never returns the
+        // genesis block itself — the response starts at block 1, whose
+        // prevHash IS the genesis hash. Labeling this header height 0 would
+        // shift every block (and every scanned wallet output) off by one.
+        this.log(`Initial sync: first header is block 1 (genesis = ${prevHash.substring(0, 16)}...)`);
+        headerHeight = 1;
+        this.genesisHash = prevHash;
       } else if (i > 0) {
         // Chain from the previous header in THIS batch
         // Since getheaders returns headers in chain order, header[i].prevHash should equal header[i-1].hash
@@ -576,10 +625,10 @@ export class P2PSyncProvider extends BaseSyncProvider {
 
       offset = result.newOffset;
 
-      if (result.outputKeys.length > 0) {
+      if (result.outputKeys.length > 0 || result.inputHashes.length > 0) {
         txKeys.push({
           txHash: result.txHash,
-          keys: this.formatOutputKeys(result.outputKeys),
+          keys: this.formatOutputKeys(result.outputKeys, result.inputHashes),
         });
       }
     }
@@ -673,9 +722,10 @@ export class P2PSyncProvider extends BaseSyncProvider {
   private parseBlsctTransaction(
     data: Buffer,
     offset: number
-  ): { txHash: string; outputKeys: ParsedOutputKeys[]; newOffset: number; error?: string } {
+  ): { txHash: string; outputKeys: ParsedOutputKeys[]; inputHashes: string[]; newOffset: number; error?: string } {
     const startOffset = offset;
     const outputKeys: ParsedOutputKeys[] = [];
+    const inputHashes: string[] = [];
 
     try {
       // Version (4 bytes)
@@ -706,13 +756,17 @@ export class P2PSyncProvider extends BaseSyncProvider {
       // NOTE: Navio's COutPoint only contains hash (no index/n field)
       // This is different from Bitcoin where COutPoint has both hash and n
       for (let i = 0; i < Number(inputCount); i++) {
-        offset += 32; // Previous output hash (prevout.hash) - Navio has no prevout.n!
+        // Previous output hash (prevout.hash) - Navio has no prevout.n!
+        // Record it (display hex) so spent-output detection can mark our
+        // wallet outputs consumed by this transaction.
+        inputHashes.push(Buffer.from(data.subarray(offset, offset + 32)).reverse().toString('hex'));
+        offset += 32;
         
         // scriptSig length + data
         const { value: scriptSigLen, bytesRead: sigLenBytes } = this.decodeVarInt(data, offset);
         offset += sigLenBytes;
         if (Number(scriptSigLen) > 10000) {
-          return { txHash: '', outputKeys: [], newOffset: offset, error: `Invalid scriptSig length: ${scriptSigLen}` };
+          return { txHash: '', outputKeys: [], inputHashes: [], newOffset: offset, error: `Invalid scriptSig length: ${scriptSigLen}` };
         }
         offset += Number(scriptSigLen);
         offset += 4; // sequence
@@ -724,9 +778,9 @@ export class P2PSyncProvider extends BaseSyncProvider {
 
       // Parse outputs
       for (let i = 0; i < Number(outputCount); i++) {
-        const outputResult = this.parseBlsctOutput(data, offset, i);
+        const outputResult = this.parseBlsctOutput(data, offset);
         if (outputResult.error) {
-          return { txHash: '', outputKeys: [], newOffset: offset, error: outputResult.error };
+          return { txHash: '', outputKeys: [], inputHashes: [], newOffset: offset, error: outputResult.error };
         }
         offset = outputResult.newOffset;
         if (outputResult.keys) {
@@ -764,12 +818,14 @@ export class P2PSyncProvider extends BaseSyncProvider {
       return {
         txHash,
         outputKeys,
+        inputHashes,
         newOffset: offset,
       };
     } catch (e) {
       return {
         txHash: '',
         outputKeys: [],
+        inputHashes: [],
         newOffset: offset,
         error: `Parse error: ${e}`,
       };
@@ -782,8 +838,8 @@ export class P2PSyncProvider extends BaseSyncProvider {
   private parseBlsctOutput(
     data: Buffer,
     offset: number,
-    outputIndex: number
   ): { keys: ParsedOutputKeys | null; newOffset: number; error?: string } {
+    const outputStart = offset;
     try {
       // Read value (8 bytes)
       const rawValue = data.readBigInt64LE(offset);
@@ -816,7 +872,7 @@ export class P2PSyncProvider extends BaseSyncProvider {
 
       // Parse BLSCT data if present
       if (hasBlsctData) {
-        const blsctResult = this.parseBlsctData(data, offset, outputIndex);
+        const blsctResult = this.parseBlsctData(data, offset);
         if (blsctResult.error) {
           return { keys: null, newOffset: offset, error: blsctResult.error };
         }
@@ -826,8 +882,8 @@ export class P2PSyncProvider extends BaseSyncProvider {
 
       // Skip token ID if present
       if (hasTokenId) {
-        // TokenId is 2 uint256s (64 bytes)
-        offset += 64;
+        // TokenId is a uint256 token hash + uint64 subid (40 bytes)
+        offset += 40;
       }
 
       // Skip predicate if present
@@ -835,6 +891,17 @@ export class P2PSyncProvider extends BaseSyncProvider {
         const { value: predicateLen, bytesRead: predLenBytes } = this.decodeVarInt(data, offset);
         offset += predLenBytes;
         offset += Number(predicateLen);
+      }
+
+      // The output hash is CTxOut::GetHash(): double-SHA256 of the full
+      // serialized output, displayed byte-reversed — the same identifier the
+      // ElectrumX backend reports and the daemon's getoutputdata expects.
+      if (keys) {
+        const serialized = data.subarray(outputStart, offset);
+        keys.outputHash = Buffer.from(sha256(sha256(serialized)))
+          .reverse()
+          .toString('hex');
+        this.cacheOutputData(keys.outputHash, serialized.toString('hex'));
       }
 
       return { keys, newOffset: offset };
@@ -849,7 +916,6 @@ export class P2PSyncProvider extends BaseSyncProvider {
   private parseBlsctData(
     data: Buffer,
     offset: number,
-    outputIndex: number
   ): { keys: ParsedOutputKeys | null; newOffset: number; error?: string } {
     try {
       // Parse range proof
@@ -877,16 +943,15 @@ export class P2PSyncProvider extends BaseSyncProvider {
         const viewTag = data.readUInt16LE(offset);
         offset += 2;
 
-        // Create output hash from output index (simplified)
-        const outputHash = this.hashBuffer(Buffer.from(`output:${outputIndex}`));
-
         return {
           keys: {
             blindingKey,
             spendingKey,
             ephemeralKey,
             viewTag,
-            outputHash,
+            // Filled in by parseBlsctOutput once the full output (including
+            // any tokenId/predicate) has been consumed.
+            outputHash: '',
             hasRangeProof: true,
           },
           newOffset: offset,
@@ -956,16 +1021,16 @@ export class P2PSyncProvider extends BaseSyncProvider {
   /**
    * Hash a buffer using SHA256
    */
-  private hashBuffer(data: Buffer): string {
-    return Buffer.from(sha256(data)).toString('hex');
-  }
-
   /**
    * Format output keys for the sync interface
    */
-  private formatOutputKeys(outputKeys: ParsedOutputKeys[]): { outputs: ParsedOutputKeys[] } {
+  private formatOutputKeys(
+    outputKeys: ParsedOutputKeys[],
+    inputHashes: string[] = [],
+  ): { outputs: ParsedOutputKeys[]; inputs: Array<{ outputHash: string }> } {
     return {
       outputs: outputKeys,
+      inputs: inputHashes.map((outputHash) => ({ outputHash })),
     };
   }
 
@@ -976,9 +1041,32 @@ export class P2PSyncProvider extends BaseSyncProvider {
     throw new Error('P2P provider does not support getTransactionKeys');
   }
 
+  private cacheOutputData(outputHash: string, serializedHex: string): void {
+    if (this.outputDataCache.size >= this.maxOutputDataCacheSize) {
+      // Drop the oldest entries (Map preserves insertion order).
+      const drop = Math.max(1, this.maxOutputDataCacheSize >> 4);
+      for (const key of this.outputDataCache.keys()) {
+        this.outputDataCache.delete(key);
+        if (this.outputDataCache.size <= this.maxOutputDataCacheSize - drop) break;
+      }
+    }
+    this.outputDataCache.set(outputHash, serializedHex);
+  }
+
   async getTransactionOutput(outputHash: string): Promise<string> {
-    // Use GETOUTPUTDATA P2P message
-    const outputHashBuffer = Buffer.from(outputHash, 'hex');
+    // Serve from the parse-time cache when possible: the daemon's
+    // getoutputdata only answers for mempool / most-recent-block outputs,
+    // so confirmed outputs discovered during a block scan must come from
+    // the data we already downloaded.
+    const cached = this.outputDataCache.get(outputHash);
+    if (cached) {
+      return cached;
+    }
+
+    // Use GETOUTPUTDATA P2P message. Output hashes are handled in display
+    // (byte-reversed) hex throughout the SDK; the wire message carries the
+    // internal byte order.
+    const outputHashBuffer = Buffer.from(outputHash, 'hex').reverse();
     const response = await this.client.getOutputData([outputHashBuffer]);
 
     // Response should be a TX message containing the transaction

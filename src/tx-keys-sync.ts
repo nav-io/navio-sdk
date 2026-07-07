@@ -812,9 +812,10 @@ export class TransactionKeysSync {
   ): Promise<void> {
     if (!this.keyManager) return;
 
-    // Transaction keys structure: { outputs: [{ blindingKey, spendingKey, viewTag, outputHash, ... }, ...] }
-    // The exact structure depends on electrumx implementation
-    const outputs = keys[1]?.outputs || keys[1]?.vout || [];
+    // Transaction keys structure depends on the provider: ElectrumX delivers
+    // [txHash, { vout: [...] }] tuples, the P2P provider delivers
+    // { outputs: [...] } objects. Accept both shapes.
+    const outputs = keys?.[1]?.outputs || keys?.[1]?.vout || keys?.outputs || keys?.vout || [];
 
     if (!Array.isArray(outputs)) return;
 

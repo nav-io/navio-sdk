@@ -11,6 +11,7 @@ TypeScript SDK for interacting with the Navio blockchain. Provides wallet manage
 - **Amount Recovery** - Decrypt confidential transaction amounts
 - **Balance Tracking** - Query wallet balance and UTXOs
 - **Token/NFT Transfer, Creation & Minting** - Create collections, mint assets, send tokenized outputs, and inspect owned assets
+- **RFQ Atomic-Swap Trading** - Trade tokens peer-to-peer as taker or maker over Navio's encrypted p2p messaging bus; swap halves are built and signed locally
 - **Spending Status Tracking** - Monitor spent/unspent outputs
 - **Blockchain Reorganization Handling** - Automatic reorg detection and recovery
 - **Cross-Platform Persistence** - Efficient SQLite storage (sql.js with IndexedDB for browser, better-sqlite3 for Node.js)
@@ -1085,6 +1086,72 @@ const result3 = await client.sendToMany({
 
 console.log('Multi-send tx:', result3.txId);
 ```
+
+### Trade Tokens (RFQ Atomic Swaps)
+
+Light wallets can trade tokens peer-to-peer over Navio's encrypted p2p
+messaging bus, both as **taker** (request quotes, accept the best one) and as
+**maker** (advertise intents, answer quote requests, publish standing orders).
+Requires the `electrum` backend against an ElectrumX server with the RFQ
+bridge, connected to a daemon with `-p2pmsg=1`.
+
+Swap halves — deliberately unbalanced BLSCT transactions whose received leg
+is supplied by the counterparty's half — are always **built and signed
+locally**. The server only wraps, encrypts and relays them.
+
+```typescript
+// ---- Taker: buy 500 units of a token, paying NAV ----
+const req = await client.requestQuote({
+  buyTokenId: tokenId,
+  sellTokenId: null, // NAV
+  amount: 500n,
+  expiry: Math.floor(Date.now() / 1000) + 300,
+});
+
+// Poll collected quotes (ranked cheapest first)
+const quotes = await client.listQuotes(req.uuid);
+
+// Accept with mandatory slippage bounds — your only trust anchor against a
+// malicious quote. The swap either settles atomically or no funds move.
+const result = await client.acceptQuote({
+  uuid: req.uuid,
+  quoteId: quotes[0].quoteId,
+  buyTokenId: tokenId,
+  sellTokenId: null,
+  maxPay: 60n,    // reject if charged more
+  minRecv: 500n,  // reject if delivered less
+});
+console.log('Swap tx:', result.txId);
+
+// ---- Maker: advertise liquidity and answer matching requests ----
+await client.setSwapIntent({
+  tokenInId: tokenId,  // we deliver this
+  tokenOutId: null,    // we want NAV
+  minSize: 1n,
+  maxSize: 10_000n,
+  priceMin: 10_000_000n, // 0.1 NAV per unit (scaled 1e8)
+  expiry: Math.floor(Date.now() / 1000) + 3600,
+});
+
+await client.subscribePendingQuoteRequests(async (pending) => {
+  for (const request of pending) {
+    await client.replyQuote({ request }); // builds + signs the maker half
+  }
+});
+
+// ---- Maker: standing order that peers can fill while you're offline ----
+await client.broadcastOrder({
+  offerTokenId: tokenId,
+  offerAmount: 100n,
+  wantTokenId: null,
+  wantAmount: 10n,
+  expiry: Math.floor(Date.now() / 1000) + 86400,
+});
+```
+
+Maker halves spend wallet coins that are **not locked** while a quote or
+order is outstanding — don't spend them manually until it expires, or the
+swap will fail to confirm.
 
 ### Query Wallet Outputs
 
