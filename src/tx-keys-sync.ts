@@ -903,27 +903,29 @@ export class TransactionKeysSync {
     blindingKeyObj: any,
     outputHex: string
   ): Promise<{ amount: number; gamma: string; memo: string | null; tokenIdHex: string | null }> {
+    // Fast path: hand-parse the serialized output. This reliably recovers
+    // plain (NAV) outputs, but the parser mis-handles token/predicate outputs
+    // — their range proof sits behind a variable predicate layout — so it can
+    // return amount 0 for a token that actually holds a balance. A zero here
+    // is therefore inconclusive: fall through and confirm with the binding's
+    // full-transaction parser, which understands every output shape. A
+    // positive amount is always trustworthy and returned immediately.
     const fastRecovery = this.tryRecoverFromSerializedOutput(outputHex, blindingKeyObj);
-    if (fastRecovery !== null) {
+    if (fastRecovery !== null && fastRecovery.amount > 0) {
       return fastRecovery;
     }
 
     const rawTx = await this.withRetry(() => this.syncProvider.getRawTransaction(txHash));
-    if (typeof rawTx !== 'string') {
-      return {
-        amount: 0,
-        gamma: '0',
-        memo: null,
-        tokenIdHex: null,
-      };
+    if (typeof rawTx === 'string') {
+      const rawRecovery = this.tryRecoverFromRawTransaction(rawTx, outputIndex, blindingKeyObj);
+      if (rawRecovery !== null && rawRecovery.amount > 0) {
+        return rawRecovery;
+      }
     }
 
-    const rawRecovery = this.tryRecoverFromRawTransaction(rawTx, outputIndex, blindingKeyObj);
-    if (rawRecovery !== null) {
-      return rawRecovery;
-    }
-
-    return {
+    // Neither path found a positive amount — return the fast result if we had
+    // one (a genuine zero-value output), else zero.
+    return fastRecovery ?? {
       amount: 0,
       gamma: '0',
       memo: null,
@@ -946,6 +948,19 @@ export class TransactionKeysSync {
       const nonce = this.keyManager!.calculateNonce(blindingKeyObj);
       const rangeProofResult = this.extractRangeProofFromOutput(outputHex);
       const tokenIdHex = rangeProofResult.tokenIdHex;
+
+      // Token/NFT mint outputs carry their amount as a transparent value, not
+      // in the range proof (which commits to 0). Use it directly — recovering
+      // from the proof would read the amount as 0. Transparent amounts have no
+      // blinding factor, so gamma is 0.
+      if (rangeProofResult.transparentValue !== null && rangeProofResult.transparentValue > 0n) {
+        return {
+          amount: Number(rangeProofResult.transparentValue),
+          gamma: '0',
+          memo: null,
+          tokenIdHex,
+        };
+      }
 
       if (!rangeProofResult.rangeProofHex) {
         return {
@@ -1026,7 +1041,7 @@ export class TransactionKeysSync {
    * @param outputHex - Serialized output data (hex)
    * @returns Object containing rangeProofHex and tokenIdHex
    */
-  private extractRangeProofFromOutput(outputHex: string): { rangeProofHex: string | null; tokenIdHex: string | null } {
+  private extractRangeProofFromOutput(outputHex: string): { rangeProofHex: string | null; tokenIdHex: string | null; transparentValue: bigint | null } {
     try {
       const data = Buffer.from(outputHex, 'hex');
       let offset = 0;
@@ -1045,19 +1060,30 @@ export class TransactionKeysSync {
       const HAS_TOKENID = 2n;
       const TOKEN_ID_SIZE = 40;
 
-      // Read value
+      // Read value. Two encodings:
+      //  - plain: `value` IS the transparent amount (non-BLSCT outputs);
+      //  - extended: value == MAX_AMOUNT sentinel, then a flags word, and —
+      //    when TRANSPARENT_VALUE_MARKER (bit 3) is set — an 8-byte
+      //    transparent amount. Token/NFT mint outputs use this: their amount
+      //    is NOT in the range proof (which commits to 0), it is this
+      //    transparent field. Capture it so the caller can use it instead of
+      //    range-proof recovery, which would otherwise read the amount as 0.
+      const TRANSPARENT_VALUE_MARKER = 8n;
       const value = data.readBigInt64LE(offset);
       offset += 8;
 
       let flags = 0n;
+      let transparentValue: bigint | null = null;
       if (value === MAX_AMOUNT) {
         flags = data.readBigUInt64LE(offset);
         offset += 8;
-        
-        // Skip transparent value if present
-        if ((flags & 8n) !== 0n) {
+
+        if ((flags & TRANSPARENT_VALUE_MARKER) !== 0n) {
+          transparentValue = data.readBigInt64LE(offset);
           offset += 8;
         }
+      } else {
+        transparentValue = value;
       }
 
       // Skip scriptPubKey
@@ -1116,9 +1142,9 @@ export class TransactionKeysSync {
         tokenIdHex = data.subarray(offset, offset + TOKEN_ID_SIZE).toString('hex');
       }
 
-      return { rangeProofHex, tokenIdHex };
+      return { rangeProofHex, tokenIdHex, transparentValue };
     } catch (e) {
-      return { rangeProofHex: null, tokenIdHex: null };
+      return { rangeProofHex: null, tokenIdHex: null, transparentValue: null };
     }
   }
 
