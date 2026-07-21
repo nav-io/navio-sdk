@@ -297,6 +297,10 @@ export interface WalletAssetBalance {
   collectionTokenId: string | null;
   /** NFT sub-id for NFTs, otherwise null */
   nftId: bigint | null;
+  /** Collection metadata, when known (local creation record or server token registry). */
+  metadata?: TokenMetadata;
+  /** Collection max total supply, when known. */
+  totalSupply?: bigint;
 }
 
 export interface CreateCollectionResult extends SendTransactionResult {
@@ -306,6 +310,8 @@ export interface CreateCollectionResult extends SendTransactionResult {
   collectionTokenId: string;
   /** Derived collection token public key. */
   tokenPublicKey: string;
+  /** Public on-chain token id (hash of the token public key) — the id explorers, `gettoken`, and balance methods report. */
+  publicTokenId: string;
   /** Amount minted in the same transaction when `initialMint` was used. */
   mintedAmount?: bigint;
 }
@@ -319,6 +325,8 @@ export interface CreatedCollectionInfo {
   kind: WalletAssetKind;
   /** Creation id — pass this to mintToken/mintNft. */
   collectionTokenId: string;
+  /** Public on-chain token id (hash of the token public key) — matches getAssetBalances/getTokenBalances and the explorer. */
+  publicTokenId: string;
   /** Derived collection token public key (hex). */
   tokenPublicKey: string;
   /** Metadata the collection was created with. */
@@ -346,6 +354,8 @@ export interface MintAssetResult extends SendTransactionResult {
   tokenId: string;
   /** Derived collection token public key. */
   tokenPublicKey: string;
+  /** Public on-chain token id (hash of the token public key) — matches getAssetBalances/getTokenBalances. */
+  publicTokenId: string;
 }
 
 function reverseHexBytes(hex: string): string {
@@ -513,6 +523,22 @@ function normalizeTokenMetadata(metadata?: TokenMetadata): TokenMetadata {
     }
     return [key, value];
   }));
+}
+
+/**
+ * Compute the public on-chain token id of a collection from its token public
+ * key: navio-core `PublicKey::GetHash()` double-SHA256s the *serialized
+ * vector* (compact-size length prefix + point bytes), and token ids display
+ * in reversed byte order. This is the id explorers, `gettoken`, and wallet
+ * outputs use — verified against live registry entries.
+ */
+function publicTokenIdFromPublicKeyHex(tokenPublicKeyHex: string): string {
+  const keyBytes = Buffer.from(tokenPublicKeyHex, 'hex');
+  if (keyBytes.length === 0 || keyBytes.length >= 0xfd) {
+    throw new Error('Unexpected token public key length');
+  }
+  const prefixed = Buffer.concat([Buffer.from([keyBytes.length]), keyBytes]);
+  return Buffer.from(sha256(sha256(prefixed))).reverse().toString('hex');
 }
 
 /**
@@ -731,6 +757,18 @@ export class NavioClient {
 
   // Legacy: keep electrumClient reference for backwards compatibility
   private electrumClient: ElectrumClient | null = null;
+
+  /**
+   * Cache of collection info keyed by public token id. Token metadata and
+   * max supply are immutable once a collection is created, so entries never
+   * expire; `null` marks a failed lookup (unknown token or a server without
+   * the get_token bridge) so it is not retried every call.
+   */
+  private tokenRegistryCache = new Map<string, {
+    metadata: TokenMetadata;
+    totalSupply: bigint;
+    kind: WalletAssetKind;
+  } | null>();
 
   // Background sync state
   private backgroundSyncTimer: ReturnType<typeof setInterval> | null = null;
@@ -1429,8 +1467,14 @@ export class NavioClient {
   /**
    * Get current balances for all non-NAV assets owned by the wallet.
    * Aggregates unspent outputs by token ID.
+   *
+   * Each entry carries the collection `metadata` and `totalSupply` when they
+   * can be resolved — from this wallet's own creation records, or from the
+   * server's token registry (`blockchain.token.get_token`), cached for the
+   * client's lifetime since collection info is immutable. Pass
+   * `{ includeMetadata: false }` to skip resolution.
    */
-  async getAssetBalances(): Promise<WalletAssetBalance[]> {
+  async getAssetBalances(options: { includeMetadata?: boolean } = {}): Promise<WalletAssetBalance[]> {
     if (!this.walletDB) {
       throw new Error('Client not initialized');
     }
@@ -1465,7 +1509,88 @@ export class NavioClient {
       });
     }
 
-    return [...balances.values()].sort((a, b) => a.tokenId.localeCompare(b.tokenId));
+    const assets = [...balances.values()].sort((a, b) => a.tokenId.localeCompare(b.tokenId));
+
+    if (options.includeMetadata ?? true) {
+      for (const asset of assets) {
+        try {
+          const publicId = asset.collectionTokenId ?? describeTokenId(asset.tokenId).collectionTokenId;
+          if (!publicId) {
+            continue;
+          }
+          const info = await this.resolveCollectionInfoByPublicId(publicId);
+          if (info) {
+            asset.metadata = info.metadata;
+            asset.totalSupply = info.totalSupply;
+          }
+        } catch {
+          // Metadata resolution is best-effort; balances stay authoritative.
+        }
+      }
+    }
+
+    return assets;
+  }
+
+  /**
+   * Resolve collection metadata/supply by public token id: local creation
+   * records first (free), then the server's token registry, both cached for
+   * the client's lifetime.
+   */
+  private async resolveCollectionInfoByPublicId(publicTokenId: string): Promise<{
+    metadata: TokenMetadata;
+    totalSupply: bigint;
+    kind: WalletAssetKind;
+  } | null> {
+    const cached = this.tokenRegistryCache.get(publicTokenId);
+    if (cached !== undefined) {
+      return cached;
+    }
+
+    // Local creation records: compute each record's public id and match.
+    if (this.walletDB) {
+      try {
+        for (const record of await this.walletDB.getCreatedCollections()) {
+          const recordPublicId = publicTokenIdFromPublicKeyHex(record.tokenPublicKey);
+          if (!this.tokenRegistryCache.has(recordPublicId)) {
+            this.tokenRegistryCache.set(recordPublicId, {
+              metadata: record.metadata,
+              totalSupply: BigInt(record.totalSupply),
+              kind: record.kind,
+            });
+          }
+        }
+        const localHit = this.tokenRegistryCache.get(publicTokenId);
+        if (localHit !== undefined) {
+          return localHit;
+        }
+      } catch {
+        // Fall through to the registry lookup.
+      }
+    }
+
+    if (!this.electrumClient) {
+      return null; // not cached: a later connection may resolve it
+    }
+
+    try {
+      const onChainToken: any = await this.electrumClient.getToken(publicTokenId);
+      if (onChainToken && typeof onChainToken === 'object' && onChainToken.publicKey) {
+        const info = {
+          metadata: tokenMetadataFromChainRecord(onChainToken.metadata),
+          totalSupply: BigInt(onChainToken.maxSupply ?? 0),
+          kind: (onChainToken.type === 'nft' ? 'nft' : 'token') as WalletAssetKind,
+        };
+        this.tokenRegistryCache.set(publicTokenId, info);
+        return info;
+      }
+      this.tokenRegistryCache.set(publicTokenId, null);
+    } catch {
+      // Unknown token or server without the bridge — cache the miss so it
+      // is not retried on every balance call.
+      this.tokenRegistryCache.set(publicTokenId, null);
+    }
+    return null;
   }
 
   /**
@@ -2207,6 +2332,7 @@ export class NavioClient {
       kind: 'token',
       collectionTokenId,
       tokenPublicKey: tokenPublicKey.serialize(),
+      publicTokenId: publicTokenIdFromPublicKeyHex(tokenPublicKey.serialize()),
       ...(mintedAmount !== undefined ? { mintedAmount } : {}),
     };
   }
@@ -2235,6 +2361,7 @@ export class NavioClient {
       kind: 'nft',
       collectionTokenId,
       tokenPublicKey: tokenPublicKey.serialize(),
+      publicTokenId: publicTokenIdFromPublicKeyHex(tokenPublicKey.serialize()),
     };
   }
 
@@ -2298,6 +2425,7 @@ export class NavioClient {
       collections.set(record.collectionTokenId, {
         kind: record.kind,
         collectionTokenId: record.collectionTokenId,
+        publicTokenId: publicTokenIdFromPublicKeyHex(record.tokenPublicKey),
         tokenPublicKey: record.tokenPublicKey,
         metadata: record.metadata,
         totalSupply: BigInt(record.totalSupply),
@@ -2346,6 +2474,7 @@ export class NavioClient {
             collections.set(creationTokenId, {
               kind,
               collectionTokenId: creationTokenId,
+              publicTokenId: publicTokenIdFromPublicKeyHex(String(onChainToken.publicKey)),
               tokenPublicKey: String(onChainToken.publicKey).toLowerCase(),
               metadata,
               totalSupply: BigInt(totalSupply),
@@ -2411,6 +2540,7 @@ export class NavioClient {
             collections.set(creationTokenId, {
               kind: info.getType() === TokenType.Nft ? 'nft' : 'token',
               collectionTokenId: creationTokenId,
+              publicTokenId: publicTokenIdFromPublicKeyHex(predicatePublicKey),
               tokenPublicKey: predicatePublicKey,
               metadata,
               totalSupply: BigInt(totalSupply),
@@ -2458,6 +2588,7 @@ export class NavioClient {
       collectionTokenId,
       tokenId: collectionTokenId,
       tokenPublicKey: tokenPublicKey.serialize(),
+      publicTokenId: publicTokenIdFromPublicKeyHex(tokenPublicKey.serialize()),
     };
   }
 
@@ -2490,6 +2621,7 @@ export class NavioClient {
       collectionTokenId,
       tokenId: composeNftTokenId(collectionTokenId, normalizedNftId),
       tokenPublicKey: tokenPublicKey.serialize(),
+      publicTokenId: publicTokenIdFromPublicKeyHex(tokenPublicKey.serialize()),
     };
   }
 

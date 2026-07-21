@@ -521,9 +521,16 @@ on-chain token public key re-derives from this wallet's seed. The returned
 
 ```typescript
 const collections = await client.listCreatedCollections();
-// [{ kind: 'token', collectionTokenId: '…', metadata: { name: 'TOK' },
-//    totalSupply: 5000000n, source: 'local', … }]
+// [{ kind: 'token', collectionTokenId: '…', publicTokenId: '…',
+//    metadata: { name: 'TOK' }, totalSupply: 5000000n, source: 'local', … }]
 ```
+
+Every entry carries both ids: `collectionTokenId` is the creation id (works
+with `mintToken`/`mintNft` on any backend), `publicTokenId` is the public
+on-chain id that `getAssetBalances`/`getTokenBalances` and the explorer
+report — join collection and balance rows on it. Balance entries themselves
+also carry the collection `metadata` and `totalSupply` when resolvable
+(local creation records, or the server token registry, cached).
 
 Chain discovery needs the electrum backend and a server bridging
 `blockchain.token.get_token`; pass `{ discoverFromChain: false }` to skip it.

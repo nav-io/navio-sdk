@@ -3,6 +3,23 @@
 All notable changes to navio-sdk are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/); versions follow [SemVer](https://semver.org/).
 
+## [0.1.24] - 2026-07-22
+
+### Added
+- `publicTokenId` on `CreateCollectionResult`, `MintAssetResult`, and
+  `CreatedCollectionInfo`: the public on-chain token id (hash of the token
+  public key, computed locally) — the id explorers, `gettoken`, and the
+  balance methods report. Collections from `listCreatedCollections` can now
+  be joined directly against `getAssetBalances`/`getTokenBalances` rows.
+  `collectionTokenId` (the creation id, needed for minting on any backend)
+  is unchanged.
+- `getAssetBalances` (and therefore `getTokenBalances`/`getNftBalances`)
+  entries now carry the collection `metadata` and `totalSupply` when
+  resolvable — from the wallet's own creation records, or from the server's
+  token registry, cached for the client's lifetime (collection info is
+  immutable). One call returns balances and display metadata. Pass
+  `{ includeMetadata: false }` to skip.
+
 ## [0.1.23] - 2026-07-21
 
 ### Added
