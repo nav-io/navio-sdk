@@ -3,6 +3,18 @@
 All notable changes to navio-sdk are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/); versions follow [SemVer](https://semver.org/).
 
+## [0.1.25] - 2026-07-22
+
+### Fixed
+- Sync no longer aborts permanently on outputs whose BLSCT keys are not
+  valid curve points. Anyone can broadcast such an output (testnet block
+  48020 contains one); the server serves its keys verbatim, and
+  `PublicKey.deserialize` threw, killing every sync attempt at that block —
+  wallets stalled and re-scanned from their creation height in a loop
+  (reported as "stuck at 48019, rolls back to 46700"). An output with
+  invalid keys is spendable by no wallet, so it is now skipped and the rest
+  of the block processes normally.
+
 ## [0.1.24] - 2026-07-22
 
 ### Added

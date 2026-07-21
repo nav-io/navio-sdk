@@ -851,11 +851,21 @@ export class TransactionKeysSync {
 
       // Convert keys to PublicKey format if needed (they might be hex strings or serialized)
       const PublicKey = blsctModule.PublicKey;
-      let blindingKeyObj: any = PublicKey.deserialize(blindingKey);
-      let spendingKeyObj: any = PublicKey.deserialize(spendingKey);
-
-      // Check if output belongs to wallet
-      const isMine = this.keyManager.isMineByKeys(blindingKeyObj, spendingKeyObj, viewTag);
+      let blindingKeyObj: any;
+      let spendingKeyObj: any;
+      let isMine: boolean;
+      try {
+        blindingKeyObj = PublicKey.deserialize(blindingKey);
+        spendingKeyObj = PublicKey.deserialize(spendingKey);
+        // Check if output belongs to wallet
+        isMine = this.keyManager.isMineByKeys(blindingKeyObj, spendingKeyObj, viewTag);
+      } catch {
+        // Anyone can broadcast an output whose BLSCT keys are not valid
+        // curve points (testnet block 48020 has one). Such an output is
+        // spendable by no wallet, so it cannot be ours — skip it instead of
+        // letting one malformed output abort the sync loop forever.
+        continue;
+      }
       if (isMine) {
         let outputHex = '';
         try {
