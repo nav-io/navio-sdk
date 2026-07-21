@@ -17,6 +17,15 @@ import * as blsctModule from 'navio-blsct';
 import { sha256 } from '@noble/hashes/sha256';
 
 /**
+ * Serialization of an empty bulletproofs+ range proof: just the zero Vs
+ * count. Token/NFT mint outputs (transparent value) carry one of these.
+ * `RangeProof.recoverAmounts` on an empty proof terminates the process with
+ * an uncatchable native exception, so every recovery site must check this
+ * before calling it.
+ */
+const EMPTY_RANGE_PROOF_HEX = '00';
+
+/**
  * Yield control back to the browser's event loop so it can repaint and
  * handle user input.  Uses setTimeout(0) which schedules a macrotask,
  * guaranteeing that pending paint / input tasks run before we resume.
@@ -694,13 +703,23 @@ export class TransactionKeysSync {
         const tokenId = ctxOut.getTokenId();
         tokenIdHex = tokenId.serialize();
 
-        const req = new AmountRecoveryReq(rangeProof, nonce, tokenId);
-        const results = RangeProof.recoverAmounts([req]);
+        if (rangeProof.serialize() === EMPTY_RANGE_PROOF_HEX) {
+          // Token/NFT mint outputs have no range proof — their amount is the
+          // transparent value. RangeProof.recoverAmounts on an empty proof
+          // ABORTS the process (uncatchable native exception), so it must
+          // never be called here: this path runs on every own broadcast and
+          // killed apps the moment they minted an NFT.
+          recoveredAmount = Number(ctxOut.getValue());
+          recoveredGamma = '0';
+        } else {
+          const req = new AmountRecoveryReq(rangeProof, nonce, tokenId);
+          const results = RangeProof.recoverAmounts([req]);
 
-        if (results.length > 0 && results[0].isSucc) {
-          recoveredAmount = Number(results[0].amount);
-          recoveredGamma = results[0].gamma ?? '0';
-          recoveredMemo = results[0].msg || null;
+          if (results.length > 0 && results[0].isSucc) {
+            recoveredAmount = Number(results[0].amount);
+            recoveredGamma = results[0].gamma ?? '0';
+            recoveredMemo = results[0].msg || null;
+          }
         }
       } catch {
         // Amount recovery failed; store output with zero amount
@@ -972,7 +991,10 @@ export class TransactionKeysSync {
         };
       }
 
-      if (!rangeProofResult.rangeProofHex) {
+      if (!rangeProofResult.rangeProofHex
+          || rangeProofResult.rangeProofHex === EMPTY_RANGE_PROOF_HEX) {
+        // No proof (or the empty proof) — nothing to recover, and
+        // recoverAmounts on an empty proof aborts the process.
         return {
           amount: 0,
           gamma: '0',
@@ -1023,6 +1045,18 @@ export class TransactionKeysSync {
       const tokenId = ctxOut.getTokenId();
       const tokenIdHex = tokenId.serialize();
       const rangeProof = ctxOut.getRangeProof();
+
+      if (rangeProof.serialize() === EMPTY_RANGE_PROOF_HEX) {
+        // Mint outputs carry a transparent value and no range proof; calling
+        // recoverAmounts on an empty proof aborts the process.
+        return {
+          amount: Number(ctxOut.getValue()),
+          gamma: '0',
+          memo: null,
+          tokenIdHex,
+        };
+      }
+
       const req = new AmountRecoveryReq(rangeProof, nonce, tokenId);
       const results = RangeProof.recoverAmounts([req]);
 

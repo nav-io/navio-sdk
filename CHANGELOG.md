@@ -3,6 +3,26 @@
 All notable changes to navio-sdk are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/); versions follow [SemVer](https://semver.org/).
 
+## [0.1.26] - 2026-07-22
+
+### Fixed
+- Minting an NFT no longer kills the process. Mint outputs carry their amount
+  as a transparent value and an *empty* range proof, and
+  `RangeProof.recoverAmounts` on an empty proof terminates the process with an
+  uncatchable native exception. The mempool-processing path that runs right
+  after every own broadcast called it unconditionally, so any app died the
+  moment it minted an NFT (the mint transaction itself was already broadcast
+  and confirmed — only the local process crashed). All three amount-recovery
+  sites now detect the empty proof and use the transparent value instead.
+- Investigation of the same incident (testnet block 48020, the network's
+  first NFT mint — made with this SDK's README example) uncovered the
+  companion server-side bug: the ElectrumX indexer over-read empty range
+  proofs by 304 bytes, corrupting the served keys, output hashes, and raw
+  transaction for mint-carrying blocks. Fixed in nav-io/electrumx
+  (`rfq-swap-bridge` branch); affected servers need a reindex of blocks
+  containing mint outputs. The 0.1.25 malformed-key guard keeps wallets
+  syncing past still-corrupted servers in the meantime.
+
 ## [0.1.25] - 2026-07-22
 
 ### Fixed
