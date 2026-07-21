@@ -447,6 +447,21 @@ const collection = await client.createTokenCollection({
 console.log(collection.collectionTokenId);
 ```
 
+Pass `initialMint` to mint the first supply in the **same transaction** as
+the collection creation (consensus executes output predicates in order, so
+the collection registers before the mint validates — no need to wait for
+the collection to confirm before minting):
+
+```typescript
+const collection = await client.createTokenCollection({
+  metadata: { name: 'Token Collection', symbol: 'TOK' },
+  totalSupply: 5_000_000,
+  initialMint: { address: 'tnav1...', amount: 1_000_000 },
+});
+
+console.log(collection.mintedAmount); // 1000000n
+```
+
 ##### `createNftCollection(options: CreateNftCollectionOptions): Promise<CreateCollectionResult>`
 
 Create an NFT collection definition on-chain. You can optionally encode a collection max supply; omitting it keeps the previous `0` behavior.

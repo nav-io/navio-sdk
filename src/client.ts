@@ -203,6 +203,20 @@ export interface CreateTokenCollectionOptions {
   totalSupply: bigint | number;
   /** Optional NAV UTXOs to fund the transaction fee. */
   selectedUtxos?: string[];
+  /**
+   * Optionally mint an initial amount of the new token in the SAME
+   * transaction as the collection creation. Consensus executes output
+   * predicates in order, so the create-collection output registers the token
+   * before the mint output is validated — collection and first supply land
+   * in one transaction (and therefore one block). Without this, a mint can
+   * only be broadcast after the collection transaction has confirmed.
+   */
+  initialMint?: {
+    /** Destination address receiving the minted fungible token output. */
+    address: string;
+    /** Amount of fungible tokens to mint. */
+    amount: bigint | number;
+  };
 }
 
 export interface CreateNftCollectionOptions {
@@ -292,6 +306,8 @@ export interface CreateCollectionResult extends SendTransactionResult {
   collectionTokenId: string;
   /** Derived collection token public key. */
   tokenPublicKey: string;
+  /** Amount minted in the same transaction when `initialMint` was used. */
+  mintedAmount?: bigint;
 }
 
 export interface MintAssetResult extends SendTransactionResult {
@@ -2129,16 +2145,40 @@ export class NavioClient {
     const { tokenKey, tokenPublicKey } = this.buildCollectionTokenContext(collectionTokenId);
     const tokenInfo = TokenInfo.build(TokenType.Token, tokenPublicKey, metadata, totalSupply);
 
-    const result = await this.buildAndBroadcastUnsignedTransaction(
-      UnsignedOutput.createTokenCollection(tokenKey, tokenInfo),
-      options.selectedUtxos
-    );
+    const outputs = [UnsignedOutput.createTokenCollection(tokenKey, tokenInfo)];
+
+    let mintedAmount: bigint | undefined;
+    if (options.initialMint) {
+      const mintAmount = toSafeInteger(options.initialMint.amount, 'initialMint.amount');
+      if (mintAmount <= 0) {
+        throw new Error('initialMint.amount must be positive');
+      }
+      if (mintAmount > totalSupply) {
+        throw new Error('initialMint.amount exceeds totalSupply');
+      }
+      const mintDestination = this.decodeDestinationAddress(options.initialMint.address);
+      // The create output must precede the mint output: consensus executes
+      // predicates in output order, and the mint predicate requires the
+      // token to already exist in the view.
+      outputs.push(
+        UnsignedOutput.mintToken(mintDestination, mintAmount, Scalar.random(), tokenKey, tokenPublicKey)
+      );
+      mintedAmount = BigInt(mintAmount);
+    }
+
+    let result: SendTransactionResult;
+    try {
+      result = await this.buildAndBroadcastUnsignedTransaction(outputs, options.selectedUtxos);
+    } catch (err) {
+      throw options.initialMint ? augmentMintBroadcastError(err, collectionTokenId) : err;
+    }
 
     return {
       ...result,
       kind: 'token',
       collectionTokenId,
       tokenPublicKey: tokenPublicKey.serialize(),
+      ...(mintedAmount !== undefined ? { mintedAmount } : {}),
     };
   }
 
@@ -3067,14 +3107,18 @@ export class NavioClient {
   }
 
   private async buildAndBroadcastUnsignedTransaction(
-    unsignedOutput: InstanceType<typeof UnsignedOutput>,
+    unsignedOutput: InstanceType<typeof UnsignedOutput> | InstanceType<typeof UnsignedOutput>[],
     selectedUtxos?: string[],
   ): Promise<SendTransactionResult> {
+    // Output order is preserved through signing and consensus executes output
+    // predicates in order, so callers may rely on it (e.g. a create-collection
+    // output registering the token before a mint output in the same tx).
+    const assetOutputs = Array.isArray(unsignedOutput) ? unsignedOutput : [unsignedOutput];
     const { walletDB } = await this.ensureSpendReady();
     const { selected, totalIn } = await this.selectFundingUtxos(walletDB, selectedUtxos);
     const inputs = selected.map((utxo) => ({ output: utxo, tokenId: TokenId.default() }));
 
-    let outputs = [unsignedOutput];
+    let outputs = [...assetOutputs];
     let fee = 0n;
     let previousNavChange: bigint | null = null;
 
@@ -3088,7 +3132,7 @@ export class NavioClient {
       }
 
       const navChangeAmount = totalIn - fee;
-      const nextOutputs = [unsignedOutput];
+      const nextOutputs = [...assetOutputs];
       if (navChangeAmount > 0n) {
         nextOutputs.push(this.buildUnsignedNavChangeOutput(navChangeAmount));
       }

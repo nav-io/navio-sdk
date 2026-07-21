@@ -70,12 +70,29 @@ jobs:
         if: steps.check_version.outputs.exists == 'false'
         run: npm publish --access public --provenance
 
+      - name: Extract changelog for release
+        if: steps.check_version.outputs.exists == 'false'
+        run: |
+          VERSION="${{ steps.package_version.outputs.version }}"
+          # Pull this version's section out of CHANGELOG.md (between its
+          # "## [x.y.z]" heading and the next "## [" heading).
+          awk -v ver="$VERSION" '
+            $0 ~ "^## \\[" ver "\\]" { found=1; next }
+            found && /^## \[/ { exit }
+            found { print }
+          ' CHANGELOG.md > /tmp/release-notes.md
+          if [ ! -s /tmp/release-notes.md ]; then
+            echo "_No changelog entry for ${VERSION}._" > /tmp/release-notes.md
+          fi
+          cat /tmp/release-notes.md
+
       - name: Create GitHub Release
         if: steps.check_version.outputs.exists == 'false'
         uses: softprops/action-gh-release@v1
         with:
           tag_name: v${{ steps.package_version.outputs.version }}
           name: v${{ steps.package_version.outputs.version }}
+          body_path: /tmp/release-notes.md
           generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
