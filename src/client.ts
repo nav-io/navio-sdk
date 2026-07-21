@@ -310,6 +310,33 @@ export interface CreateCollectionResult extends SendTransactionResult {
   mintedAmount?: bigint;
 }
 
+/**
+ * A collection this wallet created, as reported by
+ * {@link NavioClient.listCreatedCollections}.
+ */
+export interface CreatedCollectionInfo {
+  /** Asset type of the collection. */
+  kind: WalletAssetKind;
+  /** Creation id — pass this to mintToken/mintNft. */
+  collectionTokenId: string;
+  /** Derived collection token public key (hex). */
+  tokenPublicKey: string;
+  /** Metadata the collection was created with. */
+  metadata: TokenMetadata;
+  /** Maximum total supply recorded at creation. */
+  totalSupply: bigint;
+  /** Create-collection transaction id (known for locally recorded creations). */
+  txId?: string;
+  /** Unix timestamp (seconds) of the creation broadcast (locally recorded creations). */
+  createdAt?: number;
+  /**
+   * Where the entry came from: `local` = recorded by this wallet database at
+   * creation time; `chain` = re-derived from an owned token output via the
+   * server's token registry (covers restored wallets).
+   */
+  source: 'local' | 'chain';
+}
+
 export interface MintAssetResult extends SendTransactionResult {
   /** Asset type for the minted output. */
   kind: WalletAssetKind;
@@ -2173,6 +2200,8 @@ export class NavioClient {
       throw options.initialMint ? augmentMintBroadcastError(err, collectionTokenId) : err;
     }
 
+    await this.recordCreatedCollection('token', collectionTokenId, tokenPublicKey.serialize(), metadata, totalSupply, result.txId);
+
     return {
       ...result,
       kind: 'token',
@@ -2199,12 +2228,203 @@ export class NavioClient {
       options.selectedUtxos
     );
 
+    await this.recordCreatedCollection('nft', collectionTokenId, tokenPublicKey.serialize(), metadata, totalSupply, result.txId);
+
     return {
       ...result,
       kind: 'nft',
       collectionTokenId,
       tokenPublicKey: tokenPublicKey.serialize(),
     };
+  }
+
+  /**
+   * Best-effort record of a collection created by this wallet, so
+   * listCreatedCollections can report it without a chain lookup. Failure to
+   * record never fails the (already broadcast) creation.
+   */
+  private async recordCreatedCollection(
+    kind: 'token' | 'nft',
+    collectionTokenId: string,
+    tokenPublicKey: string,
+    metadata: TokenMetadata,
+    totalSupply: number,
+    txId: string,
+  ): Promise<void> {
+    try {
+      await this.walletDB?.saveCreatedCollection({
+        collectionTokenId,
+        kind,
+        tokenPublicKey,
+        metadata,
+        totalSupply,
+        txId,
+        createdAt: Math.floor(Date.now() / 1000),
+      });
+    } catch {
+      // Recording is informational only.
+    }
+  }
+
+  /**
+   * List the token/NFT collections this wallet created.
+   *
+   * Combines two sources:
+   * - `local`: collections recorded in the wallet database when
+   *   createTokenCollection/createNftCollection broadcast them.
+   * - `chain`: for restored wallets (whose database has no local records),
+   *   two discovery passes run against the electrum backend. Every distinct
+   *   token held by the wallet is looked up in the server's token registry
+   *   (`blockchain.token.get_token`), and the wallet's own transactions are
+   *   scanned for create-token predicates — the create transaction spends
+   *   the wallet's NAV, so its hash is known after a sync even when the
+   *   collection was never minted or held. A collection is reported when its
+   *   on-chain token public key re-derives from this wallet's seed — the
+   *   same ownership proof minting uses.
+   *
+   * The returned `collectionTokenId` is the creation id, directly usable with
+   * mintToken/mintNft.
+   */
+  async listCreatedCollections(options: { discoverFromChain?: boolean } = {}): Promise<CreatedCollectionInfo[]> {
+    if (!this.initialized) {
+      await this.initialize();
+    }
+    if (!this.walletDB) {
+      throw new Error('Client not initialized');
+    }
+
+    const collections = new Map<string, CreatedCollectionInfo>();
+    for (const record of await this.walletDB.getCreatedCollections()) {
+      collections.set(record.collectionTokenId, {
+        kind: record.kind,
+        collectionTokenId: record.collectionTokenId,
+        tokenPublicKey: record.tokenPublicKey,
+        metadata: record.metadata,
+        totalSupply: BigInt(record.totalSupply),
+        txId: record.txId,
+        createdAt: record.createdAt,
+        source: 'local',
+      });
+    }
+
+    const discover = options.discoverFromChain ?? true;
+    if (discover && this.electrumClient && this.keyManager) {
+      const assets = await this.getAssetBalances();
+      const tokenHashes = new Set<string>();
+      for (const asset of assets) {
+        try {
+          const hash = describeTokenId(asset.tokenId).collectionTokenId;
+          if (hash) {
+            tokenHashes.add(hash);
+          }
+        } catch {
+          // Ignore malformed stored token ids.
+        }
+      }
+
+      for (const tokenHash of tokenHashes) {
+        let onChainToken: any;
+        try {
+          onChainToken = await this.electrumClient.getToken(tokenHash);
+        } catch {
+          continue; // unknown token or server without the bridge
+        }
+        if (!onChainToken || typeof onChainToken !== 'object' || !onChainToken.publicKey) {
+          continue;
+        }
+        try {
+          const kind: 'token' | 'nft' = onChainToken.type === 'nft' ? 'nft' : 'token';
+          const metadata = tokenMetadataFromChainRecord(onChainToken.metadata);
+          const totalSupply = toSafeInteger(BigInt(onChainToken.maxSupply ?? 0), 'maxSupply');
+          const creationTokenId = normalizeCollectionTokenHashHex(calcCollectionTokenHashHex(metadata, totalSupply));
+          const derived = this.buildCollectionTokenContext(creationTokenId);
+          if (String(derived.tokenPublicKey.serialize()).toLowerCase()
+              !== String(onChainToken.publicKey).toLowerCase()) {
+            continue; // held, but created by someone else
+          }
+          if (!collections.has(creationTokenId)) {
+            collections.set(creationTokenId, {
+              kind,
+              collectionTokenId: creationTokenId,
+              tokenPublicKey: String(onChainToken.publicKey).toLowerCase(),
+              metadata,
+              totalSupply: BigInt(totalSupply),
+              source: 'chain',
+            });
+          }
+        } catch {
+          // Skip records that fail to parse or derive.
+        }
+      }
+
+      // Second pass: scan the wallet's own transactions for create-token
+      // predicates. This recovers collections the wallet created but never
+      // minted or held an output of — the create transaction spends the
+      // wallet's NAV and pays change back, so its hash is known even to a
+      // freshly restored wallet after a sync.
+      const txHashes = new Set<string>();
+      for (const output of await this.getAllOutputs()) {
+        if (output.txType === 'sent' && output.txHash && !output.txHash.startsWith('mempool:')) {
+          txHashes.add(output.txHash);
+        }
+        if (output.isSpent && output.spentTxHash) {
+          txHashes.add(output.spentTxHash);
+        }
+      }
+
+      const {
+        getPredicateType, parseCreateTokenPredicateTokenInfo, BlsctPredicateType,
+      } = blsctModule as any;
+
+      for (const txHash of txHashes) {
+        let ctx: any;
+        try {
+          const rawTx = await this.electrumClient.getRawTransaction(txHash);
+          ctx = CTx.deserialize(rawTx);
+        } catch {
+          continue; // pruned/unknown tx — nothing to scan
+        }
+
+        const outs = ctx.getCTxOuts();
+        const numOuts = outs.size();
+        for (let i = 0; i < numOuts; i++) {
+          try {
+            const predicateHex = outs.at(i).getVectorPredicate();
+            if (!predicateHex
+                || getPredicateType(predicateHex) !== BlsctPredicateType.BlsctCreateTokenPredicateType) {
+              continue;
+            }
+            const info = parseCreateTokenPredicateTokenInfo(predicateHex);
+            const metadata = normalizeTokenMetadata(info.getMetadata());
+            const totalSupply = toSafeInteger(info.getTotalSupply(), 'totalSupply');
+            const creationTokenId = normalizeCollectionTokenHashHex(
+              calcCollectionTokenHashHex(metadata, totalSupply)
+            );
+            if (collections.has(creationTokenId)) {
+              continue;
+            }
+            const derived = this.buildCollectionTokenContext(creationTokenId);
+            const predicatePublicKey = String(info.getPublicKey().serialize()).toLowerCase();
+            if (String(derived.tokenPublicKey.serialize()).toLowerCase() !== predicatePublicKey) {
+              continue; // a create in the same (aggregated) tx by someone else
+            }
+            collections.set(creationTokenId, {
+              kind: info.getType() === TokenType.Nft ? 'nft' : 'token',
+              collectionTokenId: creationTokenId,
+              tokenPublicKey: predicatePublicKey,
+              metadata,
+              totalSupply: BigInt(totalSupply),
+              txId: txHash,
+              source: 'chain',
+            });
+          } catch {
+            // Skip outputs whose predicate fails to parse.
+          }
+        }
+      }
+    }
+
+    return [...collections.values()];
   }
 
   /**

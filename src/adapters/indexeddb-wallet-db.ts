@@ -23,9 +23,11 @@ import type {
   WalletMetadata,
   StoreOutputParams,
   TxType,
+  CreatedCollectionRecord,
 } from '../wallet-db.interface';
 
-const IDB_VERSION = 1;
+// v2: adds the createdCollections store
+const IDB_VERSION = 2;
 const DEFAULT_TOKEN_ID = '0000000000000000000000000000000000000000000000000000000000000000';
 
 function idbReq<T>(req: IDBRequest<T>): Promise<T> {
@@ -118,6 +120,7 @@ export class IndexedDBWalletDB implements IWalletDB {
       ['keyMetadata', { keyPath: 'keyId' }],
       ['syncState', { keyPath: 'id' }],
       ['blockHashes', { keyPath: 'height' }],
+      ['createdCollections', { keyPath: 'collectionTokenId' }],
     ];
     for (const [name, opts] of stores) {
       if (!db.objectStoreNames.contains(name)) db.createObjectStore(name, opts);
@@ -697,6 +700,15 @@ export class IndexedDBWalletDB implements IWalletDB {
       store.put(rec);
     }
     await idbTx(tx);
+  }
+
+  async saveCreatedCollection(record: CreatedCollectionRecord): Promise<void> {
+    await this.put('createdCollections', { ...record });
+  }
+
+  async getCreatedCollections(): Promise<CreatedCollectionRecord[]> {
+    const recs = await this.getAll<CreatedCollectionRecord>('createdCollections');
+    return recs.sort((a, b) => a.createdAt - b.createdAt);
   }
 
   async getPendingSpentAmount(tokenId: string | null = null): Promise<bigint> {

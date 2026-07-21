@@ -507,6 +507,27 @@ const mint = await client.mintNft({
 });
 ```
 
+##### `listCreatedCollections(options?): Promise<CreatedCollectionInfo[]>`
+
+List the token/NFT collections this wallet created. Combines local records
+(written when the wallet broadcasts a creation) with chain discovery for
+restored wallets: every distinct token the wallet holds is looked up in the
+server's token registry, and the wallet's own transactions are scanned for
+create-token predicates — so even collections that were created but never
+minted or held are recovered after a sync. A collection is reported when its
+on-chain token public key re-derives from this wallet's seed. The returned
+`collectionTokenId` is the creation id, directly usable with
+`mintToken`/`mintNft`.
+
+```typescript
+const collections = await client.listCreatedCollections();
+// [{ kind: 'token', collectionTokenId: '…', metadata: { name: 'TOK' },
+//    totalSupply: 5000000n, source: 'local', … }]
+```
+
+Chain discovery needs the electrum backend and a server bridging
+`blockchain.token.get_token`; pass `{ discoverFromChain: false }` to skip it.
+
 #### Chain & Metadata
 
 ##### `getChainTip(): Promise<{ height: number; hash: string }>`

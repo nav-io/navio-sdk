@@ -78,6 +78,26 @@ export interface StoreOutputParams {
 }
 
 /**
+ * A token/NFT collection created by this wallet, recorded at creation time.
+ */
+export interface CreatedCollectionRecord {
+  /** Creation id `Hash(metadata‖totalSupply)` — the id minting derives keys from. */
+  collectionTokenId: string;
+  /** Collection type. */
+  kind: 'token' | 'nft';
+  /** Derived collection token public key (hex). */
+  tokenPublicKey: string;
+  /** Metadata the collection was created with. */
+  metadata: Record<string, string>;
+  /** Maximum total supply recorded at creation. */
+  totalSupply: number;
+  /** Transaction id of the create-collection transaction. */
+  txId: string;
+  /** Unix timestamp (seconds) when the creation was broadcast. */
+  createdAt: number;
+}
+
+/**
  * Wallet metadata
  */
 export interface WalletMetadata {
@@ -148,6 +168,10 @@ export interface IWalletDB {
   // -- pending/mempool balance ------------------------------------------
   getPendingSpentAmount(tokenId?: string | null): Promise<bigint>;
   deleteUnconfirmedOutputsByTxHash(txHash: string): Promise<void>;
+
+  // -- created collections ----------------------------------------------
+  saveCreatedCollection(record: CreatedCollectionRecord): Promise<void>;
+  getCreatedCollections(): Promise<CreatedCollectionRecord[]>;
 
   // -- persistence ------------------------------------------------------
   /** Flush to durable storage.  No-op for backends with immediate persistence. */

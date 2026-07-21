@@ -33,8 +33,8 @@ import type { HDChain, SubAddressIdentifier } from './key-manager.types';
 import * as blsctModule from 'navio-blsct';
 import type { IDatabaseAdapter, DatabaseAdapterOptions } from './database-adapter';
 import { createDatabaseAdapter } from './database-adapter';
-import type { SyncState, StoreOutputParams, TxType } from './wallet-db.interface';
-export type { SyncState, WalletOutput, WalletMetadata, StoreOutputParams, IWalletDB, TxType } from './wallet-db.interface';
+import type { SyncState, StoreOutputParams, TxType, CreatedCollectionRecord } from './wallet-db.interface';
+export type { SyncState, WalletOutput, WalletMetadata, StoreOutputParams, IWalletDB, TxType, CreatedCollectionRecord } from './wallet-db.interface';
 
 // WalletOutput is re-exported from wallet-db.interface.ts
 import type { WalletOutput } from './wallet-db.interface';
@@ -314,6 +314,19 @@ export class WalletDB {
         salt TEXT,
         verification_hash TEXT,
         encryption_version INTEGER NOT NULL DEFAULT 1
+      )
+    `);
+
+    // Collections created by this wallet (recorded at creation time)
+    await this.adapter.run(`
+      CREATE TABLE IF NOT EXISTS created_collections (
+        collection_token_id TEXT PRIMARY KEY,
+        kind TEXT NOT NULL,
+        token_public_key TEXT NOT NULL,
+        metadata TEXT NOT NULL,
+        total_supply INTEGER NOT NULL,
+        tx_id TEXT NOT NULL,
+        created_at INTEGER NOT NULL
       )
     `);
 
@@ -957,6 +970,53 @@ export class WalletDB {
   // ============================================================================
   // Sync data methods (used by TransactionKeysSync via IWalletDB interface)
   // ============================================================================
+
+  async saveCreatedCollection(record: CreatedCollectionRecord): Promise<void> {
+    if (!this.adapter) throw new Error('Database not open');
+    const stmt = await this.adapter.prepare(`
+      INSERT OR REPLACE INTO created_collections
+      (collection_token_id, kind, token_public_key, metadata, total_supply, tx_id, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `);
+    await stmt.run([
+      record.collectionTokenId,
+      record.kind,
+      record.tokenPublicKey,
+      JSON.stringify(record.metadata),
+      record.totalSupply,
+      record.txId,
+      record.createdAt,
+    ]);
+    await stmt.free();
+    await this.persistToDisk();
+  }
+
+  async getCreatedCollections(): Promise<CreatedCollectionRecord[]> {
+    if (!this.adapter) throw new Error('Database not open');
+    const result = await this.adapter.exec(
+      'SELECT collection_token_id, kind, token_public_key, metadata, total_supply, tx_id, created_at FROM created_collections ORDER BY created_at'
+    );
+    if (result.length === 0) {
+      return [];
+    }
+    return result[0].values.map((row) => {
+      let metadata: Record<string, string> = {};
+      try {
+        metadata = JSON.parse(row[3] as string);
+      } catch {
+        // Corrupt metadata JSON is non-fatal; return the record without it.
+      }
+      return {
+        collectionTokenId: row[0] as string,
+        kind: row[1] as 'token' | 'nft',
+        tokenPublicKey: row[2] as string,
+        metadata,
+        totalSupply: row[4] as number,
+        txId: row[5] as string,
+        createdAt: row[6] as number,
+      };
+    });
+  }
 
   async loadSyncState(): Promise<SyncState | null> {
     if (!this.adapter) return null;

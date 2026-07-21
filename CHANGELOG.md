@@ -3,6 +3,24 @@
 All notable changes to navio-sdk are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/); versions follow [SemVer](https://semver.org/).
 
+## [0.1.23] - 2026-07-21
+
+### Added
+- `listCreatedCollections()`: list the token/NFT collections this wallet
+  created. Creations are recorded in the wallet database at broadcast time;
+  for restored wallets the method additionally discovers collections from
+  chain in two ways — every distinct held token is looked up via
+  `blockchain.token.get_token`, and the wallet's own transactions are scanned
+  for create-token predicates (the create transaction spends the wallet's NAV,
+  so its hash is known after a sync — this recovers collections that were
+  created but never minted or held). A collection is reported when its
+  on-chain token public key re-derives from the wallet's seed (the same
+  ownership proof minting uses). Returned `collectionTokenId` is the creation
+  id, directly usable with `mintToken`/`mintNft`.
+  `{ discoverFromChain: false }` skips the chain passes.
+- Wallet database: new `created_collections` table (SQLite) / store
+  (IndexedDB, schema v2 — upgrades automatically).
+
 ## [0.1.22] - 2026-07-21
 
 ### Added
