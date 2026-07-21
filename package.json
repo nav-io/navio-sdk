@@ -20,6 +20,11 @@
     "files": [
         "dist"
     ],
+    "allowScripts": {
+        "navio-blsct": true,
+        "better-sqlite3": true,
+        "esbuild": true
+    },
     "scripts": {
         "build": "tsup",
         "dev": "tsup --watch",
