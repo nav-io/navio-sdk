@@ -620,6 +620,17 @@ export class ElectrumClient {
   }
 
   /**
+   * Look up an on-chain token by its public token ID (the hash reported by
+   * explorers and `gettoken`). Resolves to the daemon's token record
+   * (`{tokenId, publicKey, type, metadata, maxSupply, currentSupply}`), or
+   * rejects if the token is unknown or the server does not bridge the RPC.
+   * @param tokenId - Public token ID (64-char hex, display order)
+   */
+  async getToken(tokenId: string): Promise<any> {
+    return this.call('blockchain.token.get_token', tokenId);
+  }
+
+  /**
    * Get all transaction keys for a block
    * @param height - Block height
    * @returns Array of transaction keys for the block

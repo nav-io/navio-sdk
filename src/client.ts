@@ -56,6 +56,17 @@ export type NetworkType = 'mainnet' | 'testnet' | 'signet' | 'regtest';
 const DEFAULT_FEE_PER_COMPONENT = 200_000;
 
 /**
+ * BLSCT address prefix (bech32_mod_hrp) per network, from navio-core
+ * chainparams. Signet reuses the mainnet prefix.
+ */
+const NETWORK_ADDRESS_HRP: Record<NetworkType, string> = {
+  mainnet: 'nav',
+  testnet: 'tnv',
+  signet: 'nav',
+  regtest: 'rnv',
+};
+
+/**
  * Extra fee a maker's swap half over-funds so the combined transaction (its
  * half + the taker's fee-free half) clears the consensus minimum for the
  * COMBINED weight. Mirrors navio-core's per-candidate allowance:
@@ -459,6 +470,48 @@ function normalizeTokenMetadata(metadata?: TokenMetadata): TokenMetadata {
     }
     return [key, value];
   }));
+}
+
+/**
+ * Convert the metadata shape served by `gettoken`/`blockchain.token.get_token`
+ * (an array of `{key, value}` entries, or already a plain object) back into
+ * the SDK's TokenMetadata record.
+ */
+function tokenMetadataFromChainRecord(metadata: unknown): TokenMetadata {
+  if (!metadata) {
+    return {};
+  }
+  if (Array.isArray(metadata)) {
+    return Object.fromEntries(
+      metadata
+        .filter((entry) => entry && typeof entry.key === 'string')
+        .map((entry) => [entry.key, String(entry.value ?? '')])
+    );
+  }
+  if (typeof metadata === 'object') {
+    return normalizeTokenMetadata(metadata as TokenMetadata);
+  }
+  return {};
+}
+
+/**
+ * Give the opaque `failed-to-execute-predicate` network rejection an
+ * actionable explanation when it comes out of a mint.
+ */
+function augmentMintBroadcastError(err: unknown, collectionTokenId: string): Error {
+  const message = err instanceof Error ? err.message : String(err);
+  if (!message.includes('failed-to-execute-predicate')) {
+    return err instanceof Error ? err : new Error(message);
+  }
+  return new Error(
+    `${message}\n` +
+    `The network rejected the mint predicate for collection ${collectionTokenId.slice(0, 16)}…. Common causes: ` +
+    '(1) the id passed is the on-chain/explorer token id instead of the creation id returned by ' +
+    'createTokenCollection/createNftCollection — the SDK resolves this automatically when the connected server ' +
+    'bridges blockchain.token.get_token, but this server does not; ' +
+    '(2) the collection was created by a different wallet (the mint key derives from the creator\'s seed); ' +
+    '(3) the mint type does not match the collection type (fungible amount into an NFT collection, or vice versa).'
+  );
 }
 
 function toSafeInteger(value: bigint | number, fieldName: string): number {
@@ -1520,7 +1573,7 @@ export class NavioClient {
     }
 
     // --- Decode destination address ---
-    const destSubAddr = NavioClient.decodeAddress(address);
+    const destSubAddr = this.decodeDestinationAddress(address);
 
     if (tokenId !== null) {
       if (subtractFeeFromAmount) {
@@ -1850,7 +1903,7 @@ export class NavioClient {
       }
 
       return {
-        subAddr: NavioClient.decodeAddress(recipient.address),
+        subAddr: this.decodeDestinationAddress(recipient.address),
         amount: recipient.amount,
         memo: recipient.memo ?? '',
         subtractFee: recipient.subtractFeeFromAmount === true,
@@ -2125,14 +2178,19 @@ export class NavioClient {
       throw new Error('amount must be positive');
     }
 
-    const destination = NavioClient.decodeAddress(options.address);
-    const collectionTokenId = normalizeCollectionTokenHashHex(options.collectionTokenId);
-    const { tokenKey, tokenPublicKey } = this.buildCollectionTokenContext(collectionTokenId);
+    const destination = this.decodeDestinationAddress(options.address);
+    const { collectionTokenId, tokenKey, tokenPublicKey } =
+      await this.resolveCollectionTokenContext(options.collectionTokenId, 'token');
 
-    const result = await this.buildAndBroadcastUnsignedTransaction(
-      UnsignedOutput.mintToken(destination, mintAmount, Scalar.random(), tokenKey, tokenPublicKey),
-      options.selectedUtxos
-    );
+    let result: SendTransactionResult;
+    try {
+      result = await this.buildAndBroadcastUnsignedTransaction(
+        UnsignedOutput.mintToken(destination, mintAmount, Scalar.random(), tokenKey, tokenPublicKey),
+        options.selectedUtxos
+      );
+    } catch (err) {
+      throw augmentMintBroadcastError(err, collectionTokenId);
+    }
 
     return {
       ...result,
@@ -2152,14 +2210,19 @@ export class NavioClient {
     const normalizedNftId = typeof options.nftId === 'bigint' ? options.nftId : BigInt(options.nftId);
     const nftId = toSafeInteger(normalizedNftId, 'nftId');
     const metadata = normalizeTokenMetadata(options.metadata);
-    const destination = NavioClient.decodeAddress(options.address);
-    const collectionTokenId = normalizeCollectionTokenHashHex(options.collectionTokenId);
-    const { tokenKey, tokenPublicKey } = this.buildCollectionTokenContext(collectionTokenId);
+    const destination = this.decodeDestinationAddress(options.address);
+    const { collectionTokenId, tokenKey, tokenPublicKey } =
+      await this.resolveCollectionTokenContext(options.collectionTokenId, 'nft');
 
-    const result = await this.buildAndBroadcastUnsignedTransaction(
-      UnsignedOutput.mintNft(destination, Scalar.random(), tokenKey, tokenPublicKey, nftId, metadata),
-      options.selectedUtxos
-    );
+    let result: SendTransactionResult;
+    try {
+      result = await this.buildAndBroadcastUnsignedTransaction(
+        UnsignedOutput.mintNft(destination, Scalar.random(), tokenKey, tokenPublicKey, nftId, metadata),
+        options.selectedUtxos
+      );
+    } catch (err) {
+      throw augmentMintBroadcastError(err, collectionTokenId);
+    }
 
     return {
       ...result,
@@ -2718,6 +2781,30 @@ export class NavioClient {
   }
 
   /**
+   * Decode a destination address, first checking that its bech32 prefix
+   * belongs to the network this client is configured for. Catches wallets
+   * that mix up networks (e.g. a testnet address sent to a mainnet client)
+   * before an invalid transaction is built and broadcast.
+   */
+  private decodeDestinationAddress(addressStr: string): InstanceType<typeof SubAddr> {
+    const network = this.getNetwork();
+    const expectedHrp = NETWORK_ADDRESS_HRP[network];
+    const separator = addressStr.lastIndexOf('1');
+    const hrp = separator > 0 ? addressStr.slice(0, separator).toLowerCase() : '';
+    if (expectedHrp && hrp && hrp !== expectedHrp) {
+      const addressNetworks = Object.entries(NETWORK_ADDRESS_HRP)
+        .filter(([, prefix]) => prefix === hrp)
+        .map(([net]) => net);
+      const belongsTo = addressNetworks.length > 0 ? addressNetworks.join('/') : `unknown network (prefix "${hrp}")`;
+      throw new Error(
+        `Address "${addressStr.slice(0, 12)}…" is a ${belongsTo} address, but this client is configured for ${network} ` +
+        `(expected prefix "${expectedHrp}1…").`
+      );
+    }
+    return NavioClient.decodeAddress(addressStr);
+  }
+
+  /**
    * Select UTXOs to cover the target amount.
    * Uses a simple largest-first strategy.
    */
@@ -2793,10 +2880,62 @@ export class NavioClient {
       throw new Error('Wallet is locked. Unlock it before sending.');
     }
 
+    await this.verifyWalletMatchesChain();
+
     return {
       keyManager: this.keyManager,
       walletDB: this.walletDB,
     };
+  }
+
+  /**
+   * Verify the wallet database was synced against the chain the connected
+   * backend serves, by comparing the stored hash of the last synced block
+   * with the backend's header at that height. A wallet database synced on
+   * one network but spent against another selects UTXOs the node has never
+   * seen, and every spend is rejected with `bad-txns-inputs-missingorspent`
+   * — fail fast with an actionable message instead. A deep-reorg mismatch
+   * trips the same check; re-syncing resolves both.
+   *
+   * Backend/transport errors are swallowed: this is a safety net and must
+   * not add a new failure mode to spending.
+   */
+  private async verifyWalletMatchesChain(): Promise<void> {
+    if (!this.walletDB || !this.syncProvider) {
+      return;
+    }
+
+    let state;
+    try {
+      state = await this.walletDB.loadSyncState();
+    } catch {
+      return;
+    }
+    if (!state || state.lastSyncedHeight <= 0 || !state.lastSyncedHash) {
+      return;
+    }
+
+    let headerHex: string;
+    try {
+      headerHex = await this.syncProvider.getBlockHeader(state.lastSyncedHeight);
+    } catch {
+      return;
+    }
+    if (!headerHex || typeof headerHex !== 'string') {
+      return;
+    }
+
+    const headerHash = Buffer.from(sha256(sha256(Buffer.from(headerHex, 'hex'))))
+      .reverse()
+      .toString('hex');
+    if (headerHash !== state.lastSyncedHash.toLowerCase()) {
+      throw new Error(
+        `Wallet state does not match the connected ${this.getNetwork()} chain: block ${state.lastSyncedHeight} ` +
+        `is ${state.lastSyncedHash.slice(0, 16)}… in the wallet but ${headerHash.slice(0, 16)}… on the backend. ` +
+        'The wallet database was synced against a different network (or the chain reorged past it). ' +
+        'Re-sync this wallet against the connected backend — or use the wallet database that belongs to this network — before spending.'
+      );
+    }
   }
 
   private buildCollectionTokenContext(collectionTokenId: string): {
@@ -2814,6 +2953,76 @@ export class NavioClient {
       tokenKey: deriveCollectionTokenKeyFromMaster(masterTokenKey, collectionTokenHashHex),
       tokenPublicKey: deriveCollectionTokenPublicKeyFromMaster(masterTokenKey, collectionTokenHashHex),
     };
+  }
+
+  /**
+   * Resolve the collection id a caller passed to a mint into the CREATION id
+   * the mint predicate key derives from.
+   *
+   * A collection has two distinct 64-hex ids and mixing them up is the #1
+   * mint failure: the creation id `Hash(metadata‖totalSupply)` (returned by
+   * createTokenCollection/createNftCollection, input to the key derivation)
+   * and the public on-chain id `hash(tokenPublicKey)` (what explorers,
+   * `gettoken`, and wallet balances report). Deriving the mint key from the
+   * public id produces a key the predicate rejects, and the node's only
+   * feedback is an opaque `failed-to-execute-predicate`.
+   *
+   * When the connected server bridges `blockchain.token.get_token`, look the
+   * id up on-chain: if it names an existing token, recompute the creation id
+   * from the token's metadata and supply, re-derive the collection key, and
+   * prove ownership by comparing the derived public key with the on-chain
+   * one. Unknown ids (or servers without the bridge) fall back to treating
+   * the id as a creation id, which is the pre-existing behavior.
+   */
+  private async resolveCollectionTokenContext(
+    collectionTokenIdInput: string,
+    expectedKind: 'token' | 'nft',
+  ): Promise<{
+    collectionTokenId: string;
+    tokenKey: InstanceType<typeof Scalar>;
+    tokenPublicKey: InstanceType<typeof PublicKey>;
+  }> {
+    const collectionTokenId = normalizeCollectionTokenHashHex(collectionTokenIdInput);
+
+    let onChainToken: any = null;
+    if (this.electrumClient) {
+      try {
+        onChainToken = await this.electrumClient.getToken(collectionTokenId);
+      } catch {
+        // Unknown token or a server without the RPC bridge — treat the id as
+        // a creation id below.
+        onChainToken = null;
+      }
+    }
+
+    if (!onChainToken || typeof onChainToken !== 'object' || !onChainToken.publicKey) {
+      return { collectionTokenId, ...this.buildCollectionTokenContext(collectionTokenId) };
+    }
+
+    const onChainKind: 'token' | 'nft' = onChainToken.type === 'nft' ? 'nft' : 'token';
+    if (onChainKind !== expectedKind) {
+      throw new Error(
+        `Collection ${collectionTokenId.slice(0, 16)}… is an ${onChainKind === 'nft' ? 'NFT' : 'fungible token'} ` +
+        `collection; use ${onChainKind === 'nft' ? 'mintNft' : 'mintToken'} for it.`
+      );
+    }
+
+    const metadata = tokenMetadataFromChainRecord(onChainToken.metadata);
+    const totalSupply = toSafeInteger(BigInt(onChainToken.maxSupply ?? 0), 'maxSupply');
+    const creationTokenId = normalizeCollectionTokenHashHex(calcCollectionTokenHashHex(metadata, totalSupply));
+    const resolved = this.buildCollectionTokenContext(creationTokenId);
+
+    const derivedPublicKey = String(resolved.tokenPublicKey.serialize()).toLowerCase();
+    const onChainPublicKey = String(onChainToken.publicKey).toLowerCase();
+    if (derivedPublicKey !== onChainPublicKey) {
+      throw new Error(
+        `Collection ${collectionTokenId.slice(0, 16)}… exists on-chain but was not created by this wallet: ` +
+        'its token key does not derive from this wallet\'s seed, so this wallet cannot sign the mint predicate. ' +
+        'Mint from the wallet that created the collection.'
+      );
+    }
+
+    return { collectionTokenId: creationTokenId, ...resolved };
   }
 
   private async selectFundingUtxos(

@@ -470,6 +470,15 @@ const mint = await client.mintToken({
 });
 ```
 
+`collectionTokenId` accepts either the creation id returned by
+`createTokenCollection`/`createNftCollection` (the hash of metadata +
+supply that the mint key derives from) or the public on-chain token id
+that explorers and `gettoken` report. Public ids are resolved
+automatically when the connected Electrum server bridges
+`blockchain.token.get_token`; on servers without the bridge only the
+creation id works. Minting requires the wallet that created the
+collection — the mint predicate key derives from the creator's seed.
+
 ##### `mintNft(options: MintNftOptions): Promise<MintAssetResult>`
 
 Mint a single NFT from an existing collection. The returned `tokenId` is the full 80-hex NFT token ID in navio-core/RPC byte order.
