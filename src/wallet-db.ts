@@ -1316,8 +1316,11 @@ export class WalletDB {
     let query = 'SELECT SUM(amount) as total FROM wallet_outputs WHERE is_spent = 0';
 
     if (tokenId === null) {
-      // NAV balance - outputs with no token_id or default token_id
-      query += " AND (token_id IS NULL OR token_id = '0000000000000000000000000000000000000000000000000000000000000000')";
+      // NAV balance - outputs with no token_id or the default token id in
+      // either spelling (bare zero hash, or TokenId.serialize()'s zero hash
+      // + ffff… no-subid marker, written by older mempool processing)
+      query += " AND (token_id IS NULL OR token_id = '0000000000000000000000000000000000000000000000000000000000000000'"
+        + " OR token_id = '0000000000000000000000000000000000000000000000000000000000000000ffffffffffffffff')";
     } else {
       query += ` AND token_id = '${tokenId}'`;
     }

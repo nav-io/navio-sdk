@@ -525,7 +525,12 @@ export class IndexedDBWalletDB implements IWalletDB {
 
   private matchesTokenFilter(recTokenId: string | null, filterTokenId: string | null): boolean {
     if (filterTokenId === null) {
-      return !recTokenId || recTokenId === DEFAULT_TOKEN_ID;
+      // NAV: no token id, or the default token id in either spelling (bare
+      // zero hash, or TokenId.serialize()'s zero hash + ffff… no-subid
+      // marker, written by older mempool processing)
+      return !recTokenId
+        || recTokenId === DEFAULT_TOKEN_ID
+        || recTokenId === DEFAULT_TOKEN_ID + 'ffffffffffffffff';
     }
     return recTokenId === filterTokenId;
   }

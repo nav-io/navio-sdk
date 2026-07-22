@@ -26,6 +26,16 @@ import { sha256 } from '@noble/hashes/sha256';
 const EMPTY_RANGE_PROOF_HEX = '00';
 
 /**
+ * Hex spellings of the NAV (default) token id as they appear from different
+ * sources: the bare 32-byte zero hash, and TokenId.serialize()'s 40-byte
+ * form (zero hash + ffff… no-subid marker).
+ */
+const NAV_TOKEN_ID_HEX_FORMS = new Set([
+  '0'.repeat(64),
+  '0'.repeat(64) + 'ffffffffffffffff',
+]);
+
+/**
  * Yield control back to the browser's event loop so it can repaint and
  * handle user input.  Uses setTimeout(0) which schedules a macrotask,
  * guaranteeing that pending paint / input tasks run before we resume.
@@ -1210,9 +1220,18 @@ export class TransactionKeysSync {
     txType: TxType = 'received',
     timestamp: number = 0
   ): Promise<void> {
+    // Normalize the NAV token id to null at the single write choke point.
+    // TokenId.serialize() renders NAV as 64 zero chars + the ffff… no-subid
+    // marker; rows stored in that form fail the databases' NAV balance
+    // filters (which match null / the 64-zero hash), making the wallet's own
+    // unconfirmed change invisible until the next block ("balance shows 0
+    // after minting/sending").
+    const normalizedTokenId = tokenId !== null && NAV_TOKEN_ID_HEX_FORMS.has(tokenId.toLowerCase())
+      ? null
+      : tokenId;
     await this.walletDB.storeWalletOutput({
       outputHash, txHash, outputIndex, blockHeight, outputData,
-      amount, gamma, memo, tokenId, blindingKey, spendingKey,
+      amount, gamma, memo, tokenId: normalizedTokenId, blindingKey, spendingKey,
       isSpent, spentTxHash, spentBlockHeight, txType, timestamp,
     });
   }

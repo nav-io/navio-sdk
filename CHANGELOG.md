@@ -3,6 +3,18 @@
 All notable changes to navio-sdk are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/); versions follow [SemVer](https://semver.org/).
 
+## [0.1.27] - 2026-07-22
+
+### Fixed
+- NAV balance no longer reads 0 while the wallet's own change is unconfirmed.
+  Mempool processing stored the change output's token id as
+  `TokenId.serialize()`'s NAV spelling (zero hash + `ffff…` no-subid marker),
+  which the databases' NAV balance filters (null / bare zero hash) did not
+  match — so after any send or mint the entire balance disappeared until the
+  next block. Token ids are now normalized to `null` for NAV at the single
+  write choke point, and both database filters additionally accept the legacy
+  spelling so existing wallet databases heal without a resync.
+
 ## [0.1.26] - 2026-07-22
 
 ### Fixed
