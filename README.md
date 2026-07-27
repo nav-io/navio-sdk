@@ -535,6 +535,24 @@ also carry the collection `metadata` and `totalSupply` when resolvable
 Chain discovery needs the electrum backend and a server bridging
 `blockchain.token.get_token`; pass `{ discoverFromChain: false }` to skip it.
 
+##### `mintNfts(options: MintNftsOptions): Promise<MintNftsResult>`
+
+Mint several NFTs from an existing collection in a single transaction — one
+broadcast, one fee, one block. Each NFT takes its own `nftId`, `metadata`,
+and optionally its own destination `address`.
+
+```typescript
+const batch = await client.mintNfts({
+  address: 'tnav1...',
+  collectionTokenId: collection.collectionTokenId,
+  nfts: [
+    { nftId: 1n, metadata: { name: 'One' } },
+    { nftId: 2n, metadata: { name: 'Two' }, address: 'tnav1other...' },
+  ],
+});
+console.log(batch.tokenIds); // full 80-hex NFT token ids, input order
+```
+
 #### Chain & Metadata
 
 ##### `getChainTip(): Promise<{ height: number; hash: string }>`

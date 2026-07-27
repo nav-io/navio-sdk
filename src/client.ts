@@ -252,6 +252,36 @@ export interface MintNftOptions {
   selectedUtxos?: string[];
 }
 
+export interface MintNftsOptions {
+  /** Default destination address for all minted NFTs. */
+  address: string;
+  /** Collection token ID or collection token hash. */
+  collectionTokenId: string;
+  /** NFTs to mint — all in one transaction (and therefore one block). */
+  nfts: Array<{
+    /** NFT sub-id within the collection. */
+    nftId: bigint | number;
+    /** Metadata embedded in this NFT's mint predicate. */
+    metadata?: TokenMetadata;
+    /** Optional per-NFT destination overriding the default address. */
+    address?: string;
+  }>;
+  /** Optional NAV UTXOs to fund the transaction fee. */
+  selectedUtxos?: string[];
+}
+
+export interface MintNftsResult extends SendTransactionResult {
+  kind: 'nft';
+  /** Collection token ID in navio-core/RPC byte order. */
+  collectionTokenId: string;
+  /** Full 80-hex NFT token ids of every minted NFT, in input order. */
+  tokenIds: string[];
+  /** Derived collection token public key. */
+  tokenPublicKey: string;
+  /** Public on-chain token id — matches getAssetBalances/getTokenBalances. */
+  publicTokenId: string;
+}
+
 /**
  * Result of a sent transaction
  */
@@ -301,6 +331,8 @@ export interface WalletAssetBalance {
   metadata?: TokenMetadata;
   /** Collection max total supply, when known. */
   totalSupply?: bigint;
+  /** For NFTs: the metadata this specific NFT was minted with, when known. */
+  nftMetadata?: TokenMetadata;
 }
 
 export interface CreateCollectionResult extends SendTransactionResult {
@@ -765,10 +797,19 @@ export class NavioClient {
    * the get_token bridge) so it is not retried every call.
    */
   private tokenRegistryCache = new Map<string, {
-    metadata: TokenMetadata;
-    totalSupply: bigint;
-    kind: WalletAssetKind;
-  } | null>();
+    info: {
+      metadata: TokenMetadata;
+      totalSupply: bigint;
+      kind: WalletAssetKind;
+      /** For NFT collections: minted per-NFT metadata keyed by nft id (decimal string). */
+      mintedNft: Record<string, TokenMetadata>;
+    } | null;
+    /** When the entry was written; misses (`info: null`) expire after a TTL. */
+    at: number;
+  }>();
+
+  /** How long a failed token-registry lookup is remembered before retrying. */
+  private static readonly TOKEN_REGISTRY_MISS_TTL_MS = 5 * 60 * 1000;
 
   // Background sync state
   private backgroundSyncTimer: ReturnType<typeof setInterval> | null = null;
@@ -1522,6 +1563,12 @@ export class NavioClient {
           if (info) {
             asset.metadata = info.metadata;
             asset.totalSupply = info.totalSupply;
+            if (asset.kind === 'nft' && asset.nftId !== null) {
+              const nftMetadata = info.mintedNft[asset.nftId.toString()];
+              if (nftMetadata) {
+                asset.nftMetadata = nftMetadata;
+              }
+            }
           }
         } catch {
           // Metadata resolution is best-effort; balances stay authoritative.
@@ -1541,56 +1588,82 @@ export class NavioClient {
     metadata: TokenMetadata;
     totalSupply: bigint;
     kind: WalletAssetKind;
+    mintedNft: Record<string, TokenMetadata>;
   } | null> {
     const cached = this.tokenRegistryCache.get(publicTokenId);
     if (cached !== undefined) {
-      return cached;
+      const fresh = Date.now() - cached.at < NavioClient.TOKEN_REGISTRY_MISS_TTL_MS;
+      // Fungible collection info is immutable — serve it forever. NFT
+      // collections gain minted entries over time and misses may have been
+      // transient server errors, so both refresh after the TTL.
+      if (cached.info !== null && cached.info.kind === 'token') {
+        return cached.info;
+      }
+      if (fresh) {
+        return cached.info;
+      }
     }
 
     // Local creation records: compute each record's public id and match.
+    // Registry lookup still runs for NFT collections to pick up minted
+    // per-NFT metadata, which local records do not carry.
+    let localInfo: {
+      metadata: TokenMetadata; totalSupply: bigint; kind: WalletAssetKind;
+      mintedNft: Record<string, TokenMetadata>;
+    } | null = null;
     if (this.walletDB) {
       try {
         for (const record of await this.walletDB.getCreatedCollections()) {
-          const recordPublicId = publicTokenIdFromPublicKeyHex(record.tokenPublicKey);
-          if (!this.tokenRegistryCache.has(recordPublicId)) {
-            this.tokenRegistryCache.set(recordPublicId, {
+          if (publicTokenIdFromPublicKeyHex(record.tokenPublicKey) === publicTokenId) {
+            localInfo = {
               metadata: record.metadata,
               totalSupply: BigInt(record.totalSupply),
               kind: record.kind,
-            });
+              mintedNft: {},
+            };
+            break;
           }
-        }
-        const localHit = this.tokenRegistryCache.get(publicTokenId);
-        if (localHit !== undefined) {
-          return localHit;
         }
       } catch {
         // Fall through to the registry lookup.
       }
     }
+    if (localInfo && localInfo.kind === 'token') {
+      this.tokenRegistryCache.set(publicTokenId, { info: localInfo, at: Date.now() });
+      return localInfo;
+    }
 
     if (!this.electrumClient) {
-      return null; // not cached: a later connection may resolve it
+      return localInfo; // not cached: a later connection may resolve more
     }
 
     try {
       const onChainToken: any = await this.electrumClient.getToken(publicTokenId);
       if (onChainToken && typeof onChainToken === 'object' && onChainToken.publicKey) {
+        const mintedNft: Record<string, TokenMetadata> = {};
+        if (Array.isArray(onChainToken.mintedNft)) {
+          for (const entry of onChainToken.mintedNft) {
+            if (entry && entry.index !== undefined) {
+              mintedNft[String(entry.index)] = tokenMetadataFromChainRecord(entry.metadata);
+            }
+          }
+        }
         const info = {
           metadata: tokenMetadataFromChainRecord(onChainToken.metadata),
           totalSupply: BigInt(onChainToken.maxSupply ?? 0),
           kind: (onChainToken.type === 'nft' ? 'nft' : 'token') as WalletAssetKind,
+          mintedNft,
         };
-        this.tokenRegistryCache.set(publicTokenId, info);
+        this.tokenRegistryCache.set(publicTokenId, { info, at: Date.now() });
         return info;
       }
-      this.tokenRegistryCache.set(publicTokenId, null);
+      this.tokenRegistryCache.set(publicTokenId, { info: localInfo, at: Date.now() });
     } catch {
-      // Unknown token or server without the bridge — cache the miss so it
-      // is not retried on every balance call.
-      this.tokenRegistryCache.set(publicTokenId, null);
+      // Unknown token or server without the bridge — remember the miss
+      // (with a TTL) so it is not retried on every balance call.
+      this.tokenRegistryCache.set(publicTokenId, { info: localInfo, at: Date.now() });
     }
-    return null;
+    return localInfo;
   }
 
   /**
@@ -2620,6 +2693,60 @@ export class NavioClient {
       kind: 'nft',
       collectionTokenId,
       tokenId: composeNftTokenId(collectionTokenId, normalizedNftId),
+      tokenPublicKey: tokenPublicKey.serialize(),
+      publicTokenId: publicTokenIdFromPublicKeyHex(tokenPublicKey.serialize()),
+    };
+  }
+
+  /**
+   * Mint several NFTs from an existing collection in a SINGLE transaction.
+   *
+   * Consensus executes output predicates in order against a shared view, so
+   * any number of mint-NFT outputs for the same collection validate together
+   * — one broadcast, one fee, one block. Ids must be distinct and unminted.
+   */
+  async mintNfts(options: MintNftsOptions): Promise<MintNftsResult> {
+    await this.ensureSpendReady();
+
+    if (!Array.isArray(options.nfts) || options.nfts.length === 0) {
+      throw new Error('mintNfts requires at least one NFT.');
+    }
+
+    const seenIds = new Set<string>();
+    const normalized = options.nfts.map((nft) => {
+      const normalizedNftId = typeof nft.nftId === 'bigint' ? nft.nftId : BigInt(nft.nftId);
+      const key = normalizedNftId.toString();
+      if (seenIds.has(key)) {
+        throw new Error(`Duplicate nftId ${key} in mintNfts.`);
+      }
+      seenIds.add(key);
+      return {
+        nftId: toSafeInteger(normalizedNftId, 'nftId'),
+        normalizedNftId,
+        metadata: normalizeTokenMetadata(nft.metadata),
+        destination: this.decodeDestinationAddress(nft.address ?? options.address),
+      };
+    });
+
+    const { collectionTokenId, tokenKey, tokenPublicKey } =
+      await this.resolveCollectionTokenContext(options.collectionTokenId, 'nft');
+
+    const outputs = normalized.map((nft) =>
+      UnsignedOutput.mintNft(nft.destination, Scalar.random(), tokenKey, tokenPublicKey, nft.nftId, nft.metadata)
+    );
+
+    let result: SendTransactionResult;
+    try {
+      result = await this.buildAndBroadcastUnsignedTransaction(outputs, options.selectedUtxos);
+    } catch (err) {
+      throw augmentMintBroadcastError(err, collectionTokenId);
+    }
+
+    return {
+      ...result,
+      kind: 'nft',
+      collectionTokenId,
+      tokenIds: normalized.map((nft) => composeNftTokenId(collectionTokenId, nft.normalizedNftId)),
       tokenPublicKey: tokenPublicKey.serialize(),
       publicTokenId: publicTokenIdFromPublicKeyHex(tokenPublicKey.serialize()),
     };

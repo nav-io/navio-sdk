@@ -3,6 +3,24 @@
 All notable changes to navio-sdk are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/); versions follow [SemVer](https://semver.org/).
 
+## [0.1.28] - 2026-07-27
+
+### Added
+- `mintNfts()`: mint several NFTs from a collection in a SINGLE transaction
+  (one broadcast, one fee, one block). Per-NFT metadata and optional per-NFT
+  destination addresses; returns the full NFT token ids in input order.
+- `getAssetBalances` NFT entries now carry `nftMetadata` — the metadata the
+  specific NFT was minted with (from the collection's on-chain minted list) —
+  alongside the collection `metadata`/`totalSupply`.
+
+### Fixed
+- Token-registry lookup failures were cached for the client's lifetime, so a
+  single transient server error left assets without metadata for the rest of
+  a long-lived session ("received NFT has no metadata"). Misses now expire
+  after 5 minutes, and NFT-collection entries refresh on the same interval so
+  newly minted NFTs pick up their metadata; fungible collection info stays
+  cached forever (it is immutable).
+
 ## [0.1.27] - 2026-07-22
 
 ### Fixed
