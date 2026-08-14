@@ -3,6 +3,21 @@
 All notable changes to navio-sdk are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/); versions follow [SemVer](https://semver.org/).
 
+## [0.1.29] - 2026-08-14
+
+### Added
+
+- **Navio birthday mnemonic (26 words)**: a standard BIP39 24-word phrase plus
+  two extra words encoding the wallet creation time (weeks since 2026-01-01 UTC
+  plus an HMAC-SHA256 check word bound to the seed). Restores from a birthday
+  mnemonic start scanning at the encoded week instead of from genesis.
+  New `crypto` exports: `mnemonicWithBirthday`, `generateBirthdayMnemonic`,
+  `parseBirthdayMnemonic`, `isBirthdayMnemonic`. `KeyManager` accepts 26-word
+  phrases everywhere a mnemonic is accepted (keys derive from the 24-word base),
+  and `NavioClient.restoreFromMnemonic` derives `restoreFromHeight`
+  automatically. Format aligned with navio-core and navio-electrum via a shared
+  cross-implementation test vector.
+
 ## [0.1.28] - 2026-07-27
 
 ### Added
