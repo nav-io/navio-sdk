@@ -33,3 +33,13 @@ export {
   SALT_LENGTH,
   IV_LENGTH,
 } from './encryption';
+
+export {
+  BIRTHDAY_EPOCH,
+  BIRTHDAY_WEEK,
+  mnemonicWithBirthday,
+  generateBirthdayMnemonic,
+  parseBirthdayMnemonic,
+  isBirthdayMnemonic,
+} from './birthday-mnemonic';
+export type { ParsedBirthdayMnemonic } from './birthday-mnemonic';

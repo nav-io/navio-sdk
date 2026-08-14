@@ -13,6 +13,7 @@ import { WalletDB, WalletDBOptions } from './wallet-db';
 import { ElectrumClient, ElectrumOptions } from './electrum';
 import { TransactionKeysSync, SyncOptions, BackgroundSyncOptions } from './tx-keys-sync';
 import { KeyManager } from './key-manager';
+import { parseBirthdayMnemonic } from './crypto/birthday-mnemonic';
 import type { IWalletDB, WalletOutput } from './wallet-db.interface';
 import { SyncProvider } from './sync-provider';
 import { P2PSyncProvider } from './p2p-sync';
@@ -49,6 +50,24 @@ const {
  * Network type for Navio
  */
 export type NetworkType = 'mainnet' | 'testnet' | 'signet' | 'regtest';
+
+/**
+ * Genesis block timestamps and target block interval, used to turn a wallet
+ * birthday (from a 26-word Navio birthday mnemonic) into a scan height.
+ */
+const NETWORK_GENESIS_TIME: Partial<Record<NetworkType, number>> = {
+  mainnet: 1782910800,
+  testnet: 1777481682,
+};
+const BLOCK_INTERVAL_SECONDS = 120;
+
+/** Estimate the chain height at a unix timestamp (with a one-day margin). */
+function estimateHeightForTimestamp(network: NetworkType, ts: number): number {
+  const genesis = NETWORK_GENESIS_TIME[network];
+  if (!genesis || ts <= genesis) return 0;
+  const margin = 24 * 3600;
+  return Math.max(0, Math.floor((ts - genesis - margin) / BLOCK_INTERVAL_SECONDS));
+}
 
 /**
  * Fee per input+output in satoshis (matches navio-core default)
@@ -710,7 +729,11 @@ export interface NavioClientConfig {
   /** Restore wallet from seed (hex string) */
   restoreFromSeed?: string;
 
-  /** Restore wallet from mnemonic phrase (24 words) */
+  /**
+   * Restore wallet from mnemonic phrase: 24 BIP39 words, or 26 words for a
+   * Navio birthday mnemonic whose two extra words encode the wallet creation
+   * time (the scan then starts at that week instead of from genesis).
+   */
   restoreFromMnemonic?: string;
 
   /**
@@ -961,10 +984,26 @@ export class NavioClient {
       // Connect to backend
       await this.syncProvider.connect();
     } else if (this.config.restoreFromMnemonic) {
-      // Restore from mnemonic with user-provided height (or 0 to scan from genesis)
+      // Restore from mnemonic. A 26-word Navio birthday mnemonic carries the
+      // wallet creation time; when no explicit height is given, start
+      // scanning at the encoded week instead of from genesis.
+      let restoreHeight = this.config.restoreFromHeight;
+      if (restoreHeight === undefined) {
+        try {
+          const parsed = parseBirthdayMnemonic(this.config.restoreFromMnemonic);
+          if (parsed.birthday !== null) {
+            restoreHeight = estimateHeightForTimestamp(
+              this.config.network as NetworkType,
+              parsed.birthday
+            );
+          }
+        } catch {
+          // invalid phrases surface from restoreWalletFromMnemonic below
+        }
+      }
       this.keyManager = await this.walletDB.restoreWalletFromMnemonic(
         this.config.restoreFromMnemonic,
-        this.config.restoreFromHeight
+        restoreHeight
       );
 
       // Set KeyManager for sync manager (enables output detection)

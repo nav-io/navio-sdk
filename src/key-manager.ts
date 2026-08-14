@@ -9,6 +9,7 @@ import { sha256 } from '@noble/hashes/sha256';
 import { ripemd160 } from '@noble/hashes/ripemd160';
 import * as bip39 from '@scure/bip39';
 import { wordlist as englishWordlist } from '@scure/bip39/wordlists/english.js';
+import { parseBirthdayMnemonic } from './crypto/birthday-mnemonic';
 // Import from navio-blsct using ESM
 import * as blsctModule from 'navio-blsct';
 const Scalar = blsctModule.Scalar;
@@ -627,6 +628,16 @@ export class KeyManager {
    * @returns True if the mnemonic is valid
    */
   static validateMnemonic(mnemonic: string): boolean {
+    const words = mnemonic.trim().split(/\s+/);
+    if (words.length === 26) {
+      // Navio birthday mnemonic: 24 BIP39 words + birthday + check word
+      try {
+        parseBirthdayMnemonic(mnemonic);
+        return true;
+      } catch {
+        return false;
+      }
+    }
     return bip39.validateMnemonic(mnemonic, englishWordlist);
   }
 
@@ -673,11 +684,13 @@ export class KeyManager {
     if (!KeyManager.validateMnemonic(mnemonic)) {
       throw new Error('Invalid mnemonic phrase');
     }
-    
-    // Convert mnemonic back to entropy (32 bytes for 24-word mnemonic)
-    const entropy = bip39.mnemonicToEntropy(mnemonic, englishWordlist);
+
+    // Convert mnemonic back to entropy (32 bytes for a 24-word mnemonic).
+    // 26-word Navio birthday mnemonics derive from their 24-word base, so
+    // the wallet is identical to a plain BIP39 restore.
+    const entropy = parseBirthdayMnemonic(mnemonic).entropy;
     const entropyHex = uint8ArrayToHex(entropy);
-    
+
     return Scalar.deserialize(entropyHex);
   }
 
