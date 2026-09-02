@@ -86,6 +86,21 @@ const NETWORK_ADDRESS_HRP: Record<NetworkType, string> = {
 };
 
 /**
+ * Consensus activation height for the BLSCT range-proof v2 transcript, per
+ * network (from navio-core chainparams). At or above this height a BLSCT
+ * transaction must build its outputs under the v2 transcript and carry
+ * BLSCT_PROOF_V2_MARKER, or the node rejects it. Mainnet and signet are dormant
+ * (INT_MAX) until an activation height is chosen; testnet is armed at 70600 and
+ * regtest from genesis.
+ */
+const NETWORK_BLSCT_PROOF_V2_HEIGHT: Record<NetworkType, number> = {
+  mainnet: 42500,      // flag day ~2026-09-02 21:00 Berlin; see navio-core chainparams
+  testnet: 70600,
+  signet: 2147483647,  // dormant
+  regtest: 0,
+};
+
+/**
  * Extra fee a maker's swap half over-funds so the combined transaction (its
  * half + the taker's fee-free half) clears the consensus minimum for the
  * COMBINED weight. Mirrors navio-core's per-candidate allowance:
@@ -1373,6 +1388,32 @@ export class NavioClient {
   }
 
   /**
+   * Whether outputs built now must use the BLSCT range-proof v2 transcript,
+   * i.e. the next block is at or above this network's activation height. Below
+   * the gate (and on nets where it is dormant) this is false and we keep
+   * emitting v1 outputs, which stay valid before activation.
+   */
+  private wantsTranscriptV2(): boolean {
+    const nextHeight = this.getLastSyncedHeight() + 1;
+    return nextHeight >= NETWORK_BLSCT_PROOF_V2_HEIGHT[this.getNetwork()];
+  }
+
+  /**
+   * Wrap a freshly built TxOut as an UnsignedOutput, requesting the v2
+   * range-proof transcript when the chain is at/after the activation gate. Any
+   * v2 output makes the assembled transaction carry BLSCT_PROOF_V2_MARKER, so
+   * every normal output is routed through here.
+   */
+  private toUnsignedOutput(
+    txOut: InstanceType<typeof TxOut>,
+  ): InstanceType<typeof UnsignedOutput> {
+    if (this.wantsTranscriptV2()) {
+      txOut.setTranscriptV2(true);
+    }
+    return UnsignedOutput.fromTxOut(txOut);
+  }
+
+  /**
    * Get sync state
    * @returns Current sync state
    */
@@ -2106,11 +2147,11 @@ export class NavioClient {
       }
 
       const outputs: InstanceType<typeof UnsignedOutput>[] = [];
-      outputs.push(UnsignedOutput.fromTxOut(
+      outputs.push(this.toUnsignedOutput(
         TxOut.generate(destSubAddr, Number(sendAmount), memo, blsctTokenId, TxOutputType.Normal, 0, false, Scalar.random()),
       ));
       if (changeAmount > 0n) {
-        outputs.push(UnsignedOutput.fromTxOut(
+        outputs.push(this.toUnsignedOutput(
           TxOut.generate(this.getChangeSubAddress(), Number(changeAmount), '', blsctTokenId, TxOutputType.Normal, 0, false, Scalar.random()),
         ));
       }
@@ -2297,7 +2338,7 @@ export class NavioClient {
       const outputs: InstanceType<typeof UnsignedOutput>[] = [];
       for (let i = 0; i < decodedRecipients.length; i++) {
         const recipient = decodedRecipients[i];
-        outputs.push(UnsignedOutput.fromTxOut(TxOut.generate(
+        outputs.push(this.toUnsignedOutput(TxOut.generate(
           recipient.subAddr,
           Number(sendAmounts[i]),
           recipient.memo,
@@ -2310,7 +2351,7 @@ export class NavioClient {
       }
 
       if (changeAmount > 0n) {
-        outputs.push(UnsignedOutput.fromTxOut(TxOut.generate(
+        outputs.push(this.toUnsignedOutput(TxOut.generate(
           this.getChangeSubAddress(),
           Number(changeAmount),
           '',
@@ -3225,18 +3266,18 @@ export class NavioClient {
     ): InstanceType<typeof UnsignedOutput>[] => {
       const outputs: InstanceType<typeof UnsignedOutput>[] = [];
       // The received leg: an output with no matching input in this half.
-      outputs.push(UnsignedOutput.fromTxOut(TxOut.generate(
+      outputs.push(this.toUnsignedOutput(TxOut.generate(
         recvDestination, toSafeInteger(recvAmount, 'recvAmount'), 'swap-recv', recv.blsct,
         TxOutputType.Normal, 0, false, Scalar.random(),
       )));
       if (payChange > 0n) {
-        outputs.push(UnsignedOutput.fromTxOut(TxOut.generate(
+        outputs.push(this.toUnsignedOutput(TxOut.generate(
           changeSubAddr, toSafeInteger(payChange, 'pay change'), '', pay.blsct,
           TxOutputType.Normal, 0, false, Scalar.random(),
         )));
       }
       if (navChange > 0n) {
-        outputs.push(UnsignedOutput.fromTxOut(TxOut.generate(
+        outputs.push(this.toUnsignedOutput(TxOut.generate(
           changeSubAddr, toSafeInteger(navChange, 'NAV change'), '', TokenId.default(),
           TxOutputType.Normal, 0, false, Scalar.random(),
         )));
@@ -3673,7 +3714,7 @@ export class NavioClient {
   }
 
   private buildUnsignedNavChangeOutput(amount: bigint): InstanceType<typeof UnsignedOutput> {
-    return UnsignedOutput.fromTxOut(TxOut.generate(
+    return this.toUnsignedOutput(TxOut.generate(
       this.getChangeSubAddress(),
       Number(amount),
       '',
@@ -3696,7 +3737,7 @@ export class NavioClient {
     const outputs: InstanceType<typeof UnsignedOutput>[] = [];
     const changeSubAddr = this.getChangeSubAddress();
 
-    outputs.push(UnsignedOutput.fromTxOut(TxOut.generate(
+    outputs.push(this.toUnsignedOutput(TxOut.generate(
       destination,
       Number(amount),
       memo,
@@ -3708,7 +3749,7 @@ export class NavioClient {
     )));
 
     if (assetChangeAmount > 0n) {
-      outputs.push(UnsignedOutput.fromTxOut(TxOut.generate(
+      outputs.push(this.toUnsignedOutput(TxOut.generate(
         changeSubAddr,
         Number(assetChangeAmount),
         '',
@@ -3721,7 +3762,7 @@ export class NavioClient {
     }
 
     if (navChangeAmount > 0n) {
-      outputs.push(UnsignedOutput.fromTxOut(TxOut.generate(
+      outputs.push(this.toUnsignedOutput(TxOut.generate(
         changeSubAddr,
         Number(navChangeAmount),
         '',
