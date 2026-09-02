@@ -22,7 +22,7 @@ import {
   parseMintNftPredicateNftId,
   parseMintTokenPredicateAmount,
   setChain,
-} from 'navio-blsct';
+} from '@nav-io/navio-blsct';
 import { NavioClient } from './client';
 import type { WalletOutput } from './wallet-db.interface';
 

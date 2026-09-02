@@ -13,7 +13,7 @@ import { ElectrumClient } from './electrum';
 import { KeyManager } from './key-manager';
 import type { BlockTransactionKeys, TransactionKeys } from './electrum';
 import type { IWalletDB, SyncState, TxType } from './wallet-db.interface';
-import * as blsctModule from 'navio-blsct';
+import * as blsctModule from '@nav-io/navio-blsct';
 import { sha256 } from '@noble/hashes/sha256';
 
 /**

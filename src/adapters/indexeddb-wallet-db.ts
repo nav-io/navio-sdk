@@ -15,7 +15,7 @@
 
 import { KeyManager } from '../key-manager';
 import type { HDChain, SubAddressIdentifier } from '../key-manager.types';
-import * as blsctModule from 'navio-blsct';
+import * as blsctModule from '@nav-io/navio-blsct';
 import type {
   IWalletDB,
   SyncState,

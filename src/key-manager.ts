@@ -11,7 +11,7 @@ import * as bip39 from '@scure/bip39';
 import { wordlist as englishWordlist } from '@scure/bip39/wordlists/english.js';
 import { parseBirthdayMnemonic } from './crypto/birthday-mnemonic';
 // Import from navio-blsct using ESM
-import * as blsctModule from 'navio-blsct';
+import * as blsctModule from '@nav-io/navio-blsct';
 const Scalar = blsctModule.Scalar;
 const ChildKey = blsctModule.ChildKey;
 const PublicKey = blsctModule.PublicKey;

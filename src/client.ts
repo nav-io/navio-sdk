@@ -19,8 +19,8 @@ import { SyncProvider } from './sync-provider';
 import { P2PSyncProvider } from './p2p-sync';
 import { P2PConnectionOptions } from './p2p-protocol';
 import { ElectrumSyncProvider } from './electrum-sync';
-import * as blsctModule from 'navio-blsct';
-import { BlsctChain, setChain } from 'navio-blsct';
+import * as blsctModule from '@nav-io/navio-blsct';
+import { BlsctChain, setChain } from '@nav-io/navio-blsct';
 import { sha256 } from '@noble/hashes/sha256';
 import type { DatabaseAdapterType } from './database-adapter';
 import type {

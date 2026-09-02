@@ -39,4 +39,4 @@ export * from './p2p-protocol';
 export * from './p2p-sync';
 
 // Re-export BlsctChain from navio-blsct for convenience
-export { BlsctChain, getChain, setChain } from 'navio-blsct';
+export { BlsctChain, getChain, setChain } from '@nav-io/navio-blsct';

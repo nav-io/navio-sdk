@@ -12,7 +12,7 @@ import { P2PClient, P2PMessage, InvType, MessageType } from './p2p-protocol';
 import type { BlockTransactionKeys, TransactionKeys } from './electrum';
 
 // Import navio-blsct for transaction parsing (will be used for full implementation)
-// const blsctModule = require('navio-blsct');
+// const blsctModule = require('@nav-io/navio-blsct');
 
 /**
  * P2P sync provider options

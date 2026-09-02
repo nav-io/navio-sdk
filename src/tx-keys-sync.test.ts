@@ -15,7 +15,7 @@ import {
   deriveCollectionTokenKeyFromMaster,
   deriveCollectionTokenPublicKeyFromMaster,
   getCTxOutBlindingKey,
-} from 'navio-blsct';
+} from '@nav-io/navio-blsct';
 import { TransactionKeysSync, SyncState } from './tx-keys-sync';
 import { WalletDB } from './wallet-db';
 import { SyncProvider, ChainTip, BlockHeadersResult } from './sync-provider';

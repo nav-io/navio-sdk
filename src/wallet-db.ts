@@ -30,7 +30,7 @@
 
 import { KeyManager } from './key-manager';
 import type { HDChain, SubAddressIdentifier } from './key-manager.types';
-import * as blsctModule from 'navio-blsct';
+import * as blsctModule from '@nav-io/navio-blsct';
 import type { IDatabaseAdapter, DatabaseAdapterOptions } from './database-adapter';
 import { createDatabaseAdapter } from './database-adapter';
 import type { SyncState, StoreOutputParams, TxType, CreatedCollectionRecord } from './wallet-db.interface';
