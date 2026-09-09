@@ -16,6 +16,7 @@ import {
   TokenType,
   TxIn,
   TxOut,
+  UnsignedOutput,
   getPredicateType,
   parseCreateTokenPredicateTokenInfo,
   parseMintNftPredicateMetadata,
@@ -1092,5 +1093,90 @@ describe('NavioClient', () => {
     expect(result.kind).toBe('nft');
     expect(result.collectionTokenId).toBe(collection.collectionTokenId);
     expect(result.tokenId).toBe(collection.collectionTokenId + '2a00000000000000');
+  });
+
+  it('builds mint outputs under the v2 proof transcript once the chain reached the activation height', async () => {
+    const mintSpy = vi.spyOn(UnsignedOutput, 'mintToken');
+    try {
+      const { client } = createMintClientHarness();
+      const address = makeTestAddress();
+      const collection = await client.createTokenCollection({
+        metadata: { name: 'V2', symbol: 'V2' },
+        totalSupply: 1_000,
+      });
+
+      // Wallet lags (never synced) but the backend tip is past testnet's gate (70600).
+      (client as any).syncProvider.getChainTipHeight = vi.fn().mockResolvedValue(70_700);
+      await client.mintToken({ address, collectionTokenId: collection.collectionTokenId, amount: 10 });
+      expect(mintSpy).toHaveBeenLastCalledWith(
+        expect.anything(), 10, expect.anything(), expect.anything(), expect.anything(), true,
+      );
+
+      // Below the gate the mint output stays v1.
+      const v1 = createMintClientHarness().client;
+      (v1 as any).syncProvider.getChainTipHeight = vi.fn().mockResolvedValue(1_000);
+      const v1Collection = await v1.createTokenCollection({
+        metadata: { name: 'V1', symbol: 'V1' },
+        totalSupply: 1_000,
+      });
+      await v1.mintToken({ address, collectionTokenId: v1Collection.collectionTokenId, amount: 10 });
+      expect(mintSpy).toHaveBeenLastCalledWith(
+        expect.anything(), 10, expect.anything(), expect.anything(), expect.anything(), false,
+      );
+    } finally {
+      mintSpy.mockRestore();
+    }
+  });
+
+  it('skips unspent outputs that do not belong to the wallet keys when selecting inputs', async () => {
+    const ownKey = PublicKey.fromScalar(new Scalar(501)).serialize();
+    const foreignKey = PublicKey.fromScalar(new Scalar(502)).serialize();
+    const makeOutput = (outputHash: string, spendingKey: string): WalletOutput => ({
+      outputHash,
+      txHash: 'tx-' + outputHash,
+      outputIndex: 0,
+      blockHeight: 10,
+      amount: 1_000_000n,
+      gamma: '01',
+      memo: null,
+      tokenId: null,
+      blindingKey: ownKey,
+      spendingKey,
+      isSpent: false,
+      spentTxHash: null,
+      spentBlockHeight: null,
+    } as WalletOutput);
+    const foreign = makeOutput('40'.repeat(32), foreignKey);
+    const own = makeOutput('41'.repeat(32), ownKey);
+
+    const { client, walletDB } = createMintClientHarness();
+    walletDB.getUnspentOutputs.mockResolvedValue([foreign, own]);
+    Object.assign((client as any).keyManager, {
+      calculateHashId: (_blinding: unknown, spending: { serialize(): string }) =>
+        Uint8Array.from(Buffer.from(spending.serialize().slice(0, 40), 'hex')),
+      getSubAddressId: (hashId: Uint8Array, id: { account: number; address: number }) => {
+        if (Buffer.from(hashId).toString('hex') !== ownKey.slice(0, 40)) return false;
+        id.account = 0;
+        id.address = 0;
+        return true;
+      },
+      findSubAddressIdByHashId: () => null,
+    });
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    try {
+      await client.createTokenCollection({ metadata: { name: 'Sel', symbol: 'SEL' }, totalSupply: 10 });
+      const spentHashes = ((client as any).buildTxInput as ReturnType<typeof vi.fn>).mock.calls
+        .map(([output]) => (output as WalletOutput).outputHash);
+      expect(spentHashes).toContain(own.outputHash);
+      expect(spentHashes).not.toContain(foreign.outputHash);
+      expect(warn).toHaveBeenCalled();
+
+      walletDB.getUnspentOutputs.mockResolvedValue([foreign]);
+      await expect(
+        client.createTokenCollection({ metadata: { name: 'Sel2', symbol: 'SEL' }, totalSupply: 10 }),
+      ).rejects.toThrow(/do not belong to this wallet|belong to this wallet's keys/);
+    } finally {
+      warn.mockRestore();
+    }
   });
 });

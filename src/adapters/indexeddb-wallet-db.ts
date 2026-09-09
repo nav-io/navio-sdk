@@ -23,8 +23,7 @@ import type {
   WalletMetadata,
   StoreOutputParams,
   TxType,
-  CreatedCollectionRecord,
-} from '../wallet-db.interface';
+  CreatedCollectionRecord, SubAddressEntry } from '../wallet-db.interface';
 
 // v2: adds the createdCollections store
 const IDB_VERSION = 2;
@@ -277,16 +276,17 @@ export class IndexedDBWalletDB implements IWalletDB {
       );
     }
 
+    // Regenerate the deterministic default pools first, then load persisted
+    // mappings on top (entries past the pools are only known through them;
+    // loading also advances the per-account counters past them).
+    km.newSubAddressPool(0);
+    km.newSubAddressPool(-1);
+    km.newSubAddressPool(-2);
+
     const subAddrs = await this.getAll<any>('subAddresses');
     for (const sa of subAddrs) {
-      const id: SubAddressIdentifier = { account: sa.account, address: sa.address };
+      const id: SubAddressIdentifier = { account: Number(sa.account), address: Number(sa.address) };
       km.loadSubAddress(this.hexToBytes(sa.hashId), id);
-    }
-
-    if (subAddrs.length === 0) {
-      km.newSubAddressPool(0);
-      km.newSubAddressPool(-1);
-      km.newSubAddressPool(-2);
     }
 
     const encMeta = await this.getEncryptionMetadata();
@@ -305,6 +305,7 @@ export class IndexedDBWalletDB implements IWalletDB {
     km.newSubAddressPool(-1);
     km.newSubAddressPool(-2);
 
+    await this.discardForeignWalletData(km);
     await this.saveWallet(km);
     await this.saveWalletMetadata({
       creationHeight: creationHeight ?? 0,
@@ -325,6 +326,7 @@ export class IndexedDBWalletDB implements IWalletDB {
     km.newSubAddressPool(-1);
     km.newSubAddressPool(-2);
 
+    await this.discardForeignWalletData(km);
     await this.saveWallet(km);
     await this.saveWalletMetadata({
       creationHeight: creationHeight ?? 0,
@@ -348,6 +350,7 @@ export class IndexedDBWalletDB implements IWalletDB {
       throw new Error('Failed to import audit key');
     }
 
+    await this.discardForeignWalletData(km);
     await this.saveWallet(km);
     await this.saveWalletMetadata({
       creationHeight: creationHeight ?? 0,
@@ -367,6 +370,7 @@ export class IndexedDBWalletDB implements IWalletDB {
     km.newSubAddressPool(-1);
     km.newSubAddressPool(-2);
 
+    await this.discardForeignWalletData(km);
     await this.saveWallet(km);
     await this.saveWalletMetadata({
       creationHeight: creationHeight ?? 0,
@@ -435,6 +439,11 @@ export class IndexedDBWalletDB implements IWalletDB {
       });
     } catch { /* not available */ }
 
+    // Sub-address mappings (hashId -> account/address)
+    for (const entry of km.getSubAddressEntries()) {
+      tx.objectStore('subAddresses').put({ hashId: entry.hashId, account: entry.account, address: entry.address });
+    }
+
     await idbTx(tx);
 
     if (km.isEncrypted()) {
@@ -442,6 +451,48 @@ export class IndexedDBWalletDB implements IWalletDB {
       if (params) {
         await this.saveEncryptionMetadata(params.salt, params.verificationHash);
       }
+    }
+  }
+
+  async saveSubAddresses(entries: SubAddressEntry[]): Promise<void> {
+    if (entries.length === 0) return;
+    const db = this.ensureOpen();
+    const tx = db.transaction('subAddresses', 'readwrite');
+    for (const entry of entries) {
+      tx.objectStore('subAddresses').put({ hashId: entry.hashId, account: entry.account, address: entry.address });
+    }
+    await idbTx(tx);
+  }
+
+  /**
+   * Drop data that belongs to a previously stored wallet when a different
+   * wallet (different spending key) is written into this database. Outputs,
+   * created collections and sync progress are tied to the keys that detected
+   * them; kept across a restore with another seed they are selected as inputs
+   * and the spend fails with "does not map to a known sub-address in this
+   * wallet". Restoring the same seed keeps everything.
+   */
+  private async discardForeignWalletData(incoming: KeyManager): Promise<void> {
+    if (!(await this.holdsDifferentWallet(incoming))) return;
+    const db = this.ensureOpen();
+    const tx = db.transaction(['walletOutputs', 'createdCollections'], 'readwrite');
+    tx.objectStore('walletOutputs').clear();
+    tx.objectStore('createdCollections').clear();
+    await idbTx(tx);
+    await this.clearSyncData();
+  }
+
+  private async holdsDifferentWallet(incoming: KeyManager): Promise<boolean> {
+    const outputs = await this.getAll<any>('walletOutputs');
+    const syncState = await this.get<any>('syncState', 0);
+    if (outputs.length === 0 && !syncState) return false;
+
+    const spendRec = await this.get<any>('config', 'spendKey');
+    if (!spendRec?.publicKey) return true;
+    try {
+      return String(spendRec.publicKey) !== this.serializePublicKey(incoming.getPublicSpendingKey());
+    } catch {
+      return true;
     }
   }
 

@@ -3,6 +3,41 @@
 All notable changes to navio-sdk are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/); versions follow [SemVer](https://semver.org/).
 
+## [0.1.33] - 2026-09-09
+
+### Fixed
+
+- **`mintToken` rejected with `failed-rangeproof-check` after the BLSCT proof
+  transcript v2 activation** (testnet 70600, mainnet 42500). A fungible mint
+  output carries a range proof, but it was always built under the v1
+  transcript while the change output (and therefore the transaction marker)
+  switched to v2. Mint outputs now follow the same transcript decision as
+  every other output. Requires `@nav-io/navio-blsct` >= 1.1.20
+  (`UnsignedOutput.mintToken(..., transcriptV2)`), backed by navio-core's new
+  `build_unsigned_mint_token_output_with_transcript`. `createTokenCollection`
+  with `initialMint` is covered by the same change.
+- The proof transcript decision now also considers the connected backend's
+  chain tip (refreshed before every spend), so a wallet that lags behind the
+  activation height — or has not synced in this session — no longer emits
+  v1 outputs the node rejects.
+- **`Cannot derive spending key: output … does not map to a known sub-address
+  in this wallet`** when spending:
+  - Sub-addresses generated past the default pools (fresh receive addresses
+    handed out with `generateNewSubAddress`/`getNewDestination`) were never
+    persisted, so after a reload outputs received on them were in the
+    database but unspendable. Sub-address mappings are now saved by
+    `saveWallet` and the new `IWalletDB.saveSubAddresses`, and the spend path
+    recovers unknown sub-addresses by deriving candidates around the account
+    counters (`KeyManager.findSubAddressIdByHashId`), persisting what it finds.
+  - Restoring a wallet with a different seed into an existing database kept
+    the previous wallet's outputs and sync progress; those outputs were then
+    selected as inputs and the spend failed. Restore/create now drop outputs,
+    created collections and sync data that belong to a different spending key
+    (restoring the same seed keeps everything).
+  - Automatic coin selection skips outputs the wallet's keys cannot sign for
+    (with a warning) instead of failing the whole spend, and reports a clear
+    error naming the cause when no spendable output is left.
+
 ## [0.1.29] - 2026-08-14
 
 ### Added

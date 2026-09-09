@@ -1388,14 +1388,44 @@ export class NavioClient {
   }
 
   /**
+   * Backend chain tip as last observed by {@link refreshBackendTipHint}, or -1.
+   * Lets {@link wantsTranscriptV2} pick the right proof transcript even when
+   * the wallet has not caught up to the activation height yet (or has not
+   * synced at all in this session).
+   */
+  private backendTipHeightHint = -1;
+
+  /**
    * Whether outputs built now must use the BLSCT range-proof v2 transcript,
    * i.e. the next block is at or above this network's activation height. Below
    * the gate (and on nets where it is dormant) this is false and we keep
    * emitting v1 outputs, which stay valid before activation.
+   *
+   * The decision uses the higher of the wallet's synced height and the
+   * backend tip seen in {@link ensureSpendReady}: a spend from a wallet that
+   * lags behind the tip is still validated against the tip.
    */
   private wantsTranscriptV2(): boolean {
-    const nextHeight = this.getLastSyncedHeight() + 1;
+    const nextHeight = Math.max(this.getLastSyncedHeight(), this.backendTipHeightHint) + 1;
     return nextHeight >= NETWORK_BLSCT_PROOF_V2_HEIGHT[this.getNetwork()];
+  }
+
+  /**
+   * Best-effort refresh of {@link backendTipHeightHint} from the connected
+   * backend. Failures are swallowed: the synced height remains the fallback.
+   */
+  private async refreshBackendTipHint(): Promise<void> {
+    if (!this.syncProvider || typeof this.syncProvider.getChainTipHeight !== 'function') {
+      return;
+    }
+    try {
+      const tip = await this.syncProvider.getChainTipHeight();
+      if (Number.isFinite(tip) && tip > this.backendTipHeightHint) {
+        this.backendTipHeightHint = tip;
+      }
+    } catch {
+      // Backend/transport errors must not add a failure mode to spending.
+    }
   }
 
   /**
@@ -2108,7 +2138,7 @@ export class NavioClient {
         }
         throw new Error('No unspent outputs available');
       }
-      ({ selected, totalIn } = NavioClient.selectInputs(confirmedUtxos, amount, subtractFeeFromAmount));
+      ({ selected, totalIn } = NavioClient.selectInputs(this.selectableUtxos(confirmedUtxos), amount, subtractFeeFromAmount));
     }
 
     // --- Build token ID ---
@@ -2466,7 +2496,9 @@ export class NavioClient {
       // predicates in output order, and the mint predicate requires the
       // token to already exist in the view.
       outputs.push(
-        UnsignedOutput.mintToken(mintDestination, mintAmount, Scalar.random(), tokenKey, tokenPublicKey)
+        UnsignedOutput.mintToken(
+          mintDestination, mintAmount, Scalar.random(), tokenKey, tokenPublicKey, this.wantsTranscriptV2(),
+        )
       );
       mintedAmount = BigInt(mintAmount);
     }
@@ -2727,8 +2759,14 @@ export class NavioClient {
 
     let result: SendTransactionResult;
     try {
+      // A fungible mint output carries a range proof, so it must be built under
+      // the same proof transcript as the rest of the transaction (see
+      // wantsTranscriptV2); a v1 mint output in a v2 transaction is rejected
+      // with failed-rangeproof-check.
       result = await this.buildAndBroadcastUnsignedTransaction(
-        UnsignedOutput.mintToken(destination, mintAmount, Scalar.random(), tokenKey, tokenPublicKey),
+        UnsignedOutput.mintToken(
+          destination, mintAmount, Scalar.random(), tokenKey, tokenPublicKey, this.wantsTranscriptV2(),
+        ),
         options.selectedUtxos
       );
     } catch (err) {
@@ -3480,6 +3518,7 @@ export class NavioClient {
     }
 
     await this.verifyWalletMatchesChain();
+    await this.refreshBackendTipHint();
 
     return {
       keyManager: this.keyManager,
@@ -3654,7 +3693,7 @@ export class NavioClient {
         }
         throw new Error('No unspent NAV outputs available to fund the transaction.');
       }
-      ({ selected, totalIn } = NavioClient.selectInputs(confirmedUtxos, 0n, false));
+      ({ selected, totalIn } = NavioClient.selectInputs(this.selectableUtxos(confirmedUtxos), 0n, false));
     }
 
     const fee = BigInt((selected.length + 2) * DEFAULT_FEE_PER_COMPONENT);
@@ -3872,14 +3911,16 @@ export class NavioClient {
     const masterSpendKey = this.keyManager.getSpendingKey();
 
     // Find the sub-address this output belongs to via hash ID
-    const spendingPubKey = PublicKey.deserialize(utxo.spendingKey);
-    const hashId = this.keyManager.calculateHashId(blindingPubKey, spendingPubKey);
-    const hashIdHex = Array.from(hashId).map(b => b.toString(16).padStart(2, '0')).join('');
-    const subAddrId = { account: 0, address: 0 };
-    if (!this.keyManager.getSubAddressId(hashId, subAddrId)) {
+    const subAddrId = this.resolveOutputSubAddress(utxo);
+    if (!subAddrId) {
+      const spendingPubKey = PublicKey.deserialize(utxo.spendingKey);
+      const hashId = this.keyManager.calculateHashId(blindingPubKey, spendingPubKey);
+      const hashIdHex = Array.from(hashId).map(b => b.toString(16).padStart(2, '0')).join('');
       throw new Error(
         `Cannot derive spending key: output ${utxo.outputHash.slice(0, 16)}… ` +
-        `does not map to a known sub-address in this wallet (hashId=${hashIdHex})`
+        `does not map to a known sub-address in this wallet (hashId=${hashIdHex}). ` +
+        'The wallet database holds an output this wallet\'s keys did not detect — usually one left over from ' +
+        'a wallet with a different seed that used the same database. Clear the sync data and re-sync.'
       );
     }
 
@@ -3906,6 +3947,91 @@ export class NavioClient {
       tokenId,
       outPoint,
     );
+  }
+
+  /**
+   * Hash IDs already proven not to belong to this wallet's keys, so a foreign
+   * output is scanned for at most once per session.
+   */
+  private readonly unresolvableHashIds = new Set<string>();
+
+  /**
+   * Resolve the sub-address an output was received on, or null when the
+   * output does not belong to this wallet's keys.
+   *
+   * The tracked sub-address set covers the default pools; anything past them
+   * (fresh receive addresses handed out in an earlier session) is recovered by
+   * deriving candidates around the account counters, then persisted so the
+   * next session finds it directly.
+   */
+  private resolveOutputSubAddress(utxo: WalletOutput): { account: number; address: number } | null {
+    if (!this.keyManager) {
+      throw new Error('KeyManager not available');
+    }
+    const blindingPubKey = PublicKey.deserialize(utxo.blindingKey);
+    const spendingPubKey = PublicKey.deserialize(utxo.spendingKey);
+    const hashId = this.keyManager.calculateHashId(blindingPubKey, spendingPubKey);
+    const hashIdHex = Array.from(hashId).map(b => b.toString(16).padStart(2, '0')).join('');
+
+    const subAddrId = { account: 0, address: 0 };
+    if (this.keyManager.getSubAddressId(hashId, subAddrId)) {
+      return subAddrId;
+    }
+    if (this.unresolvableHashIds.has(hashIdHex)) {
+      return null;
+    }
+
+    const recovered = this.keyManager.findSubAddressIdByHashId(hashId);
+    if (!recovered) {
+      this.unresolvableHashIds.add(hashIdHex);
+      return null;
+    }
+    // Persist the recovered mapping (best effort) so it survives a reload.
+    void this.walletDB?.saveSubAddresses([{ hashId: hashIdHex, ...recovered }]).catch(() => undefined);
+    return recovered;
+  }
+
+  /**
+   * Split confirmed outputs into those this wallet can sign for and those it
+   * cannot (see {@link resolveOutputSubAddress}). When the check itself is
+   * unavailable the output is treated as spendable and buildTxInput reports
+   * the precise failure.
+   */
+  private partitionSpendableUtxos(utxos: WalletOutput[]): { spendable: WalletOutput[]; foreign: WalletOutput[] } {
+    const spendable: WalletOutput[] = [];
+    const foreign: WalletOutput[] = [];
+    for (const utxo of utxos) {
+      let ok = true;
+      try {
+        ok = this.resolveOutputSubAddress(utxo) !== null;
+      } catch {
+        ok = true;
+      }
+      (ok ? spendable : foreign).push(utxo);
+    }
+    return { spendable, foreign };
+  }
+
+  /**
+   * Automatic coin selection candidates: confirmed outputs this wallet can
+   * sign for. Throws when every candidate is foreign, naming the cause.
+   */
+  private selectableUtxos(confirmedUtxos: WalletOutput[]): WalletOutput[] {
+    const { spendable, foreign } = this.partitionSpendableUtxos(confirmedUtxos);
+    if (spendable.length === 0 && foreign.length > 0) {
+      throw new Error(
+        `None of the ${foreign.length} confirmed unspent output(s) in the wallet database belong to this wallet's keys ` +
+        `(e.g. output ${foreign[0].outputHash.slice(0, 16)}…). They were most likely synced by a wallet with a different ` +
+        'seed that used the same database. Clear the sync data and re-sync before spending.'
+      );
+    }
+    if (foreign.length > 0) {
+      console.warn(
+        `[NavioClient] Skipping ${foreign.length} unspent output(s) that do not belong to this wallet's keys ` +
+        `(e.g. ${foreign[0].outputHash.slice(0, 16)}…); clear the sync data and re-sync to drop them.`
+      );
+    }
+    return spendable;
   }
 
   /**

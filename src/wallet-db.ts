@@ -33,8 +33,8 @@ import type { HDChain, SubAddressIdentifier } from './key-manager.types';
 import * as blsctModule from '@nav-io/navio-blsct';
 import type { IDatabaseAdapter, DatabaseAdapterOptions } from './database-adapter';
 import { createDatabaseAdapter } from './database-adapter';
-import type { SyncState, StoreOutputParams, TxType, CreatedCollectionRecord } from './wallet-db.interface';
-export type { SyncState, WalletOutput, WalletMetadata, StoreOutputParams, IWalletDB, TxType, CreatedCollectionRecord } from './wallet-db.interface';
+import type { SyncState, StoreOutputParams, TxType, CreatedCollectionRecord, SubAddressEntry } from './wallet-db.interface';
+export type { SyncState, WalletOutput, WalletMetadata, StoreOutputParams, IWalletDB, TxType, CreatedCollectionRecord, SubAddressEntry } from './wallet-db.interface';
 
 // WalletOutput is re-exported from wallet-db.interface.ts
 import type { WalletOutput } from './wallet-db.interface';
@@ -499,35 +499,27 @@ export class WalletDB {
       }
     }
 
-    // Load sub-addresses
-    const subAddressesResult = await this.adapter.exec('SELECT * FROM sub_addresses');
+    // Regenerate the default sub-address pools (like navio-core does during
+    // startup). The pools are deterministic from the keys, so this always
+    // yields the same first entries regardless of what was persisted.
+    keyManager.newSubAddressPool(0);
+    keyManager.newSubAddressPool(-1);
+    keyManager.newSubAddressPool(-2);
+
+    // Then load persisted sub-addresses on top: entries past the default pools
+    // (fresh receive addresses handed out in earlier sessions, recovered
+    // mappings) are only known through these rows. Loading also advances the
+    // per-account counters past them so generation never reuses an index.
+    const subAddressesResult = await this.adapter.exec('SELECT hash_id, account, address FROM sub_addresses');
     if (subAddressesResult.length > 0) {
       for (const row of subAddressesResult[0].values) {
         const hashId = this.hexToBytes(row[0] as string);
         const id: SubAddressIdentifier = {
-          account: row[1] as number,
-          address: row[2] as number,
+          account: Number(row[1]),
+          address: Number(row[2]),
         };
         keyManager.loadSubAddress(hashId, id);
       }
-    }
-
-    // Load sub-address counters
-    const counterResult = await this.adapter.exec('SELECT * FROM sub_address_counter');
-    if (counterResult.length > 0) {
-      for (const _row of counterResult[0].values) {
-        // This would need to be stored in KeyManager
-        // For now, we'll rely on the sub-addresses to reconstruct counters
-      }
-    }
-
-    // If no sub-addresses were loaded from DB, regenerate the pools
-    // This is needed because sub-address saving was not fully implemented
-    if (subAddressesResult.length === 0 || subAddressesResult[0].values.length === 0) {
-      // Regenerate sub-address pools (like navio-core does during startup)
-      keyManager.newSubAddressPool(0);
-      keyManager.newSubAddressPool(-1);
-      keyManager.newSubAddressPool(-2);
     }
 
     this.keyManager = keyManager;
@@ -555,7 +547,8 @@ export class WalletDB {
     keyManager.newSubAddressPool(-1);
     keyManager.newSubAddressPool(-2);
 
-    // Save to database
+    // Drop outputs/sync data left by a different wallet, then save
+    await this.discardForeignWalletData(keyManager);
     await this.saveWallet(keyManager);
 
     // Save wallet metadata
@@ -591,7 +584,8 @@ export class WalletDB {
     keyManager.newSubAddressPool(-1);
     keyManager.newSubAddressPool(-2);
 
-    // Save to database
+    // Drop outputs/sync data left by a different wallet, then save
+    await this.discardForeignWalletData(keyManager);
     await this.saveWallet(keyManager);
 
     // Save wallet metadata with restore height
@@ -624,6 +618,7 @@ export class WalletDB {
       throw new Error('Failed to import audit key');
     }
 
+    await this.discardForeignWalletData(keyManager);
     await this.saveWallet(keyManager);
     await this.saveWalletMetadata({
       creationHeight: creationHeight ?? 0,
@@ -656,7 +651,8 @@ export class WalletDB {
     keyManager.newSubAddressPool(-1);
     keyManager.newSubAddressPool(-2);
 
-    // Save to database
+    // Drop outputs/sync data left by a different wallet, then save
+    await this.discardForeignWalletData(keyManager);
     await this.saveWallet(keyManager);
 
     // Save wallet metadata with restore height
@@ -917,9 +913,12 @@ export class WalletDB {
         // Spend key not available
       }
 
-      // Note: Keys, output keys, encrypted keys, and sub-addresses would be saved here
-      // For now, we're saving the essential HD chain and master keys
-      // Full implementation would iterate through all keys and save them
+      // Save sub-address mappings (hashId -> account/address) so sub-addresses
+      // past the default pools survive a reload.
+      await this.insertSubAddressRows(km.getSubAddressEntries());
+
+      // Note: Keys, output keys and encrypted keys are reconstructed from the
+      // seed / view key on load.
 
       // Commit transaction
       await this.adapter.run('COMMIT');
@@ -930,6 +929,77 @@ export class WalletDB {
       await this.adapter.run('ROLLBACK');
       throw error;
     }
+  }
+
+  async saveSubAddresses(entries: SubAddressEntry[]): Promise<void> {
+    if (!this.opened || !this.adapter) {
+      throw new Error('Database not open');
+    }
+    if (entries.length === 0) {
+      return;
+    }
+    await this.insertSubAddressRows(entries);
+    await this.persistToDisk();
+  }
+
+  private async insertSubAddressRows(entries: SubAddressEntry[]): Promise<void> {
+    if (!this.adapter || entries.length === 0) {
+      return;
+    }
+    const stmt = await this.adapter.prepare(
+      'INSERT OR REPLACE INTO sub_addresses (hash_id, account, address) VALUES (?, ?, ?)'
+    );
+    for (const entry of entries) {
+      await stmt.run([entry.hashId, entry.account, entry.address]);
+    }
+    await stmt.free();
+  }
+
+  /**
+   * Drop data that belongs to a previously stored wallet when a different
+   * wallet (different spending key) is written into this database.
+   *
+   * Outputs, created collections and sync progress are tied to the keys that
+   * detected them: kept across a restore with a different seed they show up
+   * in the new wallet's balance and get selected as inputs, and the spend
+   * then fails with "does not map to a known sub-address in this wallet".
+   * Restoring the same seed again keeps everything (no re-sync needed).
+   */
+  private async discardForeignWalletData(incoming: KeyManager): Promise<void> {
+    if (!this.adapter) {
+      return;
+    }
+    if (!(await this.holdsDifferentWallet(incoming))) {
+      return;
+    }
+    await this.adapter.run('DELETE FROM wallet_outputs');
+    await this.adapter.run('DELETE FROM created_collections');
+    await this.clearSyncData();
+  }
+
+  private async holdsDifferentWallet(incoming: KeyManager): Promise<boolean> {
+    if (!this.adapter) {
+      return false;
+    }
+    const outputs = await this.adapter.exec('SELECT COUNT(*) FROM wallet_outputs');
+    const syncState = await this.adapter.exec('SELECT COUNT(*) FROM sync_state');
+    const count = (rows: typeof outputs) => (rows.length > 0 ? Number(rows[0].values[0][0]) : 0);
+    if (count(outputs) === 0 && count(syncState) === 0) {
+      return false;
+    }
+
+    const stored = await this.adapter.exec('SELECT public_key FROM spend_key LIMIT 1');
+    if (stored.length === 0 || stored[0].values.length === 0) {
+      // Wallet data without a wallet: nothing it can belong to.
+      return true;
+    }
+    let incomingSpendKey: string;
+    try {
+      incomingSpendKey = this.serializePublicKey(incoming.getPublicSpendingKey());
+    } catch {
+      return true;
+    }
+    return String(stored[0].values[0][0]) !== incomingSpendKey;
   }
 
   /**

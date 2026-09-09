@@ -537,3 +537,57 @@ describe('KeyManager', () => {
     });
   });
 });
+
+describe('KeyManager sub-address recovery', () => {
+  const MNEMONIC =
+    'short exact vendor hand scale enroll around pudding genius party lesson basket cook crash sugar protect advance gentle humor bench farm weekend direct awkward';
+
+  function hexToBytes(hex: string): Uint8Array {
+    return Uint8Array.from(Buffer.from(hex, 'hex'));
+  }
+
+  function freshWallet(): KeyManager {
+    const km = new KeyManager();
+    km.setHDSeedFromMnemonic(MNEMONIC);
+    km.newSubAddressPool(0);
+    km.newSubAddressPool(-1);
+    km.newSubAddressPool(-2);
+    return km;
+  }
+
+  it('recovers a sub-address generated past the default pool and registers it', () => {
+    const generator = freshWallet();
+    let target: { account: number; address: number } | null = null;
+    for (let i = 0; i < 20; i++) {
+      target = generator.generateNewSubAddress(0).id;
+    }
+    expect(target!.address).toBeGreaterThanOrEqual(100);
+    const entry = generator.getSubAddressEntries().find(
+      (e) => e.account === target!.account && e.address === target!.address,
+    );
+    expect(entry).toBeDefined();
+
+    const reloaded = freshWallet();
+    const hashId = hexToBytes(entry!.hashId);
+    expect(reloaded.haveSubAddress(hashId)).toBe(false);
+
+    expect(reloaded.findSubAddressIdByHashId(hashId)).toEqual(target);
+    expect(reloaded.haveSubAddress(hashId)).toBe(true);
+    const id = { account: 0, address: 0 };
+    expect(reloaded.getSubAddressId(hashId, id)).toBe(true);
+    expect(id).toEqual(target);
+    // The counter moved past the recovered index so it is never handed out again.
+    expect(reloaded.generateNewSubAddress(0).id.address).toBe(target!.address + 1);
+  });
+
+  it('returns null for a hash id that belongs to no derivable sub-address', () => {
+    const km = freshWallet();
+    expect(km.findSubAddressIdByHashId(new Uint8Array(20).fill(0xab), 10)).toBeNull();
+  });
+
+  it('advances the account counter when loading a persisted sub-address', () => {
+    const km = freshWallet();
+    km.loadSubAddress(new Uint8Array(20).fill(0x11), { account: 0, address: 250 });
+    expect(km.generateNewSubAddress(0).id.address).toBe(251);
+  });
+});

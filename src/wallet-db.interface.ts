@@ -98,6 +98,16 @@ export interface CreatedCollectionRecord {
 }
 
 /**
+ * A persisted (hashId -> sub-address) mapping.
+ */
+export interface SubAddressEntry {
+  /** Hash160 of the sub-address spending key, hex. */
+  hashId: string;
+  account: number;
+  address: number;
+}
+
+/**
  * Wallet metadata
  */
 export interface WalletMetadata {
@@ -127,6 +137,12 @@ export interface IWalletDB {
   restoreWalletFromAuditKey(auditKeyHex: string, creationHeight?: number): Promise<KeyManager>;
   restoreWalletFromMnemonic(mnemonic: string, creationHeight?: number): Promise<KeyManager>;
   saveWallet(keyManager?: KeyManager): Promise<void>;
+  /**
+   * Persist (hashId -> sub-address) mappings so sub-addresses generated or
+   * recovered past the default pools survive a reload. Existing rows for the
+   * same hashId are replaced.
+   */
+  saveSubAddresses(entries: SubAddressEntry[]): Promise<void>;
   getKeyManager(): KeyManager | null;
 
   // -- metadata ---------------------------------------------------------

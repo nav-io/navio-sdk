@@ -887,25 +887,117 @@ export class KeyManager {
 
     const subAddress = this.getSubAddress(id);
 
-    // Calculate hashId for this sub-address so we can look it up during output scanning
-    // Generate DoublePublicKey which contains (blindingKey, spendingKey) for this sub-address
-    const dpk = DoublePublicKey.fromKeysAcctAddr(this.viewKey, this.spendPublicKey, account, addressIndex);
-    const serialized = dpk.serialize();
-
-    // DoublePublicKey serializes as 192 hex chars (96 bytes = 2 x 48-byte G1 points)
-    // First 96 chars = blinding key, second 96 chars = spending key
-    const spendingKeyHex = serialized.substring(96);
-
-    // The hashId is Hash160 of the sub-address spending key D (the second G1 point of the DPK).
-    // In navio-core: DoublePublicKey::GetID() returns sk.GetID() = Hash160(sk.GetVch())
-    // During output detection, CalculateHashId recovers D_prime from the output keys,
-    // and Hash160(D_prime) == Hash160(D) for outputs belonging to this sub-address.
-    const spendingKeyBytes = hexToUint8Array(spendingKeyHex);
-    const hashIdBytes = this.hash160(spendingKeyBytes);
-    const hashIdHex = this.bytesToHex(hashIdBytes);
-    this.subAddresses.set(hashIdHex, id);
+    // Register the hashId so the sub-address can be looked up during output scanning.
+    this.subAddresses.set(this.computeSubAddressHashIdHex(account, addressIndex), id);
 
     return { subAddress, id };
+  }
+
+  /**
+   * Compute the hash ID of the sub-address (account, addressIndex) without
+   * registering it.
+   *
+   * The hashId is Hash160 of the sub-address spending key D (the second G1
+   * point of the DoublePublicKey). In navio-core, DoublePublicKey::GetID()
+   * returns sk.GetID() = Hash160(sk.GetVch()). During output detection,
+   * CalculateHashId recovers D' from the output keys, and Hash160(D') ==
+   * Hash160(D) for outputs belonging to this sub-address.
+   */
+  private computeSubAddressHashIdHex(account: number, addressIndex: number): string {
+    if (!this.viewKey || !this.spendPublicKey) {
+      throw new Error('View key or spending public key not available');
+    }
+    const dpk = DoublePublicKey.fromKeysAcctAddr(this.viewKey, this.spendPublicKey, account, addressIndex);
+    const serialized = dpk.serialize();
+    // DoublePublicKey serializes as 192 hex chars (96 bytes = 2 x 48-byte G1 points):
+    // first 96 chars = blinding key, second 96 chars = spending key.
+    const spendingKeyHex = serialized.substring(96);
+    return this.bytesToHex(this.hash160(hexToUint8Array(spendingKeyHex)));
+  }
+
+  /**
+   * Accounts whose sub-addresses this wallet tracks: the default receive (0),
+   * change (-1) and staking (-2) accounts plus any account that has had a
+   * sub-address generated or loaded.
+   */
+  private knownSubAddressAccounts(): number[] {
+    const accounts = new Set<number>([0, -1, -2]);
+    for (const account of this.subAddressCounter.keys()) accounts.add(account);
+    for (const account of this.subAddressPool.keys()) accounts.add(account);
+    return [...accounts];
+  }
+
+  /**
+   * Default number of sub-address indices scanned past each account's
+   * counter by {@link findSubAddressIdByHashId}.
+   */
+  static readonly SUB_ADDRESS_RECOVERY_LOOKAHEAD = 500;
+
+  /**
+   * Locate the sub-address a hash ID belongs to when it is not in the tracked
+   * set, by deriving candidate sub-addresses for every known account up to
+   * `lookahead` indices past the account's counter. On a match the sub-address
+   * is registered so subsequent lookups (and output scanning) find it directly.
+   *
+   * Sub-addresses generated past the persisted pool (e.g. fresh receive
+   * addresses handed out in an earlier session) are otherwise unknown after a
+   * reload, which leaves outputs already recorded in the wallet database
+   * unspendable ("does not map to a known sub-address").
+   *
+   * @returns The sub-address identifier, or null if no candidate matches.
+   */
+  findSubAddressIdByHashId(
+    hashId: Uint8Array,
+    lookahead: number = KeyManager.SUB_ADDRESS_RECOVERY_LOOKAHEAD,
+  ): SubAddressIdentifier | null {
+    const hashIdHex = this.bytesToHex(hashId);
+    const known = this.subAddresses.get(hashIdHex);
+    if (known) {
+      return { account: known.account, address: known.address };
+    }
+    if (!this.viewKey || !this.spendPublicKey) {
+      return null;
+    }
+
+    for (const account of this.knownSubAddressAccounts()) {
+      const limit = (this.subAddressCounter.get(account) ?? 0) + Math.max(0, lookahead);
+      for (let index = 0; index < limit; index++) {
+        if (this.computeSubAddressHashIdHex(account, index) !== hashIdHex) {
+          continue;
+        }
+        const id: SubAddressIdentifier = { account, address: index };
+        this.registerSubAddress(hashIdHex, id);
+        return { ...id };
+      }
+    }
+    return null;
+  }
+
+  /**
+   * Register a (hashId -> sub-address) mapping and keep the account's counter
+   * and pool consistent with it, so later generation never reuses the index.
+   */
+  private registerSubAddress(hashIdHex: string, id: SubAddressIdentifier): void {
+    this.subAddresses.set(hashIdHex, id);
+    const counter = this.subAddressCounter.get(id.account) ?? 0;
+    if (id.address >= counter) {
+      this.subAddressCounter.set(id.account, id.address + 1);
+    }
+    if (!this.subAddressPool.has(id.account)) {
+      this.subAddressPool.set(id.account, new Set());
+    }
+    this.subAddressPool.get(id.account)!.add(id.address);
+  }
+
+  /**
+   * All tracked (hashId -> sub-address) mappings, for persistence.
+   */
+  getSubAddressEntries(): Array<{ hashId: string; account: number; address: number }> {
+    return [...this.subAddresses.entries()].map(([hashId, id]) => ({
+      hashId,
+      account: id.account,
+      address: id.address,
+    }));
   }
 
   /**
@@ -1995,8 +2087,7 @@ export class KeyManager {
    * @param index - The sub-address identifier
    */
   loadSubAddress(hashId: Uint8Array, index: SubAddressIdentifier): void {
-    const hashIdHex = this.bytesToHex(hashId);
-    this.subAddresses.set(hashIdHex, index);
+    this.registerSubAddress(this.bytesToHex(hashId), { account: index.account, address: index.address });
   }
 
   /**
@@ -2007,9 +2098,8 @@ export class KeyManager {
    * @returns True if successful
    */
   addSubAddress(hashId: Uint8Array, index: SubAddressIdentifier): boolean {
-    const hashIdHex = this.bytesToHex(hashId);
-    this.subAddresses.set(hashIdHex, index);
-    // In a database wallet, this would also save to database
+    this.registerSubAddress(this.bytesToHex(hashId), { account: index.account, address: index.address });
+    // Persistence is the wallet database's job (IWalletDB.saveSubAddresses)
     return true;
   }
 
