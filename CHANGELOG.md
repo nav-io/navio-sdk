@@ -36,7 +36,9 @@ Format follows [Keep a Changelog](https://keepachangelog.com/); versions follow 
     (restoring the same seed keeps everything).
   - Automatic coin selection skips outputs the wallet's keys cannot sign for
     (with a warning) instead of failing the whole spend, and reports a clear
-    error naming the cause when no spendable output is left.
+    error naming the cause when no spendable output is left. Stored key hex
+    is validated (96 hex chars) before it reaches the native point decoder,
+    which does not fail cleanly on malformed input.
 
 ## [0.1.29] - 2026-08-14
 

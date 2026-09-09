@@ -3968,6 +3968,14 @@ export class NavioClient {
     if (!this.keyManager) {
       throw new Error('KeyManager not available');
     }
+    // Validate before touching the native decoder: a G1 point is 48 bytes
+    // (96 hex chars), and feeding it a shorter/garbage string is not a clean
+    // failure in the binding (it corrupts memory instead of throwing).
+    for (const [label, hex] of [['blindingKey', utxo.blindingKey], ['spendingKey', utxo.spendingKey]] as const) {
+      if (typeof hex !== 'string' || !/^[0-9a-fA-F]{96}$/.test(hex)) {
+        throw new Error(`Output ${utxo.outputHash.slice(0, 16)}… has a malformed ${label} (expected 96 hex chars)`);
+      }
+    }
     const blindingPubKey = PublicKey.deserialize(utxo.blindingKey);
     const spendingPubKey = PublicKey.deserialize(utxo.spendingKey);
     const hashId = this.keyManager.calculateHashId(blindingPubKey, spendingPubKey);
