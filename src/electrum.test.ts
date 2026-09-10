@@ -308,3 +308,38 @@ describe('ElectrumClient', () => {
     });
   });
 });
+
+describe('ElectrumClient p2pmsg request timeouts', () => {
+  beforeEach(() => {
+    MockWebSocket.reset();
+    setWebSocketClass(MockWebSocket as any);
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('gives RFQ/quote/order broadcasts the long p2pmsg timeout, other calls the regular one', async () => {
+    const client = new ElectrumClient({ host: 'localhost', port: 50001, timeout: 30_000, p2pmsgTimeout: 180_000 });
+    const connectPromise = client.connect();
+    await vi.advanceTimersByTimeAsync(10);
+    await connectPromise;
+
+    // The mock never answers these methods, so only the timeout can settle them.
+    let quoteState = 'pending';
+    const quote = client.rfqRequestQuote('', 'aa'.repeat(32), 100, 1_900_000_000)
+      .then(() => { quoteState = 'resolved'; }, (e: Error) => { quoteState = e.message; });
+    let listState = 'pending';
+    const list = client.rfqListQuotes('bb'.repeat(32))
+      .then(() => { listState = 'resolved'; }, (e: Error) => { listState = e.message; });
+
+    await vi.advanceTimersByTimeAsync(31_000);
+    expect(listState).toBe('Request timeout for method: blockchain.rfq.list_quotes');
+    expect(quoteState).toBe('pending'); // PoW grind on the daemon is still within budget
+
+    await vi.advanceTimersByTimeAsync(150_000);
+    expect(quoteState).toBe('Request timeout for method: blockchain.rfq.request_quote');
+    await Promise.all([quote, list]);
+  });
+});

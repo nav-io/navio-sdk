@@ -3,6 +3,29 @@
 All notable changes to navio-sdk are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/); versions follow [SemVer](https://semver.org/).
 
+## [0.1.34] - 2026-09-10
+
+### Fixed
+
+- **`Request timeout for method: blockchain.rfq.request_quote`** on testnet.
+  Every p2pmsg message carries mandatory anti-spam proof-of-work that the
+  daemon grinds before the RPC returns; a request-for-quote takes 10-30+ s on
+  testnet and the time is probabilistic, so it regularly exceeded the electrum
+  client's fixed 30 s request timeout. Calls that make the daemon broadcast —
+  `requestQuote`, `acceptQuote`, maker `sendQuote`, `broadcastOrder` — now use
+  a separate `p2pmsgTimeout` (default 180 s, configurable in the `electrum`
+  options). Server operators: ElectrumX aborts any request over its own
+  `REQUEST_TIMEOUT` (default 30 s, "server busy - request timed out"), so the
+  bridge server needs `REQUEST_TIMEOUT=180` (or higher) as well.
+- `requestQuote`, `setSwapIntent` and `broadcastOrder` validate `expiry` as a
+  unix time in seconds and reject durations, millisecond timestamps and past
+  times with an actionable message instead of a silent daemon-side expiry.
+
+### Changed
+
+- Depends on `@nav-io/navio-blsct` ^1.2.0 (supranational/blst backend,
+  built from navio-core master).
+
 ## [0.1.33] - 2026-09-09
 
 ### Fixed

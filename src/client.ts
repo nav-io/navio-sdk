@@ -2920,6 +2920,31 @@ export class NavioClient {
    * 64-hex display-order hash, or the empty string for NAV. NFT sub-ids are
    * not supported by the swap protocol.
    */
+  /**
+   * Validate an `expiry` option: the daemon expects a unix time in SECONDS.
+   * Catches the two common slips — a duration (e.g. the collection window in
+   * minutes) or a millisecond timestamp — with an actionable message instead
+   * of letting the daemon reject or, worse, silently expire the request.
+   */
+  private static assertUnixExpiry(expiry: number, name: string): void {
+    if (!Number.isInteger(expiry) || expiry <= 0) {
+      throw new Error(`${name} must be a positive integer unix time in seconds (got ${expiry})`);
+    }
+    const now = Math.floor(Date.now() / 1000);
+    if (expiry < 1_000_000_000) {
+      throw new Error(
+        `${name} must be a unix time in seconds, not a duration (got ${expiry}); ` +
+        'use Math.floor(Date.now() / 1000) + <seconds from now>'
+      );
+    }
+    if (expiry > now * 100) {
+      throw new Error(`${name} must be a unix time in seconds, not milliseconds (got ${expiry})`);
+    }
+    if (expiry <= now) {
+      throw new Error(`${name} is already in the past (${expiry} <= now ${now})`);
+    }
+  }
+
   private static toDaemonToken(tokenId: string | null): string {
     if (tokenId === null) {
       return '';
@@ -2986,6 +3011,7 @@ export class NavioClient {
     if (options.amount <= 0n) {
       throw new Error('Amount must be positive');
     }
+    NavioClient.assertUnixExpiry(options.expiry, 'expiry');
     const electrum = this.getTradingClient();
     const res = await electrum.rfqRequestQuote(
       NavioClient.toDaemonToken(options.buyTokenId),
@@ -3077,6 +3103,7 @@ export class NavioClient {
     if (options.priceMin < 0n) {
       throw new Error('priceMin must be non-negative');
     }
+    NavioClient.assertUnixExpiry(options.expiry, 'expiry');
     const electrum = this.getTradingClient();
     return electrum.swapSetIntent(
       NavioClient.toDaemonToken(options.tokenInId),
@@ -3188,6 +3215,7 @@ export class NavioClient {
     if (options.offerAmount <= 0n || options.wantAmount <= 0n) {
       throw new Error('Amounts must be positive');
     }
+    NavioClient.assertUnixExpiry(options.expiry, 'expiry');
     const electrum = this.getTradingClient();
 
     const { halfHex, fee } = await this.buildSwapHalf({

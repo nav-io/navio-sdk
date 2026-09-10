@@ -137,6 +137,15 @@ export interface ElectrumOptions {
   ssl?: boolean;
   /** Connection timeout in milliseconds (default: 30000) */
   timeout?: number;
+  /**
+   * Request timeout for methods that make the daemon broadcast a p2pmsg
+   * message (RFQ request/accept, maker quote, standing order). Every p2pmsg
+   * message carries mandatory anti-spam proof-of-work that the daemon grinds
+   * before the RPC returns — a single request_quote takes ~10-30 s on
+   * testnet and the time is probabilistic — so these calls need far more
+   * than the regular `timeout`. Default: 180000.
+   */
+  p2pmsgTimeout?: number;
   /** Client name for server.version (default: 'navio-sdk') */
   clientName?: string;
   /** Client version for server.version (default: '1.4') */
@@ -272,6 +281,7 @@ export class ElectrumClient {
       port: options.port || 50001,
       ssl: options.ssl || false,
       timeout: options.timeout || 30000,
+      p2pmsgTimeout: options.p2pmsgTimeout || 180000,
       clientName: options.clientName || 'navio-sdk',
       clientVersion: options.clientVersion || '1.4',
     };
@@ -418,6 +428,18 @@ export class ElectrumClient {
    * @returns Promise resolving to the result
    */
   async call(method: string, ...params: any[]): Promise<any> {
+    return this.callWithTimeout(this.options.timeout, method, ...params);
+  }
+
+  /**
+   * Call a method that makes the daemon broadcast over the p2pmsg bus (and
+   * therefore grind proof-of-work before replying), using `p2pmsgTimeout`.
+   */
+  private callP2pmsg(method: string, ...params: any[]): Promise<any> {
+    return this.callWithTimeout(this.options.p2pmsgTimeout, method, ...params);
+  }
+
+  private async callWithTimeout(timeoutMs: number, method: string, ...params: any[]): Promise<any> {
     if (!this.connected || !this.ws) {
       try {
         await this.connect();
@@ -442,7 +464,7 @@ export class ElectrumClient {
           this.pendingRequests.delete(id);
           reject(new Error(`Request timeout for method: ${method}`));
         }
-      }, this.options.timeout);
+      }, timeoutMs);
 
       this.pendingRequests.set(id, { resolve, reject, timeout });
 
@@ -833,7 +855,7 @@ export class ElectrumClient {
     size: number,
     expiry: number
   ): Promise<{ uuid: string; reply_key: string }> {
-    return this.call('blockchain.rfq.request_quote', buyToken, sellToken, size, expiry);
+    return this.callP2pmsg('blockchain.rfq.request_quote', buyToken, sellToken, size, expiry);
   }
 
   /**
@@ -851,7 +873,7 @@ export class ElectrumClient {
    * @returns Transaction id of the broadcast swap
    */
   async rfqAcceptQuote(uuid: string, quoteId: string, takerHalfHex: string): Promise<string> {
-    return this.call('blockchain.rfq.accept_quote', uuid, quoteId, takerHalfHex);
+    return this.callP2pmsg('blockchain.rfq.accept_quote', uuid, quoteId, takerHalfHex);
   }
 
   /**
@@ -909,7 +931,7 @@ export class ElectrumClient {
     sellCost: number,
     orderExpiry: number
   ): Promise<string> {
-    return this.call(
+    return this.callP2pmsg(
       'blockchain.swap.send_quote', uuid, replyKey, halfTxHex,
       buyToken, sellToken, fill, sellCost, orderExpiry
     );
@@ -928,7 +950,7 @@ export class ElectrumClient {
     wantAmount: number,
     expiry: number
   ): Promise<string> {
-    return this.call(
+    return this.callP2pmsg(
       'blockchain.swap.broadcast_order', halfTxHex,
       offerToken, offerAmount, wantToken, wantAmount, expiry
     );

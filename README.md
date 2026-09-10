@@ -89,6 +89,7 @@ interface NavioClientConfig {
     port?: number;                   // Server port (default: 50001)
     ssl?: boolean;                   // Use SSL/TLS (default: false)
     timeout?: number;                // Request timeout ms (default: 30000)
+    p2pmsgTimeout?: number;          // Timeout for RFQ/quote/order broadcasts (daemon grinds PoW; default: 180000)
     clientName?: string;             // Client name (default: 'navio-sdk')
     clientVersion?: string;          // Protocol version (default: '1.4')
   };

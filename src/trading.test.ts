@@ -69,14 +69,26 @@ describe('requestQuote', () => {
         return { uuid: 'u1', reply_key: 'rk' };
       },
     });
+    const expiry = Math.floor(Date.now() / 1000) + 300;
     const res = await client.requestQuote({
       buyTokenId: TOKEN,
       sellTokenId: null,
       amount: 500n,
-      expiry: 123,
+      expiry,
     });
     expect(res).toEqual({ uuid: 'u1', replyKey: 'rk' });
-    expect(calls[0]).toEqual([TOKEN, '', 500, 123]);
+    expect(calls[0]).toEqual([TOKEN, '', 500, expiry]);
+  });
+
+  it('rejects expiries that are not a future unix time in seconds', async () => {
+    const client = makeClient();
+    const base = { buyTokenId: TOKEN, sellTokenId: null, amount: 500n };
+    // A duration (e.g. the collection window in minutes) instead of a timestamp.
+    await expect(client.requestQuote({ ...base, expiry: 5 })).rejects.toThrow(/not a duration/);
+    // Milliseconds instead of seconds.
+    await expect(client.requestQuote({ ...base, expiry: Date.now() + 300_000 })).rejects.toThrow(/not milliseconds/);
+    // Already elapsed.
+    await expect(client.requestQuote({ ...base, expiry: Math.floor(Date.now() / 1000) - 60 })).rejects.toThrow(/in the past/);
   });
 });
 
