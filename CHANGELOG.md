@@ -3,6 +3,26 @@
 All notable changes to navio-sdk are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/); versions follow [SemVer](https://semver.org/).
 
+## [0.1.35] - 2026-09-10
+
+### Added
+
+- **Standing-order tracking** (maker side). `broadcastOrder` records every
+  order it publishes (`listStandingOrders`, `forgetStandingOrder`) and keeps
+  the coins committed to live orders out of the next order's coin selection
+  (`reserveInputs`, default true). The network's order cache refuses an order
+  spending an input of a stored order — `order rejected (expired, duplicate,
+  or input conflict)` — and evicts an order only on expiry or when an input
+  is spent on chain, so re-publishing from the same coins could never work.
+  A broadcast that times out keeps its reservation (the daemon may still have
+  published the order after its proof-of-work grind) and says so in the
+  error; other failures release it. Records are pruned when they expire or an
+  input is spent. `MakerQuoteResult` now carries the `inputs` spent and, for
+  standing orders, the `localId`. New `IWalletDB` methods
+  `saveStandingOrder` / `getStandingOrders` / `deleteStandingOrder`
+  (SQLite table `standing_orders`; IndexedDB store `standingOrders`, DB
+  version 3).
+
 ## [0.1.34] - 2026-09-10
 
 ### Fixed

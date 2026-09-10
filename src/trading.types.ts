@@ -137,6 +137,45 @@ export interface MakerQuoteResult {
   fee: bigint;
   /** The signed maker half (hex). Spends this wallet's coins if accepted. */
   halfTxHex: string;
+  /** outputHashes of this wallet's coins the half spends */
+  inputs: string[];
+  /**
+   * Standing orders only: local id of the tracked order (see
+   * `listStandingOrders` / `forgetStandingOrder`).
+   */
+  localId?: string;
+}
+
+/**
+ * A standing order this wallet published, tracked locally so the coins it
+ * commits are not offered again while it is live. The network's order cache
+ * refuses a second order spending an input of a stored order ("order
+ * rejected (expired, duplicate, or input conflict)"), and evicts an order
+ * only when it expires or one of its inputs is spent on chain.
+ */
+export interface StandingOrderRecord {
+  /** Local id (stable across the order's lifetime). */
+  localId: string;
+  /** Daemon quote id; null while the broadcast outcome is unknown. */
+  quoteId: string | null;
+  /**
+   * `live`: the daemon accepted the order. `unconfirmed`: the broadcast call
+   * timed out — the daemon may still have published it (proof-of-work grind),
+   * so its inputs stay reserved until expiry unless forgotten explicitly.
+   */
+  status: 'live' | 'unconfirmed';
+  offerTokenId: string | null;
+  offerAmount: bigint;
+  wantTokenId: string | null;
+  wantAmount: bigint;
+  /** Unix time (seconds) the order expires */
+  expiry: number;
+  /** outputHashes of the coins the order's half spends */
+  inputs: string[];
+  halfTxHex: string;
+  fee: bigint;
+  /** Unix time (seconds) the order was built */
+  createdAt: number;
 }
 
 /** Options for publishing a standing swap order (maker side). */
@@ -153,4 +192,11 @@ export interface BroadcastOrderOptions {
   expiry: number;
   /** Optional list of outputHashes to use as inputs (manual coin selection) */
   selectedUtxos?: string[];
+  /**
+   * Skip coins committed to this wallet's other live standing orders when
+   * selecting inputs (default true). The order cache rejects an order that
+   * spends an input of a stored order, so without this a second order built
+   * from the same coins fails with "order rejected (... input conflict)".
+   */
+  reserveInputs?: boolean;
 }

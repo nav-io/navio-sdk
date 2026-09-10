@@ -98,6 +98,25 @@ export interface CreatedCollectionRecord {
 }
 
 /**
+ * A standing swap order published by this wallet, as persisted (bigints as
+ * decimal strings, inputs as outputHashes). See StandingOrderRecord.
+ */
+export interface StandingOrderRow {
+  localId: string;
+  quoteId: string | null;
+  status: 'live' | 'unconfirmed';
+  offerTokenId: string | null;
+  offerAmount: string;
+  wantTokenId: string | null;
+  wantAmount: string;
+  expiry: number;
+  inputs: string[];
+  halfTxHex: string;
+  fee: string;
+  createdAt: number;
+}
+
+/**
  * A persisted (hashId -> sub-address) mapping.
  */
 export interface SubAddressEntry {
@@ -187,6 +206,14 @@ export interface IWalletDB {
 
   // -- created collections ----------------------------------------------
   saveCreatedCollection(record: CreatedCollectionRecord): Promise<void>;
+
+  // -- standing orders (maker side) -------------------------------------
+  /** Insert or replace a tracked standing order (keyed by localId). */
+  saveStandingOrder(row: StandingOrderRow): Promise<void>;
+  /** All tracked standing orders, oldest first. */
+  getStandingOrders(): Promise<StandingOrderRow[]>;
+  /** Drop a tracked standing order by localId. */
+  deleteStandingOrder(localId: string): Promise<void>;
   getCreatedCollections(): Promise<CreatedCollectionRecord[]>;
 
   // -- persistence ------------------------------------------------------

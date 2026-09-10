@@ -33,7 +33,7 @@ import type { HDChain, SubAddressIdentifier } from './key-manager.types';
 import * as blsctModule from '@nav-io/navio-blsct';
 import type { IDatabaseAdapter, DatabaseAdapterOptions } from './database-adapter';
 import { createDatabaseAdapter } from './database-adapter';
-import type { SyncState, StoreOutputParams, TxType, CreatedCollectionRecord, SubAddressEntry } from './wallet-db.interface';
+import type { SyncState, StoreOutputParams, TxType, CreatedCollectionRecord, SubAddressEntry, StandingOrderRow } from './wallet-db.interface';
 export type { SyncState, WalletOutput, WalletMetadata, StoreOutputParams, IWalletDB, TxType, CreatedCollectionRecord, SubAddressEntry } from './wallet-db.interface';
 
 // WalletOutput is re-exported from wallet-db.interface.ts
@@ -326,6 +326,24 @@ export class WalletDB {
         metadata TEXT NOT NULL,
         total_supply INTEGER NOT NULL,
         tx_id TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+      )
+    `);
+
+    // Standing swap orders published by this wallet (maker side)
+    await this.adapter.run(`
+      CREATE TABLE IF NOT EXISTS standing_orders (
+        local_id TEXT PRIMARY KEY,
+        quote_id TEXT,
+        status TEXT NOT NULL,
+        offer_token_id TEXT,
+        offer_amount TEXT NOT NULL,
+        want_token_id TEXT,
+        want_amount TEXT NOT NULL,
+        expiry INTEGER NOT NULL,
+        inputs TEXT NOT NULL,
+        half_tx_hex TEXT NOT NULL,
+        fee TEXT NOT NULL,
         created_at INTEGER NOT NULL
       )
     `);
@@ -974,6 +992,7 @@ export class WalletDB {
     }
     await this.adapter.run('DELETE FROM wallet_outputs');
     await this.adapter.run('DELETE FROM created_collections');
+    await this.adapter.run('DELETE FROM standing_orders');
     await this.clearSyncData();
   }
 
@@ -1057,6 +1076,51 @@ export class WalletDB {
       record.txId,
       record.createdAt,
     ]);
+    await stmt.free();
+    await this.persistToDisk();
+  }
+
+  async saveStandingOrder(row: StandingOrderRow): Promise<void> {
+    if (!this.adapter) throw new Error('Database not open');
+    const stmt = await this.adapter.prepare(`
+      INSERT OR REPLACE INTO standing_orders
+      (local_id, quote_id, status, offer_token_id, offer_amount, want_token_id, want_amount, expiry, inputs, half_tx_hex, fee, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    await stmt.run([
+      row.localId, row.quoteId, row.status, row.offerTokenId, row.offerAmount, row.wantTokenId, row.wantAmount,
+      row.expiry, JSON.stringify(row.inputs), row.halfTxHex, row.fee, row.createdAt,
+    ]);
+    await stmt.free();
+    await this.persistToDisk();
+  }
+
+  async getStandingOrders(): Promise<StandingOrderRow[]> {
+    if (!this.adapter) throw new Error('Database not open');
+    const result = await this.adapter.exec(
+      'SELECT local_id, quote_id, status, offer_token_id, offer_amount, want_token_id, want_amount, expiry, inputs, half_tx_hex, fee, created_at FROM standing_orders ORDER BY created_at'
+    );
+    if (result.length === 0) return [];
+    return result[0].values.map((row) => ({
+      localId: String(row[0]),
+      quoteId: row[1] === null || row[1] === undefined ? null : String(row[1]),
+      status: String(row[2]) as StandingOrderRow['status'],
+      offerTokenId: row[3] === null || row[3] === undefined ? null : String(row[3]),
+      offerAmount: String(row[4]),
+      wantTokenId: row[5] === null || row[5] === undefined ? null : String(row[5]),
+      wantAmount: String(row[6]),
+      expiry: Number(row[7]),
+      inputs: JSON.parse(String(row[8])) as string[],
+      halfTxHex: String(row[9]),
+      fee: String(row[10]),
+      createdAt: Number(row[11]),
+    }));
+  }
+
+  async deleteStandingOrder(localId: string): Promise<void> {
+    if (!this.adapter) throw new Error('Database not open');
+    const stmt = await this.adapter.prepare('DELETE FROM standing_orders WHERE local_id = ?');
+    await stmt.run([localId]);
     await stmt.free();
     await this.persistToDisk();
   }

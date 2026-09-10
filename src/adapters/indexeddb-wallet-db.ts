@@ -23,10 +23,11 @@ import type {
   WalletMetadata,
   StoreOutputParams,
   TxType,
-  CreatedCollectionRecord, SubAddressEntry } from '../wallet-db.interface';
+  CreatedCollectionRecord, SubAddressEntry, StandingOrderRow } from '../wallet-db.interface';
 
 // v2: adds the createdCollections store
-const IDB_VERSION = 2;
+// v3: adds the standingOrders store
+const IDB_VERSION = 3;
 const DEFAULT_TOKEN_ID = '0000000000000000000000000000000000000000000000000000000000000000';
 
 function idbReq<T>(req: IDBRequest<T>): Promise<T> {
@@ -120,6 +121,7 @@ export class IndexedDBWalletDB implements IWalletDB {
       ['syncState', { keyPath: 'id' }],
       ['blockHashes', { keyPath: 'height' }],
       ['createdCollections', { keyPath: 'collectionTokenId' }],
+      ['standingOrders', { keyPath: 'localId' }],
     ];
     for (const [name, opts] of stores) {
       if (!db.objectStoreNames.contains(name)) db.createObjectStore(name, opts);
@@ -475,9 +477,10 @@ export class IndexedDBWalletDB implements IWalletDB {
   private async discardForeignWalletData(incoming: KeyManager): Promise<void> {
     if (!(await this.holdsDifferentWallet(incoming))) return;
     const db = this.ensureOpen();
-    const tx = db.transaction(['walletOutputs', 'createdCollections'], 'readwrite');
+    const tx = db.transaction(['walletOutputs', 'createdCollections', 'standingOrders'], 'readwrite');
     tx.objectStore('walletOutputs').clear();
     tx.objectStore('createdCollections').clear();
+    tx.objectStore('standingOrders').clear();
     await idbTx(tx);
     await this.clearSyncData();
   }
@@ -760,6 +763,22 @@ export class IndexedDBWalletDB implements IWalletDB {
 
   async saveCreatedCollection(record: CreatedCollectionRecord): Promise<void> {
     await this.put('createdCollections', { ...record });
+  }
+
+  async saveStandingOrder(row: StandingOrderRow): Promise<void> {
+    await this.put('standingOrders', { ...row, inputs: [...row.inputs] });
+  }
+
+  async getStandingOrders(): Promise<StandingOrderRow[]> {
+    const rows = await this.getAll<StandingOrderRow>('standingOrders');
+    return rows.sort((a, b) => a.createdAt - b.createdAt);
+  }
+
+  async deleteStandingOrder(localId: string): Promise<void> {
+    const db = this.ensureOpen();
+    const tx = db.transaction('standingOrders', 'readwrite');
+    tx.objectStore('standingOrders').delete(localId);
+    await idbTx(tx);
   }
 
   async getCreatedCollections(): Promise<CreatedCollectionRecord[]> {

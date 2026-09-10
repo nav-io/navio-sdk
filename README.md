@@ -1220,6 +1220,13 @@ await client.broadcastOrder({
 });
 ```
 
+// Standing orders are tracked locally: the coins an order commits are not
+// offered again by the next broadcastOrder (the network's order cache
+// rejects a second order spending an input of a stored order). A timed-out
+// broadcast keeps the reservation — the daemon may still have published it.
+const orders = await client.listStandingOrders();   // live + unconfirmed, pruned on expiry / spent inputs
+await client.forgetStandingOrder(orders[0].localId); // release the coins locally (network keeps the order until expiry)
+
 Maker halves spend wallet coins that are **not locked** while a quote or
 order is outstanding — don't spend them manually until it expires, or the
 swap will fail to confirm.

@@ -14,7 +14,8 @@ import { ElectrumClient, ElectrumOptions } from './electrum';
 import { TransactionKeysSync, SyncOptions, BackgroundSyncOptions } from './tx-keys-sync';
 import { KeyManager } from './key-manager';
 import { parseBirthdayMnemonic } from './crypto/birthday-mnemonic';
-import type { IWalletDB, WalletOutput } from './wallet-db.interface';
+import { randomBytes } from './crypto/encryption';
+import type { IWalletDB, WalletOutput, StandingOrderRow } from './wallet-db.interface';
 import { SyncProvider } from './sync-provider';
 import { P2PSyncProvider } from './p2p-sync';
 import { P2PConnectionOptions } from './p2p-protocol';
@@ -35,6 +36,7 @@ import type {
   ReplyQuoteOptions,
   MakerQuoteResult,
   BroadcastOrderOptions,
+  StandingOrderRecord,
 } from './trading.types';
 
 const {
@@ -3181,7 +3183,7 @@ export class NavioClient {
     const orderExpiry = options.orderExpiry ?? Math.floor(Date.now() / 1000) + 600;
 
     // The maker pays what the taker buys, and receives what the taker sells.
-    const { halfHex, fee } = await this.buildSwapHalf({
+    const { halfHex, fee, spentInputs } = await this.buildSwapHalf({
       payTokenId: request.buyTokenId,
       payAmount: request.fill,
       recvTokenId: request.sellTokenId,
@@ -3201,7 +3203,7 @@ export class NavioClient {
       orderExpiry,
     );
 
-    return { quoteId, fee, halfTxHex: halfHex };
+    return { quoteId, fee, halfTxHex: halfHex, inputs: spentInputs };
   }
 
   /**
@@ -3218,25 +3220,161 @@ export class NavioClient {
     NavioClient.assertUnixExpiry(options.expiry, 'expiry');
     const electrum = this.getTradingClient();
 
-    const { halfHex, fee } = await this.buildSwapHalf({
+    // Coins committed to other live standing orders are off limits: the
+    // network's order cache refuses an order spending an input of a stored
+    // order, and only evicts orders on expiry or when an input is spent.
+    const reserved = options.reserveInputs === false
+      ? new Set<string>()
+      : await this.reservedStandingOrderInputs();
+
+    const { halfHex, fee, spentInputs } = await this.buildSwapHalf({
       payTokenId: options.offerTokenId,
       payAmount: options.offerAmount,
       recvTokenId: options.wantTokenId,
       recvAmount: options.wantAmount,
       makerFee: true,
       selectedUtxos: options.selectedUtxos,
+      excludeUtxos: reserved,
     });
 
-    const quoteId = await electrum.swapBroadcastOrder(
-      halfHex,
-      NavioClient.toDaemonToken(options.offerTokenId),
-      toSafeInteger(options.offerAmount, 'offerAmount'),
-      NavioClient.toDaemonToken(options.wantTokenId),
-      toSafeInteger(options.wantAmount, 'wantAmount'),
-      options.expiry,
-    );
+    // Track the order BEFORE broadcasting. The daemon grinds proof-of-work
+    // before it answers, so a timed-out call may still have published the
+    // order; recording first keeps those coins reserved either way.
+    const localId = Array.from(randomBytes(16)).map((b) => b.toString(16).padStart(2, '0')).join('');
+    const row: StandingOrderRow = {
+      localId,
+      quoteId: null,
+      status: 'unconfirmed',
+      offerTokenId: options.offerTokenId,
+      offerAmount: options.offerAmount.toString(),
+      wantTokenId: options.wantTokenId,
+      wantAmount: options.wantAmount.toString(),
+      expiry: options.expiry,
+      inputs: spentInputs,
+      halfTxHex: halfHex,
+      fee: fee.toString(),
+      createdAt: Math.floor(Date.now() / 1000),
+    };
+    await this.saveStandingOrderRow(row);
 
-    return { quoteId, fee, halfTxHex: halfHex };
+    let quoteId: string;
+    try {
+      quoteId = await electrum.swapBroadcastOrder(
+        halfHex,
+        NavioClient.toDaemonToken(options.offerTokenId),
+        toSafeInteger(options.offerAmount, 'offerAmount'),
+        NavioClient.toDaemonToken(options.wantTokenId),
+        toSafeInteger(options.wantAmount, 'wantAmount'),
+        options.expiry,
+      );
+    } catch (err) {
+      if (NavioClient.isRequestTimeout(err)) {
+        // Outcome unknown: keep the reservation (status stays 'unconfirmed').
+        throw new Error(
+          `${(err as Error).message}. The daemon may still have published the order; its ${spentInputs.length} ` +
+          `input(s) stay reserved locally until it expires (${new Date(options.expiry * 1000).toISOString()}). ` +
+          `Call forgetStandingOrder('${localId}') to release them if you know it was not published.`
+        );
+      }
+      await this.deleteStandingOrderRow(localId);
+      throw err;
+    }
+
+    await this.saveStandingOrderRow({ ...row, quoteId, status: 'live' });
+    return { quoteId, fee, halfTxHex: halfHex, inputs: spentInputs, localId };
+  }
+
+  /**
+   * Standing orders this wallet published and still tracks: live ones and
+   * ones whose broadcast timed out (outcome unknown). Orders that expired,
+   * or whose inputs were spent on chain (the network evicts those too), are
+   * dropped from the store on the way.
+   */
+  async listStandingOrders(): Promise<StandingOrderRecord[]> {
+    const rows = await this.liveStandingOrderRows();
+    return rows.map((row) => ({
+      localId: row.localId,
+      quoteId: row.quoteId,
+      status: row.status,
+      offerTokenId: row.offerTokenId,
+      offerAmount: BigInt(row.offerAmount),
+      wantTokenId: row.wantTokenId,
+      wantAmount: BigInt(row.wantAmount),
+      expiry: row.expiry,
+      inputs: [...row.inputs],
+      halfTxHex: row.halfTxHex,
+      fee: BigInt(row.fee),
+      createdAt: row.createdAt,
+    }));
+  }
+
+  /**
+   * Stop tracking a standing order (by local id or quote id), releasing its
+   * inputs for new orders. This is local bookkeeping only: the network's
+   * order cache keeps the order until it expires or an input is spent, so a
+   * new order built from the same coins is still rejected while the old one
+   * is cached there.
+   */
+  async forgetStandingOrder(id: string): Promise<boolean> {
+    const rows = await this.walletDB?.getStandingOrders() ?? [];
+    const row = rows.find((r) => r.localId === id || r.quoteId === id);
+    if (!row) {
+      return false;
+    }
+    await this.deleteStandingOrderRow(row.localId);
+    return true;
+  }
+
+  private static isRequestTimeout(err: unknown): boolean {
+    return err instanceof Error && /^Request timeout for method/.test(err.message);
+  }
+
+  private async saveStandingOrderRow(row: StandingOrderRow): Promise<void> {
+    if (!this.walletDB) {
+      throw new Error('Client not initialized');
+    }
+    await this.walletDB.saveStandingOrder(row);
+  }
+
+  private async deleteStandingOrderRow(localId: string): Promise<void> {
+    await this.walletDB?.deleteStandingOrder(localId);
+  }
+
+  /**
+   * Tracked standing orders still worth reserving coins for, pruning expired
+   * ones and ones with an input already spent (mirrors the daemon's order
+   * cache eviction rules).
+   */
+  private async liveStandingOrderRows(): Promise<StandingOrderRow[]> {
+    if (!this.walletDB) {
+      return [];
+    }
+    const rows = await this.walletDB.getStandingOrders();
+    if (rows.length === 0) {
+      return [];
+    }
+    const now = Math.floor(Date.now() / 1000);
+    const spent = new Set(
+      (await this.getAllOutputs()).filter((o) => o.isSpent).map((o) => o.outputHash),
+    );
+    const live: StandingOrderRow[] = [];
+    for (const row of rows) {
+      const evicted = row.expiry <= now || row.inputs.some((hash) => spent.has(hash));
+      if (evicted) {
+        await this.deleteStandingOrderRow(row.localId);
+        continue;
+      }
+      live.push(row);
+    }
+    return live;
+  }
+
+  private async reservedStandingOrderInputs(): Promise<Set<string>> {
+    const reserved = new Set<string>();
+    for (const row of await this.liveStandingOrderRows()) {
+      for (const hash of row.inputs) reserved.add(hash);
+    }
+    return reserved;
   }
 
   /**
@@ -3257,6 +3395,8 @@ export class NavioClient {
     recvAmount: bigint;
     makerFee: boolean;
     selectedUtxos?: string[];
+    /** outputHashes never to select automatically (reserved by standing orders) */
+    excludeUtxos?: Set<string>;
   }): Promise<{ halfHex: string; fee: bigint; spentInputs: string[] }> {
     const { keyManager } = await this.ensureSpendReady();
     const { payAmount, recvAmount, makerFee } = params;
@@ -3292,8 +3432,9 @@ export class NavioClient {
     // resolveRequestedTokenId already yields the stored representation, so
     // compare stored tokenIds directly (same convention as sendTransaction's
     // token branch). NAV outputs are stored with tokenId === null.
+    const exclude = params.excludeUtxos ?? new Set<string>();
     const spendable = (utxo: WalletOutput, publicId: string | null): boolean =>
-      !utxo.isSpent && utxo.blockHeight > 0 && utxo.tokenId === publicId;
+      !utxo.isSpent && utxo.blockHeight > 0 && utxo.tokenId === publicId && !exclude.has(utxo.outputHash);
     const payUtxos = allOutputs.filter((utxo) => spendable(utxo, pay.publicId));
     const navUtxos = pay.publicId === null
       ? payUtxos
@@ -3306,6 +3447,12 @@ export class NavioClient {
       const payByHash = new Map(payUtxos.map((utxo) => [utxo.outputHash, utxo]));
       const navByHash = new Map(navUtxos.map((utxo) => [utxo.outputHash, utxo]));
       for (const hash of manualHashes) {
+        if (exclude.has(hash)) {
+          throw new Error(
+            `Selected UTXO ${hash.slice(0, 16)}... is reserved by one of this wallet's standing orders ` +
+            '(see listStandingOrders / forgetStandingOrder)'
+          );
+        }
         const payUtxo = payByHash.get(hash);
         if (payUtxo) {
           manualPay.push(payUtxo);
