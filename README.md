@@ -97,9 +97,12 @@ interface NavioClientConfig {
   // P2P backend options
   p2p?: {
     host: string;                    // Node host
-    port: number;                    // Node port (mainnet: 33670, testnet: 43670)
-    network: 'mainnet' | 'testnet';  // Network type
+    port?: number;                   // Node P2P port (default by network: mainnet 48470, testnet 33670, regtest 18444)
+    network?: 'mainnet' | 'testnet' | 'regtest'; // Defaults to the client's `network`
+    timeout?: number;                // Request timeout ms (default: 30000)
     debug?: boolean;                 // Enable debug logging
+    maxBlocksPerRequest?: number;    // Blocks per scan batch (default: 16)
+    maxConcurrentBlockRequests?: number; // Parallel block downloads (default: 8)
   };
 
   // Network configuration (for navio-blsct)
@@ -926,21 +929,47 @@ const height = await provider.getChainTipHeight();
 
 ### P2PSyncProvider
 
-Direct P2P node connection implementation of SyncProvider.
+Direct P2P node connection implementation of SyncProvider. Talks the Navio
+wire protocol to a full node (`naviod`), so no Electrum server is needed:
+
+- **Headers** via `getheaders` (synced to the tip on connect; every
+  `getChainTipHeight()` re-checks the tip, and block `inv` announcements
+  trigger an immediate refresh; reorgs truncate to the fork point).
+- **Block scanning** via `getdata` (`MSG_WITNESS_BLOCK`), parsed locally:
+  BLSCT output keys (spending/blinding/ephemeral key, view tag, output hash)
+  and spent output hashes per transaction, plus the block timestamp / PoS flag.
+- **Broadcast** by pushing an unsolicited `tx` message, then confirming the
+  node holds the transaction in its mempool (a rejected transaction throws).
+- **Outputs and transactions** via `getdata` — the node serves its mempool and
+  most recent block; outputs from scanned blocks are served from a local
+  cache, and `getRawTransaction` re-reads older confirmed transactions from
+  the block they were scanned in.
+- **Block header subscriptions** (`subscribeBlockHeaders`) driven by the
+  node's `inv` announcements, so `startBackgroundSync` reacts to new blocks
+  without waiting for the poll interval.
+
+The node needs no special configuration beyond `-listen=1`; the SDK
+advertises no services and relays nothing.
 
 ```typescript
 import { P2PSyncProvider } from 'navio-sdk';
 
 const provider = new P2PSyncProvider({
   host: 'localhost',
-  port: 43670,  // testnet port (mainnet: 33670)
-  network: 'testnet',
+  network: 'testnet', // port defaults: mainnet 48470, testnet 33670, regtest 18444
   debug: true,
 });
 
 await provider.connect();
 const height = await provider.getChainTipHeight();
+const { blocks, nextHeight } = await provider.getBlockTransactionKeysRange(height - 10);
+const txid = await provider.broadcastTransaction(rawTxHex);
 ```
+
+Note: navio-core's dedicated `getoutputdata` message cannot be used on the
+wire (its name is 13 characters, one more than the 12-byte command field, so
+nodes drop it as unknown); the SDK uses the node's output-hash lookup for
+`getdata(MSG_WITNESS_TX, outputHash)` instead.
 
 ---
 
@@ -1029,17 +1058,18 @@ await client.sync();
 
 ### Using P2P Backend
 
+Connect straight to a `naviod` P2P port; the magic bytes and default port
+follow the client's `network` (`p2p.network` / `p2p.port` override them).
+
 ```typescript
 const client = new NavioClient({
   walletDbPath: './p2p-wallet.db',
   backend: 'p2p',
+  network: 'testnet',
   p2p: {
-    host: 'localhost',
-    port: 33670,
-    network: 'testnet',
+    host: 'localhost',   // port defaults to 33670 on testnet
     debug: false,
   },
-  network: 'testnet',
   createWalletIfNotExists: true,
 });
 
@@ -1048,7 +1078,15 @@ await client.sync();
 
 const balance = await client.getBalanceNav();
 console.log(`Balance: ${balance} NAV`);
+
+// Spending works the same as with Electrum: the transaction is pushed to the
+// node over P2P and confirmed against its mempool.
+const { txId } = await client.sendTransaction({ address: 'tnv1...', amount: 100_000_000n });
 ```
+
+For local development, run a `naviod -chain=blsctregtest` node and use
+`network: 'regtest'`; `npm run test:p2p:regtest` spawns such a node and
+exercises the whole flow (sync, receive, spend, polling).
 
 ### Sync with Progress
 
@@ -1415,6 +1453,7 @@ npm run test:electrum     # Electrum client tests
 npm run test:client       # Full client tests (Electrum)
 npm run test:p2p          # P2P protocol tests
 npm run test:client:p2p   # Full client tests (P2P)
+npm run test:p2p:regtest  # End-to-end P2P test against a spawned naviod (blsctregtest)
 npm run test:encryption   # Encryption module tests
 npm run test:tx-keys-sync # Transaction keys sync tests
 

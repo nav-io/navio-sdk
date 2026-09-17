@@ -3,6 +3,73 @@
 All notable changes to navio-sdk are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/); versions follow [SemVer](https://semver.org/).
 
+## [0.1.36] - 2026-09-17
+
+### Fixed
+
+- **`backend: 'p2p'` now syncs and transacts against a Navio full node** with
+  no Electrum server. The P2P path was unusable end to end:
+  - `NetworkMagic` / `DefaultPorts` were stale (navio-core
+    `kernel/chainparams.cpp`: mainnet `bd5fc300` / 48470, testnet `2467d2c1` /
+    33670, regtest `fdbf9ffb` / 18444); `P2PSyncProvider` also defaulted to
+    port 33570. The P2P network now follows the client's `network` unless
+    `p2p.network` is set, and the default network is mainnet.
+  - `broadcastTransaction` never sent anything. It now pushes an unsolicited
+    `tx` message and confirms the node holds the transaction in its mempool
+    (via the output-hash lookup below); a rejected transaction throws.
+  - `getRawTransaction` waited for *any* `tx` message. Responses are now
+    matched by txid/wtxid (and `notfound` is honoured); confirmed
+    transactions the node no longer serves over `getdata` are re-read from the
+    block they were scanned in (`txLocationCacheSize`, default 100000 txids).
+  - `getTransactionKeys` threw; it now returns the parsed keys of a
+    mempool / recent-block transaction.
+  - `getTransactionOutput` fell back to navio-core's `getoutputdata` message,
+    which cannot work on the wire: its name is 13 characters, one more than
+    the 12-byte command field, so nodes receive `getoutputdat` and drop it as
+    unknown. The node's output-hash lookup for `getdata(MSG_WITNESS_TX,
+    outputHash)` is used instead (mempool / most recent block); scanned
+    outputs are served from the local cache as before.
+  - Transaction ids were the hash of the full serialization; they are now the
+    witness-stripped hash (`CTransaction::ComputeHash`).
+  - BLSCT output keys were only read when the range proof had commitments;
+    navio-core serializes the keys and view tag whenever the BLSCT flag is
+    set, so such outputs desynchronized the parser.
+  - Header sync mislabelled heights on later batches, could not detect
+    reorgs, and `getChainTipHeight` served a cached tip for 5 s so a sync
+    started right after a new block stopped one block short. Headers are now
+    chained by previous-hash with fork-point truncation, every
+    `getChainTipHeight()` re-checks the node (one `getheaders` round-trip,
+    empty reply when unchanged), and block `inv` announcements trigger a
+    refresh. `subscribeBlockHeaders` is implemented on top of that, so
+    `startBackgroundSync` reacts to new blocks immediately.
+  - Request/response matching keyed by command name: concurrent requests of
+    the same type collided and the connect timeout could fire after a
+    successful handshake. `P2PClient` now matches replies by content (block
+    hash, txid, inventory hash), advertises no services (`NODE_NONE`, so the
+    node does not choose it as a headers-sync peer), sends nothing between
+    `version` and `verack` (the node disconnects peers that send
+    `sendaddrv2`/`wtxidrelay` after `verack`), and rejects all pending
+    requests on close so `TransactionKeysSync` reconnects.
+  - Blocks for a scan batch are downloaded concurrently (`maxConcurrentBlockRequests`,
+    default 8) and `BlockTransactionKeys` now carries `timestamp` / `isPoS`
+    from the P2P provider too.
+- `NavioClient.initialize()` with `createWalletIfNotExists` and an explicit
+  `creationHeight` never connected to the backend (every other path does), so
+  `isConnected()` was false and the first `sync()` did nothing on P2P.
+- `KeyManager.getSubAddressBech32m` accepts `'regtest'` and `'signet'`.
+
+### Added
+
+- `src/p2p-block-parser.ts` (exported): `parseBlock` / `parseTransaction` /
+  `computeTxid` for Navio's block and BLSCT transaction wire format (PoS
+  proof skipping, output hashes, key extraction, witness stripping).
+- `scripts/test-p2p-regtest.ts` (`npm run test:p2p:regtest`): spawns a
+  `naviod -chain=blsctregtest` node and runs the full P2P flow — header sync,
+  receiving a payment, spending it back over P2P, `getRawTransaction`, and
+  background polling picking up a new block. Requires a navio-core build
+  (`NAVIOD=/path/to/naviod`).
+- Unit tests for the parser and codec helpers (`src/p2p-block-parser.test.ts`).
+
 ## [0.1.35] - 2026-09-10
 
 ### Added
