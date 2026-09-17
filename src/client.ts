@@ -814,7 +814,7 @@ export interface NavioClientConfig {
  * const client = new NavioClient({
  *   walletDbPath: './wallet.db',
  *   backend: 'p2p',
- *   p2p: { host: '127.0.0.1', port: 44440, network: 'mainnet' }
+ *   p2p: { host: '127.0.0.1', port: 48470, network: 'mainnet' }
  * });
  *
  * @category Client
@@ -904,7 +904,14 @@ export class NavioClient {
 
     // Create sync provider based on backend type
     if (this.config.backend === 'p2p') {
-      this.syncProvider = new P2PSyncProvider(this.config.p2p!);
+      // The P2P network (magic bytes / default port) follows the client's
+      // network unless the p2p options name one explicitly. Signet has no
+      // fixed P2P magic in the SDK, so it must be given explicitly.
+      const p2pNetwork = this.config.network === 'signet' ? undefined : this.config.network;
+      this.syncProvider = new P2PSyncProvider({
+        ...(p2pNetwork ? { network: p2pNetwork } : {}),
+        ...this.config.p2p!,
+      });
     } else {
       // Electrum backend
       this.electrumClient = new ElectrumClient(this.config.electrum!);
@@ -1067,6 +1074,12 @@ export class NavioClient {
 
         this.keyManager = await this.walletDB.createWallet(creationHeight);
         this.syncManager.setKeyManager(this.keyManager);
+
+        // Connect to backend (an explicit creationHeight skipped the
+        // connect above; every other initialize path ends connected)
+        if (!this.syncProvider.isConnected()) {
+          await this.syncProvider.connect();
+        }
       } else {
         throw new Error(
           `Wallet not found at ${this.config.walletDbPath}. ` +

@@ -2,14 +2,22 @@
  * Test script for P2P sync provider
  *
  * Tests direct P2P connection to a Navio full node.
- * Run with: npx tsx scripts/test-p2p-sync.ts [host] [port]
+ * Run with: npx tsx scripts/test-p2p-sync.ts [host] [port] [network]
+ *   network: mainnet | testnet (default) | regtest
+ *   port defaults to the network's P2P port (mainnet 48470, testnet 33670, regtest 18444)
  */
 
-import { P2PClient, NetworkMagic, DefaultPorts } from '../src/p2p-protocol';
+import { P2PClient, NetworkMagic, DefaultPorts, P2PNetwork } from '../src/p2p-protocol';
 import { P2PSyncProvider } from '../src/p2p-sync';
 
 const host = process.argv[2] || 'localhost';
-const port = parseInt(process.argv[3] || String(DefaultPorts.TESTNET), 10);
+const network = (process.argv[4] || 'testnet') as P2PNetwork;
+const networkKey = network.toUpperCase() as keyof typeof DefaultPorts;
+if (!DefaultPorts[networkKey]) {
+  console.error(`Unknown network: ${network} (expected mainnet, testnet or regtest)`);
+  process.exit(1);
+}
+const port = parseInt(process.argv[3] || String(DefaultPorts[networkKey]), 10);
 
 async function testP2PClient() {
   console.log('='.repeat(60));
@@ -20,7 +28,7 @@ async function testP2PClient() {
   const client = new P2PClient({
     host,
     port,
-    network: 'testnet',
+    network,
     debug: true,
     timeout: 30000,
   });
@@ -40,7 +48,11 @@ async function testP2PClient() {
     if (headers.length > 0) {
       const firstHeader = headers[0];
       const hash = P2PClient.hashToDisplay(
-        Buffer.from(require('@noble/hashes/sha256').sha256(require('@noble/hashes/sha256').sha256(firstHeader))).reverse()
+        Buffer.from(
+          require('@noble/hashes/sha256').sha256(
+            require('@noble/hashes/sha256').sha256(firstHeader)
+          )
+        ).reverse()
       );
       console.log(`  First header hash: ${hash.substring(0, 16)}...`);
     }
@@ -48,7 +60,6 @@ async function testP2PClient() {
     // Disconnect
     client.disconnect();
     console.log('\n✓ Disconnected');
-
   } catch (error) {
     console.error('\n✗ Error:', error);
     client.disconnect();
@@ -65,7 +76,7 @@ async function testP2PSyncProvider() {
   const provider = new P2PSyncProvider({
     host,
     port,
-    network: 'testnet',
+    network,
     debug: true,
     timeout: 30000,
   });
@@ -104,7 +115,9 @@ async function testP2PSyncProvider() {
           const outputs = (txKey.keys as any)?.outputs || [];
           console.log(`    ${outputs.length} outputs with BLSCT keys`);
           for (const out of outputs.slice(0, 2)) {
-            console.log(`      - viewTag: ${out.viewTag}, spendingKey: ${out.spendingKey?.substring(0, 16)}...`);
+            console.log(
+              `      - viewTag: ${out.viewTag}, spendingKey: ${out.spendingKey?.substring(0, 16)}...`
+            );
           }
         }
       }
@@ -115,7 +128,6 @@ async function testP2PSyncProvider() {
     // Disconnect
     provider.disconnect();
     console.log('\n✓ Disconnected');
-
   } catch (error) {
     console.error('\n✗ Error:', error);
     provider.disconnect();
@@ -127,8 +139,8 @@ async function main() {
   console.log('P2P Sync Test');
   console.log('='.repeat(60));
   console.log(`Target: ${host}:${port}`);
-  console.log(`Network: testnet`);
-  console.log(`Magic bytes: ${NetworkMagic.TESTNET.toString('hex')}`);
+  console.log(`Network: ${network}`);
+  console.log(`Magic bytes: ${NetworkMagic[networkKey].toString('hex')}`);
   console.log('');
 
   await testP2PClient();
@@ -140,4 +152,3 @@ async function main() {
 }
 
 main().catch(console.error);
-

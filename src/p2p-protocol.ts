@@ -3,6 +3,10 @@
  *
  * Implements the Navio P2P protocol for direct node communication.
  * Supports connection handshake, message framing, and core protocol messages.
+ *
+ * Network constants mirror navio-core `src/kernel/chainparams.cpp`
+ * (`pchMessageStart` / `nDefaultPort`). `blsctregtest` shares the regtest
+ * magic and port.
  */
 
 import { sha256 } from '@noble/hashes/sha256';
@@ -12,8 +16,8 @@ import * as net from 'net';
  * Network magic bytes for different chains
  */
 export const NetworkMagic = {
-  MAINNET: Buffer.from([0xdb, 0xd2, 0xb1, 0xac]),
-  TESTNET: Buffer.from([0x1c, 0x03, 0xbb, 0x83]),
+  MAINNET: Buffer.from([0xbd, 0x5f, 0xc3, 0x00]),
+  TESTNET: Buffer.from([0x24, 0x67, 0xd2, 0xc1]),
   REGTEST: Buffer.from([0xfd, 0xbf, 0x9f, 0xfb]),
 } as const;
 
@@ -21,10 +25,15 @@ export const NetworkMagic = {
  * Default ports for different chains
  */
 export const DefaultPorts = {
-  MAINNET: 44440,
+  MAINNET: 48470,
   TESTNET: 33670,
   REGTEST: 18444,
 } as const;
+
+/**
+ * P2P network name
+ */
+export type P2PNetwork = 'mainnet' | 'testnet' | 'regtest';
 
 /**
  * P2P message types
@@ -36,6 +45,9 @@ export const MessageType = {
   PONG: 'pong',
   GETADDR: 'getaddr',
   ADDR: 'addr',
+  ADDRV2: 'addrv2',
+  SENDADDRV2: 'sendaddrv2',
+  WTXIDRELAY: 'wtxidrelay',
   INV: 'inv',
   GETDATA: 'getdata',
   NOTFOUND: 'notfound',
@@ -44,6 +56,13 @@ export const MessageType = {
   HEADERS: 'headers',
   BLOCK: 'block',
   TX: 'tx',
+  /** Dandelion++ stem transaction (same payload as `tx`) */
+  DTX: 'dtx',
+  /**
+   * navio-core's output-hash request. Unusable on the wire: the name is 13
+   * characters but the command field holds 12, so nodes see `getoutputdat`
+   * and drop it as unknown. Use getdata(MSG_WITNESS_TX, outputHash) instead.
+   */
   GETOUTPUTDATA: 'getoutputdata',
   MEMPOOL: 'mempool',
   REJECT: 'reject',
@@ -52,6 +71,7 @@ export const MessageType = {
   CMPCTBLOCK: 'cmpctblock',
   GETBLOCKTXN: 'getblocktxn',
   BLOCKTXN: 'blocktxn',
+  FEEFILTER: 'feefilter',
 } as const;
 
 /**
@@ -65,10 +85,12 @@ export const ServiceFlags = {
   NODE_COMPACT_FILTERS: 1n << 6n,
   NODE_NETWORK_LIMITED: 1n << 10n,
   NODE_P2P_V2: 1n << 11n,
+  NODE_P2PMSG: 1n << 24n,
+  NODE_P2PMSG_LEAF: 1n << 25n,
 } as const;
 
 /**
- * Inventory types for getdata/inv messages
+ * Inventory types for getdata/inv messages (navio-core `protocol.h`)
  */
 export const InvType = {
   ERROR: 0,
@@ -91,6 +113,11 @@ export const InvType = {
 export const PROTOCOL_VERSION = 70016;
 
 /**
+ * Maximum headers a node returns per `getheaders` (navio-core MAX_HEADERS_RESULTS)
+ */
+export const MAX_HEADERS_RESULTS = 2000;
+
+/**
  * P2P connection options
  */
 export interface P2PConnectionOptions {
@@ -98,16 +125,22 @@ export interface P2PConnectionOptions {
   host: string;
   /** Port (default based on network) */
   port?: number;
-  /** Network type */
-  network?: 'mainnet' | 'testnet' | 'regtest';
-  /** Connection timeout in ms */
+  /** Network type (default: mainnet) */
+  network?: P2PNetwork;
+  /** Request timeout in ms (also the TCP connect + handshake timeout) */
   timeout?: number;
   /** User agent string */
   userAgent?: string;
   /** Enable debug logging */
   debug?: boolean;
-  /** Services to advertise */
+  /**
+   * Services to advertise. Default NODE_NONE: a light client serves nothing,
+   * and advertising NODE_NETWORK would make the node pick us as a
+   * headers-sync peer and wait on requests we never answer.
+   */
   services?: bigint;
+  /** Start height to advertise in the version message (default 0) */
+  startHeight?: number;
 }
 
 /**
@@ -168,11 +201,29 @@ export interface BlockLocator {
   hashStop: Buffer;
 }
 
+interface Waiter {
+  commands: Set<string>;
+  predicate: (msg: P2PMessage) => boolean;
+  resolve: (msg: P2PMessage) => void;
+  reject: (err: Error) => void;
+  timer: NodeJS.Timeout;
+}
+
+/**
+ * Double SHA256
+ */
+function hash256(data: Uint8Array): Buffer {
+  return Buffer.from(sha256(sha256(data)));
+}
+
 /**
  * P2P Protocol Client
  *
  * Low-level P2P protocol implementation for connecting to Navio nodes.
- * 
+ * Frames messages, runs the version/verack handshake, answers pings, and
+ * offers request/response helpers whose responses are matched by content
+ * (block hash, inventory hash) so concurrent requests do not collide.
+ *
  * @category Protocol
  */
 export class P2PClient {
@@ -182,30 +233,38 @@ export class P2PClient {
   private connected = false;
   private handshakeComplete = false;
   private receiveBuffer = Buffer.alloc(0);
-  private pendingMessages: Map<
-    string,
-    { resolve: (msg: P2PMessage) => void; reject: (err: Error) => void; timer: NodeJS.Timeout }
-  > = new Map();
+  private waiters: Waiter[] = [];
   private messageHandlers: Map<string, ((msg: P2PMessage) => void)[]> = new Map();
-  private messageQueue: Map<string, P2PMessage[]> = new Map(); // Queue for early messages
+  private closeHandlers: ((err?: Error) => void)[] = [];
   private nonce: bigint;
   private peerVersion: number = 0;
   private _peerServices: bigint = 0n;
   private peerStartHeight: number = 0;
+  private peerUserAgent: string = '';
+  private verackReceived = false;
+  private versionReceived = false;
+  private handshakeWaiter: { resolve: () => void; reject: (e: Error) => void } | null = null;
 
   constructor(options: P2PConnectionOptions) {
-    const network = options.network ?? 'testnet';
+    const network = options.network ?? 'mainnet';
+    const key = network.toUpperCase() as keyof typeof NetworkMagic;
+    if (!NetworkMagic[key]) {
+      throw new Error(`Unsupported P2P network: ${network}`);
+    }
     this.options = {
       host: options.host,
-      port: options.port ?? DefaultPorts[network.toUpperCase() as keyof typeof DefaultPorts],
+      port: options.port ?? DefaultPorts[key],
       network,
       timeout: options.timeout ?? 30000,
       userAgent: options.userAgent ?? '/navio-sdk:0.1.0/',
       debug: options.debug ?? false,
-      services: options.services ?? ServiceFlags.NODE_NETWORK | ServiceFlags.NODE_WITNESS,
+      services: options.services ?? ServiceFlags.NODE_NONE,
+      startHeight: options.startHeight ?? 0,
     };
-    this.magic = NetworkMagic[network.toUpperCase() as keyof typeof NetworkMagic];
-    this.nonce = BigInt(Math.floor(Math.random() * Number.MAX_SAFE_INTEGER));
+    this.magic = NetworkMagic[key];
+    const nonceBytes = Buffer.alloc(8);
+    for (let i = 0; i < 8; i++) nonceBytes[i] = Math.floor(Math.random() * 256);
+    this.nonce = nonceBytes.readBigUInt64LE(0);
   }
 
   private log(...args: unknown[]): void {
@@ -223,59 +282,72 @@ export class P2PClient {
     }
 
     return new Promise((resolve, reject) => {
-      this.socket = new net.Socket();
+      const socket = new net.Socket();
+      this.socket = socket;
+      this.receiveBuffer = Buffer.alloc(0);
+      this.versionReceived = false;
+      this.verackReceived = false;
+      this.handshakeComplete = false;
+
+      let settled = false;
+      const fail = (err: Error) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(connectionTimeout);
+        this.handshakeWaiter = null;
+        this.disconnect();
+        reject(err);
+      };
+      const succeed = () => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(connectionTimeout);
+        this.handshakeWaiter = null;
+        this.handshakeComplete = true;
+        this.log('Handshake complete');
+        resolve();
+      };
 
       const connectionTimeout = setTimeout(() => {
-        this.socket?.destroy();
-        reject(new Error('Connection timeout'));
+        fail(new Error(`Connection timeout (${this.options.host}:${this.options.port})`));
       }, this.options.timeout);
 
-      this.socket.on('connect', async () => {
+      this.handshakeWaiter = { resolve: succeed, reject: fail };
+
+      socket.setNoDelay(true);
+
+      socket.on('connect', () => {
         this.log(`Connected to ${this.options.host}:${this.options.port}`);
         this.connected = true;
-
         try {
-          // Send version message
-          await this.sendVersion();
-
-          // Wait for version and verack
-          await this.waitForHandshake();
-
-          clearTimeout(connectionTimeout);
-          this.handshakeComplete = true;
-          this.log('Handshake complete');
-          resolve();
+          this.sendMessage(MessageType.VERSION, this.buildVersionPayload());
         } catch (error) {
-          clearTimeout(connectionTimeout);
-          this.disconnect();
-          reject(error);
+          fail(error as Error);
         }
       });
 
-      this.socket.on('data', (data: Buffer) => {
+      socket.on('data', (data: Buffer) => {
+        if (this.socket !== socket) return;
         this.handleData(data);
       });
 
-      this.socket.on('error', (error: Error) => {
+      socket.on('error', (error: Error) => {
         this.log('Socket error:', error.message);
-        clearTimeout(connectionTimeout);
-        this.connected = false;
-        reject(error);
-      });
-
-      this.socket.on('close', (hadError: boolean) => {
-        this.log(`Connection closed (hadError=${hadError}, receiveBuffer=${this.receiveBuffer.length} bytes)`);
-        this.connected = false;
-        this.handshakeComplete = false;
-        // Reject any pending requests
-        for (const [, pending] of this.pendingMessages) {
-          clearTimeout(pending.timer);
-          pending.reject(new Error('Connection closed'));
+        if (!settled) {
+          fail(error);
         }
-        this.pendingMessages.clear();
       });
 
-      this.socket.connect(this.options.port, this.options.host);
+      socket.on('close', (hadError: boolean) => {
+        if (this.socket !== socket) return;
+        this.log(`Connection closed (hadError=${hadError})`);
+        this.onClosed(new Error('Connection closed'));
+        if (!settled) {
+          fail(new Error('Connection closed before handshake completed'));
+        }
+      });
+
+      socket.connect(this.options.port, this.options.host);
     });
   }
 
@@ -283,12 +355,35 @@ export class P2PClient {
    * Disconnect from the peer
    */
   disconnect(): void {
-    if (this.socket) {
-      this.socket.destroy();
-      this.socket = null;
+    const socket = this.socket;
+    this.socket = null;
+    if (socket) {
+      socket.removeAllListeners('data');
+      socket.destroy();
     }
+    this.onClosed(new Error('Disconnected'));
+  }
+
+  private onClosed(err: Error): void {
+    const wasConnected = this.connected;
     this.connected = false;
     this.handshakeComplete = false;
+    this.receiveBuffer = Buffer.alloc(0);
+    const waiters = this.waiters;
+    this.waiters = [];
+    for (const w of waiters) {
+      clearTimeout(w.timer);
+      w.reject(err);
+    }
+    if (wasConnected) {
+      for (const h of this.closeHandlers) {
+        try {
+          h(err);
+        } catch {
+          // handler errors must not break teardown
+        }
+      }
+    }
   }
 
   /**
@@ -320,6 +415,20 @@ export class P2PClient {
   }
 
   /**
+   * Get peer's user agent
+   */
+  getPeerUserAgent(): string {
+    return this.peerUserAgent;
+  }
+
+  /**
+   * Register a handler invoked when an established connection closes
+   */
+  onClose(handler: (err?: Error) => void): void {
+    this.closeHandlers.push(handler);
+  }
+
+  /**
    * Handle incoming data
    */
   private handleData(data: Buffer): void {
@@ -348,8 +457,8 @@ export class P2PClient {
         return; // Wait for more data
       }
 
-      // Extract payload
-      const payload = this.receiveBuffer.subarray(24, totalLength);
+      // Extract payload (copy: the receive buffer is sliced and reused)
+      const payload = Buffer.from(this.receiveBuffer.subarray(24, totalLength));
 
       // Verify checksum
       const expectedChecksum = this.calculateChecksum(payload);
@@ -375,10 +484,7 @@ export class P2PClient {
   private parseHeader(buffer: Buffer): MessageHeader {
     return {
       magic: buffer.subarray(0, 4),
-      command: buffer
-        .subarray(4, 16)
-        .toString('ascii')
-        .replace(/\0+$/, ''),
+      command: buffer.subarray(4, 16).toString('ascii').replace(/\0+$/, ''),
       length: buffer.readUInt32LE(16),
       checksum: buffer.subarray(20, 24),
     };
@@ -388,43 +494,56 @@ export class P2PClient {
    * Calculate message checksum (first 4 bytes of double SHA256)
    */
   private calculateChecksum(payload: Buffer): Buffer {
-    const hash = sha256(sha256(payload));
-    return Buffer.from(hash.subarray(0, 4));
+    return hash256(payload).subarray(0, 4);
   }
 
   /**
    * Dispatch message to handlers
    */
   private dispatchMessage(message: P2PMessage): void {
-    // Check for pending requests
-    const pending = this.pendingMessages.get(message.command);
-    if (pending) {
-      clearTimeout(pending.timer);
-      this.pendingMessages.delete(message.command);
-      pending.resolve(message);
-      return;
+    switch (message.command) {
+      case MessageType.VERSION:
+        this.handleVersion(message.payload);
+        return;
+      case MessageType.VERACK:
+        this.verackReceived = true;
+        this.maybeHandshakeDone();
+        return;
+      case MessageType.PING:
+        this.handlePing(message.payload);
+        return;
+      default:
+        break;
+    }
+
+    // Waiters: the first matching waiter consumes the message
+    for (let i = 0; i < this.waiters.length; i++) {
+      const w = this.waiters[i];
+      if (!w.commands.has(message.command)) continue;
+      let matched = false;
+      try {
+        matched = w.predicate(message);
+      } catch (e) {
+        this.log(`Waiter predicate threw for ${message.command}: ${e}`);
+      }
+      if (matched) {
+        this.waiters.splice(i, 1);
+        clearTimeout(w.timer);
+        w.resolve(message);
+        break;
+      }
     }
 
     // Call registered handlers
     const handlers = this.messageHandlers.get(message.command);
     if (handlers) {
       for (const handler of handlers) {
-        handler(message);
+        try {
+          handler(message);
+        } catch (e) {
+          this.log(`Handler for ${message.command} threw: ${e}`);
+        }
       }
-    }
-
-    // Handle specific protocol messages
-    switch (message.command) {
-      case MessageType.PING:
-        this.handlePing(message.payload);
-        break;
-      default:
-        // Queue message for later if no handler is waiting
-        // This handles race conditions during handshake
-        const queue = this.messageQueue.get(message.command) ?? [];
-        queue.push(message);
-        this.messageQueue.set(message.command, queue);
-        break;
     }
   }
 
@@ -438,10 +557,20 @@ export class P2PClient {
   }
 
   /**
+   * Remove a message handler
+   */
+  offMessage(command: string, handler: (msg: P2PMessage) => void): void {
+    const handlers = this.messageHandlers.get(command);
+    if (!handlers) return;
+    const idx = handlers.indexOf(handler);
+    if (idx >= 0) handlers.splice(idx, 1);
+  }
+
+  /**
    * Send a raw message
    */
-  private sendMessage(command: string, payload: Buffer = Buffer.alloc(0)): void {
-    if (!this.socket) {
+  sendMessage(command: string, payload: Buffer = Buffer.alloc(0)): void {
+    if (!this.socket || !this.connected) {
       throw new Error('Not connected');
     }
 
@@ -450,26 +579,71 @@ export class P2PClient {
     this.magic.copy(header, 0);
 
     // Command (12 bytes, null-padded)
-    const cmdBuffer = Buffer.alloc(12);
-    Buffer.from(command, 'ascii').copy(cmdBuffer);
-    cmdBuffer.copy(header, 4);
-
+    Buffer.from(command, 'ascii').copy(header, 4);
 
     // Payload length
     header.writeUInt32LE(payload.length, 16);
 
     // Checksum
-    const checksum = this.calculateChecksum(payload);
-    checksum.copy(header, 20);
+    this.calculateChecksum(payload).copy(header, 20);
 
     // Send
-    const message = Buffer.concat([header, payload]);
-    this.socket.write(message);
+    this.socket.write(Buffer.concat([header, payload]));
     this.log('Sent:', command, `(${payload.length} bytes)`);
   }
 
   /**
-   * Send a message and wait for a specific response
+   * Wait for the next message of one of the given commands that satisfies
+   * `predicate`. The waiter is registered synchronously, so it is safe to
+   * send the request right after calling this.
+   */
+  waitFor(
+    commands: string | string[],
+    predicate: (msg: P2PMessage) => boolean = () => true,
+    timeout?: number
+  ): Promise<P2PMessage> {
+    const cmdSet = new Set(Array.isArray(commands) ? commands : [commands]);
+    return new Promise((resolve, reject) => {
+      if (!this.connected) {
+        reject(new Error('Not connected'));
+        return;
+      }
+      const waiter: Waiter = {
+        commands: cmdSet,
+        predicate,
+        resolve,
+        reject,
+        timer: setTimeout(() => {
+          const idx = this.waiters.indexOf(waiter);
+          if (idx >= 0) this.waiters.splice(idx, 1);
+          reject(new Error(`Timeout waiting for ${[...cmdSet].join('/')}`));
+        }, timeout ?? this.options.timeout),
+      };
+      this.waiters.push(waiter);
+    });
+  }
+
+  /**
+   * Send a message and wait for a matching response
+   */
+  async request(
+    command: string,
+    payload: Buffer,
+    responseCommands: string | string[],
+    predicate: (msg: P2PMessage) => boolean = () => true,
+    timeout?: number
+  ): Promise<P2PMessage> {
+    const promise = this.waitFor(responseCommands, predicate, timeout);
+    // Attach a no-op catch so a synchronous send failure cannot leave an
+    // unhandled rejection behind; the caller still observes the rejection.
+    promise.catch(() => undefined);
+    this.sendMessage(command, payload);
+    return promise;
+  }
+
+  /**
+   * Send a message and wait for a specific response (matches the first
+   * message with `responseCommand`)
    */
   async sendAndWait(
     command: string,
@@ -477,40 +651,14 @@ export class P2PClient {
     responseCommand: string,
     timeout?: number
   ): Promise<P2PMessage> {
-    return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => {
-        this.pendingMessages.delete(responseCommand);
-        reject(new Error(`Timeout waiting for ${responseCommand}`));
-      }, timeout ?? this.options.timeout);
-
-      this.pendingMessages.set(responseCommand, { resolve, reject, timer });
-      this.sendMessage(command, payload);
-    });
+    return this.request(command, payload, responseCommand, () => true, timeout);
   }
 
   /**
-   * Wait for a specific message
+   * Wait for the next message with the given command
    */
   async waitForMessage(command: string, timeout?: number): Promise<P2PMessage> {
-    // First check if message is already in the queue
-    const queue = this.messageQueue.get(command);
-    if (queue && queue.length > 0) {
-      const message = queue.shift()!;
-      if (queue.length === 0) {
-        this.messageQueue.delete(command);
-      }
-      return message;
-    }
-
-    // Otherwise wait for it
-    return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => {
-        this.pendingMessages.delete(command);
-        reject(new Error(`Timeout waiting for ${command}`));
-      }, timeout ?? this.options.timeout);
-
-      this.pendingMessages.set(command, { resolve, reject, timer });
-    });
+    return this.waitFor(command, () => true, timeout);
   }
 
   // ============================================================================
@@ -518,23 +666,13 @@ export class P2PClient {
   // ============================================================================
 
   /**
-   * Send version message
-   */
-  private async sendVersion(): Promise<void> {
-    const payload = this.buildVersionPayload();
-    this.sendMessage(MessageType.VERSION, payload);
-  }
-
-  /**
    * Build version message payload
    */
   private buildVersionPayload(): Buffer {
     const now = BigInt(Math.floor(Date.now() / 1000));
 
-    // Calculate payload size
     const userAgentBytes = Buffer.from(this.options.userAgent, 'utf8');
     const userAgentVarInt = this.encodeVarInt(userAgentBytes.length);
-
 
     const payloadSize =
       4 + // version
@@ -551,72 +689,77 @@ export class P2PClient {
     const payload = Buffer.alloc(payloadSize);
     let offset = 0;
 
-    // Version
     payload.writeInt32LE(PROTOCOL_VERSION, offset);
     offset += 4;
 
-    // Services
     payload.writeBigUInt64LE(this.options.services, offset);
     offset += 8;
 
-    // Timestamp
     payload.writeBigInt64LE(now, offset);
     offset += 8;
 
-    // Addr recv (services + IPv6 + port)
-    payload.writeBigUInt64LE(ServiceFlags.NODE_NETWORK, offset);
-    offset += 8;
-    // IPv4-mapped IPv6 address for localhost
-    Buffer.from('00000000000000000000ffff7f000001', 'hex').copy(payload, offset);
-    offset += 16;
+    // addr_recv: services + IPv6 (unspecified) + port
+    payload.writeBigUInt64LE(0n, offset);
+    offset += 8 + 16;
     payload.writeUInt16BE(this.options.port, offset);
     offset += 2;
 
-    // Addr from
+    // addr_from
     payload.writeBigUInt64LE(this.options.services, offset);
-    offset += 8;
-    Buffer.from('00000000000000000000ffff7f000001', 'hex').copy(payload, offset);
-    offset += 16;
+    offset += 8 + 16;
     payload.writeUInt16BE(0, offset);
     offset += 2;
 
-    // Nonce
     payload.writeBigUInt64LE(this.nonce, offset);
     offset += 8;
 
-    // User agent
     userAgentVarInt.copy(payload, offset);
     offset += userAgentVarInt.length;
     userAgentBytes.copy(payload, offset);
     offset += userAgentBytes.length;
 
-    // Start height (0 for now, we don't have any blocks)
-    payload.writeInt32LE(0, offset);
+    payload.writeInt32LE(this.options.startHeight, offset);
     offset += 4;
 
-    // Relay
+    // relay = true: a peer that opts out of tx relay gets no answers to
+    // getdata(tx) / getoutputdata and its broadcasts are dropped.
     payload.writeUInt8(1, offset);
 
     return payload;
   }
 
   /**
-   * Wait for handshake completion
+   * Handle the peer's version message.
+   *
+   * BIP155/BIP339 feature negotiation (`sendaddrv2`, `wtxidrelay`) must
+   * happen between version and verack — the node disconnects a peer that
+   * sends them after verack. We need neither, so we send only verack.
    */
-  private async waitForHandshake(): Promise<void> {
-    // Create promises for both messages we need before any data arrives
-    const versionPromise = this.waitForMessage(MessageType.VERSION, 10000);
-    const verackPromise = this.waitForMessage(MessageType.VERACK, 10000);
+  private handleVersion(payload: Buffer): void {
+    if (this.versionReceived) {
+      this.log('Duplicate version message ignored');
+      return;
+    }
+    this.versionReceived = true;
+    try {
+      this.parseVersionMessage(payload);
+    } catch (e) {
+      this.handshakeWaiter?.reject(new Error(`Malformed version message: ${e}`));
+      return;
+    }
+    try {
+      this.sendMessage(MessageType.VERACK);
+    } catch (e) {
+      this.handshakeWaiter?.reject(e as Error);
+      return;
+    }
+    this.maybeHandshakeDone();
+  }
 
-    // Wait for version
-    const versionMsg = await versionPromise;
-    this.parseVersionMessage(versionMsg.payload);
-
-    // Send verack
-    this.sendMessage(MessageType.VERACK);
-
-    // Wait for verack (may have already arrived)
-    await verackPromise;
+  private maybeHandshakeDone(): void {
+    if (this.versionReceived && this.verackReceived && this.handshakeWaiter) {
+      this.handshakeWaiter.resolve();
+    }
   }
 
   /**
@@ -634,32 +777,49 @@ export class P2PClient {
     // Skip timestamp (8), addr_recv (26), addr_from (26), nonce (8)
     offset += 8 + 26 + 26 + 8;
 
-    // Parse user agent
     const { value: userAgentLen, bytesRead } = this.decodeVarInt(payload.subarray(offset));
     offset += bytesRead;
-    const userAgent = payload.subarray(offset, offset + Number(userAgentLen)).toString('utf8');
+    this.peerUserAgent = payload.subarray(offset, offset + Number(userAgentLen)).toString('utf8');
     offset += Number(userAgentLen);
 
     this.peerStartHeight = payload.readInt32LE(offset);
 
-    this.log(`Peer version: ${this.peerVersion}, user agent: ${userAgent}, height: ${this.peerStartHeight}`);
+    this.log(
+      `Peer version: ${this.peerVersion}, user agent: ${this.peerUserAgent}, height: ${this.peerStartHeight}`
+    );
   }
 
   /**
    * Handle ping message
    */
   private handlePing(payload: Buffer): void {
-    // Respond with pong using the same nonce
-    this.sendMessage(MessageType.PONG, payload);
+    try {
+      this.sendMessage(MessageType.PONG, payload);
+    } catch {
+      // connection went away
+    }
   }
 
   /**
-   * Send getheaders message
+   * Send getheaders and return the raw 80-byte headers.
+   *
+   * Responses carry no request id; callers must not issue concurrent
+   * getheaders requests on one connection.
    */
-  async getHeaders(locatorHashes: Buffer[], hashStop?: Buffer): Promise<Buffer[]> {
+  async getHeaders(
+    locatorHashes: Buffer[],
+    hashStop?: Buffer,
+    timeout?: number
+  ): Promise<Buffer[]> {
     const payload = this.buildBlockLocatorPayload(locatorHashes, hashStop);
-    const response = await this.sendAndWait(MessageType.GETHEADERS, payload, MessageType.HEADERS);
-    return this.parseHeadersMessage(response.payload);
+    const response = await this.request(
+      MessageType.GETHEADERS,
+      payload,
+      MessageType.HEADERS,
+      () => true,
+      timeout
+    );
+    return P2PClient.parseHeadersMessage(response.payload);
   }
 
   /**
@@ -671,76 +831,84 @@ export class P2PClient {
     const payload = Buffer.alloc(payloadSize);
     let offset = 0;
 
-    // Version
     payload.writeUInt32LE(PROTOCOL_VERSION, offset);
     offset += 4;
 
-    // Hash count
     hashCount.copy(payload, offset);
     offset += hashCount.length;
 
-    // Hashes
     for (const hash of hashes) {
       hash.copy(payload, offset);
       offset += 32;
     }
 
-    // Hash stop
     if (hashStop) {
       hashStop.copy(payload, offset);
     }
-    // else: already zeroed
 
     return payload;
   }
 
   /**
-   * Parse headers message
+   * Parse a headers message into raw 80-byte headers.
    *
-   * Note: Navio's headers message format differs from Bitcoin's.
-   * Bitcoin includes a varint tx_count (always 0) after each 80-byte header.
-   * Navio sends just the raw 80-byte headers with no tx_count.
+   * navio-core serializes `std::vector<CBlockHeader>` (both for getheaders
+   * responses and announcements): bare 80-byte headers with no trailing
+   * tx-count varint. A Bitcoin-style layout (81 bytes per header, trailing
+   * 0x00) is tolerated for robustness.
    */
-  private parseHeadersMessage(payload: Buffer): Buffer[] {
-    let offset = 0;
-    const { value: count, bytesRead } = this.decodeVarInt(payload);
-    offset += bytesRead;
-
-    this.log(`Parsing ${count} headers from ${payload.length} bytes`);
-
-    const headers: Buffer[] = [];
-    for (let i = 0; i < Number(count); i++) {
-      // Check bounds before reading header
-      if (offset + 80 > payload.length) {
-        this.log(`Headers parse: reached end of payload at header ${i}`);
-        break;
-      }
-
-      // Each header is exactly 80 bytes (no tx count in Navio's format)
-      const header = payload.subarray(offset, offset + 80);
-      headers.push(Buffer.from(header));
-      offset += 80;
+  static parseHeadersMessage(payload: Buffer): Buffer[] {
+    if (payload.length === 0) return [];
+    const { value, bytesRead } = P2PClient.decodeVarIntStatic(payload, 0);
+    const count = Number(value);
+    const body = payload.length - bytesRead;
+    let stride = 80;
+    if (count > 0 && body === count * 81) {
+      stride = 81;
+    } else if (count > 0 && body !== count * 80) {
+      throw new Error(`Malformed headers message: ${count} headers in ${body} bytes`);
     }
-
-    this.log(`Parsed ${headers.length} headers`);
+    const headers: Buffer[] = [];
+    let offset = bytesRead;
+    for (let i = 0; i < count; i++) {
+      headers.push(Buffer.from(payload.subarray(offset, offset + 80)));
+      offset += stride;
+    }
     return headers;
   }
 
   /**
-   * Send getdata message
+   * Parse an inv/notfound/getdata payload
+   */
+  static parseInvPayload(payload: Buffer): InvVector[] {
+    if (payload.length === 0) return [];
+    const { value, bytesRead } = P2PClient.decodeVarIntStatic(payload, 0);
+    const count = Number(value);
+    const out: InvVector[] = [];
+    let offset = bytesRead;
+    for (let i = 0; i < count && offset + 36 <= payload.length; i++) {
+      out.push({
+        type: payload.readUInt32LE(offset),
+        hash: Buffer.from(payload.subarray(offset + 4, offset + 36)),
+      });
+      offset += 36;
+    }
+    return out;
+  }
+
+  /**
+   * Send getdata message (fire and forget)
    */
   async getData(inventory: InvVector[]): Promise<void> {
-    const payload = this.buildInvPayload(inventory);
-    this.sendMessage(MessageType.GETDATA, payload);
+    this.sendMessage(MessageType.GETDATA, this.buildInvPayload(inventory));
   }
 
   /**
    * Build inventory payload for inv/getdata
    */
-  private buildInvPayload(inventory: InvVector[]): Buffer {
+  buildInvPayload(inventory: InvVector[]): Buffer {
     const countVarInt = this.encodeVarInt(inventory.length);
-    const payloadSize = countVarInt.length + inventory.length * 36;
-    const payload = Buffer.alloc(payloadSize);
+    const payload = Buffer.alloc(countVarInt.length + inventory.length * 36);
     let offset = 0;
 
     countVarInt.copy(payload, offset);
@@ -757,34 +925,112 @@ export class P2PClient {
   }
 
   /**
-   * Request a block by hash
+   * Hash of a block message payload (double SHA256 of its 80-byte header),
+   * internal byte order.
    */
-  async getBlock(blockHash: Buffer): Promise<P2PMessage> {
-    const inventory: InvVector[] = [{ type: InvType.MSG_WITNESS_BLOCK, hash: blockHash }];
-    const getDataPayload = this.buildInvPayload(inventory);
-
-    // Send getdata and wait for block
-    return this.sendAndWait(MessageType.GETDATA, getDataPayload, MessageType.BLOCK);
+  static blockPayloadHash(payload: Buffer): Buffer {
+    return hash256(payload.subarray(0, 80));
   }
 
   /**
-   * Request transaction outputs by output hash (Navio-specific)
+   * Request a block by hash (internal byte order). Resolves with the block
+   * message whose header hashes to `blockHash`; rejects on `notfound`.
    */
-  async getOutputData(outputHashes: Buffer[]): Promise<P2PMessage> {
-    const countVarInt = this.encodeVarInt(outputHashes.length);
-    const payloadSize = countVarInt.length + outputHashes.length * 32;
-    const payload = Buffer.alloc(payloadSize);
-    let offset = 0;
-
-    countVarInt.copy(payload, offset);
-    offset += countVarInt.length;
-
-    for (const hash of outputHashes) {
-      hash.copy(payload, offset);
-      offset += 32;
+  async getBlock(blockHash: Buffer, timeout?: number): Promise<P2PMessage> {
+    const payload = this.buildInvPayload([{ type: InvType.MSG_WITNESS_BLOCK, hash: blockHash }]);
+    const response = await this.request(
+      MessageType.GETDATA,
+      payload,
+      [MessageType.BLOCK, MessageType.NOTFOUND],
+      msg => {
+        if (msg.command === MessageType.BLOCK) {
+          return (
+            msg.payload.length >= 80 && P2PClient.blockPayloadHash(msg.payload).equals(blockHash)
+          );
+        }
+        return P2PClient.parseInvPayload(msg.payload).some(inv => inv.hash.equals(blockHash));
+      },
+      timeout
+    );
+    if (response.command === MessageType.NOTFOUND) {
+      throw new Error(`Block not found: ${P2PClient.hashToDisplay(blockHash)}`);
     }
+    return response;
+  }
 
-    return this.sendAndWait(MessageType.GETOUTPUTDATA, payload, MessageType.TX);
+  /**
+   * Request a transaction by txid (internal byte order). `matches` decides
+   * whether a received `tx`/`dtx` payload is the requested transaction.
+   * Resolves with the raw transaction bytes; rejects on `notfound`.
+   */
+  async getTransaction(
+    txHash: Buffer,
+    matches: (txPayload: Buffer) => boolean,
+    timeout?: number
+  ): Promise<Buffer> {
+    const payload = this.buildInvPayload([{ type: InvType.MSG_WITNESS_TX, hash: txHash }]);
+    const response = await this.request(
+      MessageType.GETDATA,
+      payload,
+      [MessageType.TX, MessageType.DTX, MessageType.NOTFOUND],
+      msg => {
+        if (msg.command === MessageType.NOTFOUND) {
+          return P2PClient.parseInvPayload(msg.payload).some(inv => inv.hash.equals(txHash));
+        }
+        return matches(msg.payload);
+      },
+      timeout
+    );
+    if (response.command === MessageType.NOTFOUND) {
+      throw new Error(`Transaction not found: ${P2PClient.hashToDisplay(txHash)}`);
+    }
+    return response.payload;
+  }
+
+  /**
+   * Request the transaction containing an output, by output hash (internal
+   * byte order). `matches` decides whether a received `tx`/`dtx` payload
+   * contains the output. Resolves with the raw transaction bytes; rejects on
+   * `notfound`.
+   *
+   * Sent as `getdata` with `MSG_WITNESS_TX`: navio-core falls back to an
+   * output-hash lookup for that inventory type (net_processing.cpp,
+   * ProcessGetData -> FindTxByOutputHash). The dedicated `getoutputdata`
+   * message cannot be used: its name is 13 characters, one more than the
+   * 12-byte command field, so nodes receive `getoutputdat` and ignore it as
+   * an unknown command.
+   *
+   * The node only answers for outputs in its mempool or most recent block.
+   */
+  async getOutputData(
+    outputHash: Buffer,
+    matches: (txPayload: Buffer) => boolean,
+    timeout?: number
+  ): Promise<Buffer> {
+    const payload = this.buildInvPayload([{ type: InvType.MSG_WITNESS_TX, hash: outputHash }]);
+    const response = await this.request(
+      MessageType.GETDATA,
+      payload,
+      [MessageType.TX, MessageType.DTX, MessageType.NOTFOUND],
+      msg => {
+        if (msg.command === MessageType.NOTFOUND) {
+          return P2PClient.parseInvPayload(msg.payload).some(inv => inv.hash.equals(outputHash));
+        }
+        return matches(msg.payload);
+      },
+      timeout
+    );
+    if (response.command === MessageType.NOTFOUND) {
+      throw new Error(`Output not found: ${P2PClient.hashToDisplay(outputHash)}`);
+    }
+    return response.payload;
+  }
+
+  /**
+   * Push a transaction to the peer (unsolicited `tx`, accepted by navio-core)
+   */
+  sendTransaction(rawTx: Buffer): void {
+    this.sendMessage(MessageType.TX, rawTx);
   }
 
   /**
@@ -830,16 +1076,20 @@ export class P2PClient {
    * Decode a variable-length integer
    */
   decodeVarInt(buffer: Buffer): { value: bigint; bytesRead: number } {
-    const first = buffer.readUInt8(0);
+    return P2PClient.decodeVarIntStatic(buffer, 0);
+  }
+
+  static decodeVarIntStatic(buffer: Buffer, offset: number): { value: bigint; bytesRead: number } {
+    const first = buffer.readUInt8(offset);
 
     if (first < 0xfd) {
       return { value: BigInt(first), bytesRead: 1 };
     } else if (first === 0xfd) {
-      return { value: BigInt(buffer.readUInt16LE(1)), bytesRead: 3 };
+      return { value: BigInt(buffer.readUInt16LE(offset + 1)), bytesRead: 3 };
     } else if (first === 0xfe) {
-      return { value: BigInt(buffer.readUInt32LE(1)), bytesRead: 5 };
+      return { value: BigInt(buffer.readUInt32LE(offset + 1)), bytesRead: 5 };
     } else {
-      return { value: buffer.readBigUInt64LE(1), bytesRead: 9 };
+      return { value: buffer.readBigUInt64LE(offset + 1), bytesRead: 9 };
     }
   }
 
@@ -864,4 +1114,3 @@ export class P2PClient {
     return Buffer.from(hash).reverse().toString('hex');
   }
 }
-

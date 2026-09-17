@@ -836,11 +836,16 @@ export class KeyManager {
    */
   getSubAddressBech32m(
     id: SubAddressIdentifier = { account: 0, address: 0 },
-    network: 'mainnet' | 'testnet' = 'mainnet'
+    network: 'mainnet' | 'testnet' | 'signet' | 'regtest' = 'mainnet'
   ): string {
     // Set the chain/network for proper HRP (Human Readable Part) encoding
-    const chain = network === 'mainnet' ? BlsctChain.Mainnet : BlsctChain.Testnet;
-    setChain(chain);
+    const chainMap = {
+      mainnet: BlsctChain.Mainnet,
+      testnet: BlsctChain.Testnet,
+      signet: BlsctChain.Signet,
+      regtest: BlsctChain.Regtest,
+    } as const;
+    setChain(chainMap[network] ?? BlsctChain.Mainnet);
 
     // Get the sub-address
     const subAddress = this.getSubAddress(id);

@@ -36,6 +36,7 @@ export * from './trading.types';
 export * from './sync-provider';
 export * from './electrum-sync';
 export * from './p2p-protocol';
+export * from './p2p-block-parser';
 export * from './p2p-sync';
 
 // Re-export BlsctChain from navio-blsct for convenience

@@ -1,18 +1,31 @@
 /**
  * P2P Sync Provider
  *
- * Implements the SyncProvider interface using direct P2P connections
- * to Navio full nodes. Parses blocks using navio-blsct for transaction
- * key extraction.
+ * Implements the SyncProvider interface using a direct P2P connection to a
+ * Navio full node: headers via getheaders, blocks via getdata, BLSCT output
+ * keys parsed locally from block data, broadcasts via an unsolicited `tx`
+ * message, and outputs/transactions via getdata.
  */
 
-import { sha256 } from '@noble/hashes/sha256';
-import { BaseSyncProvider, BlockHeadersResult, ChainTip, SyncProviderOptions } from './sync-provider';
-import { P2PClient, P2PMessage, InvType, MessageType } from './p2p-protocol';
+import {
+  BaseSyncProvider,
+  BlockHeaderCallback,
+  BlockHeaderNotification,
+  BlockHeadersResult,
+  ChainTip,
+  SyncProviderOptions,
+} from './sync-provider';
+import {
+  DefaultPorts,
+  InvType,
+  MAX_HEADERS_RESULTS,
+  MessageType,
+  P2PClient,
+  P2PMessage,
+  P2PNetwork,
+} from './p2p-protocol';
+import { parseBlock, parseTransaction, ParsedBlock, ParsedTransaction } from './p2p-block-parser';
 import type { BlockTransactionKeys, TransactionKeys } from './electrum';
-
-// Import navio-blsct for transaction parsing (will be used for full implementation)
-// const blsctModule = require('@nav-io/navio-blsct');
 
 /**
  * P2P sync provider options
@@ -22,32 +35,22 @@ export interface P2PSyncOptions extends SyncProviderOptions {
   host: string;
   /** Port (default based on network) */
   port?: number;
-  /** Network type */
-  network?: 'mainnet' | 'testnet' | 'regtest';
+  /** Network type (default: mainnet) */
+  network?: P2PNetwork;
   /** User agent string */
   userAgent?: string;
-  /** Maximum blocks to fetch per request */
+  /** Maximum blocks returned per getBlockTransactionKeysRange call (default 16) */
   maxBlocksPerRequest?: number;
-  /** Maximum headers to fetch per request */
+  /** Maximum headers to fetch per getheaders request (default 2000, the node's limit) */
   maxHeadersPerRequest?: number;
-}
-
-/**
- * Parsed transaction output keys
- */
-interface ParsedOutputKeys {
-  /** Output hash */
-  outputHash: string;
-  /** Blinding key (G1 point, 48 bytes hex) */
-  blindingKey: string;
-  /** Spending key (G1 point, 48 bytes hex) */
-  spendingKey: string;
-  /** Ephemeral key (G1 point, 48 bytes hex) */
-  ephemeralKey: string;
-  /** View tag (16-bit) */
-  viewTag: number;
-  /** Has range proof */
-  hasRangeProof: boolean;
+  /** Maximum concurrent block downloads (default 8) */
+  maxConcurrentBlockRequests?: number;
+  /**
+   * Number of txid -> block height entries remembered from scanned blocks so
+   * getRawTransaction can serve confirmed transactions the node no longer
+   * offers over getdata (default 100000).
+   */
+  txLocationCacheSize?: number;
 }
 
 /**
@@ -60,12 +63,14 @@ interface CachedHeader {
   prevHash: string;
 }
 
+const ZERO_HASH = '0'.repeat(64);
+
 /**
  * P2P Sync Provider
  *
  * Connects directly to a Navio full node via P2P protocol.
  * Fetches blocks and extracts transaction keys for wallet scanning.
- * 
+ *
  * @category Sync
  */
 export class P2PSyncProvider extends BaseSyncProvider {
@@ -74,19 +79,21 @@ export class P2PSyncProvider extends BaseSyncProvider {
   private client: P2PClient;
   private options: Required<P2PSyncOptions>;
 
-  // Header chain state
+  // Header chain state: headersByHeight is contiguous from 1 (genesis is
+  // fetched lazily as a block, since getheaders never returns it).
   private headersByHash: Map<string, CachedHeader> = new Map();
   private headersByHeight: Map<number, CachedHeader> = new Map();
   private chainTipHeight: number = -1;
-  private lastTipRefreshMs = 0;
-  /** Minimum interval between peer round-trips triggered by getChainTipHeight. */
-  private static readonly TIP_REFRESH_INTERVAL_MS = 5000;
   private chainTipHash: string = '';
   private genesisHash: string = '';
+  /** Set when the node announces a block we have no header for. */
+  private tipDirty = false;
+  /** Serializes getheaders round-trips (responses carry no request id). */
+  private headerSyncInFlight: Promise<void> | null = null;
 
-  // Block cache (limited size)
-  private blockCache: Map<string, Buffer> = new Map();
-  private maxBlockCacheSize = 10;
+  // Parsed block cache (bounded)
+  private blockCache: Map<string, ParsedBlock> = new Map();
+  private maxBlockCacheSize = 32;
 
   // Serialized-output cache, keyed by display-hex output hash. Populated
   // while parsing blocks so wallet amount recovery can read outputs we have
@@ -95,24 +102,43 @@ export class P2PSyncProvider extends BaseSyncProvider {
   private outputDataCache: Map<string, string> = new Map();
   private maxOutputDataCacheSize = 50000;
 
-  // Pending block requests
-  private pendingBlocks: Map<string, Promise<Buffer>> = new Map();
+  // txid -> block height for scanned blocks (bounded), for getRawTransaction
+  private txLocations: Map<string, number> = new Map();
+
+  // Pending block requests (dedupe concurrent fetches of one hash)
+  private pendingBlocks: Map<string, Promise<ParsedBlock>> = new Map();
+  private activeBlockRequests = 0;
+  private blockRequestQueue: Array<() => void> = [];
+
+  // Block header subscriptions
+  private blockHeaderCallbacks: BlockHeaderCallback[] = [];
+  private inboundBlockHashes: Set<string> = new Set();
 
   constructor(options: P2PSyncOptions) {
     super(options);
 
+    const network = options.network ?? 'mainnet';
     this.options = {
       host: options.host,
-      port: options.port ?? 33570,
-      network: options.network ?? 'testnet',
+      port: options.port ?? DefaultPorts[network.toUpperCase() as keyof typeof DefaultPorts],
+      network,
       timeout: options.timeout ?? 30000,
       debug: options.debug ?? false,
       userAgent: options.userAgent ?? '/navio-sdk:0.1.0/',
       maxBlocksPerRequest: options.maxBlocksPerRequest ?? 16,
-      maxHeadersPerRequest: options.maxHeadersPerRequest ?? 2000,
+      maxHeadersPerRequest: Math.min(
+        options.maxHeadersPerRequest ?? MAX_HEADERS_RESULTS,
+        MAX_HEADERS_RESULTS
+      ),
+      maxConcurrentBlockRequests: options.maxConcurrentBlockRequests ?? 8,
+      txLocationCacheSize: options.txLocationCacheSize ?? 100000,
     };
 
-    this.client = new P2PClient({
+    this.client = this.createClient();
+  }
+
+  private createClient(): P2PClient {
+    const client = new P2PClient({
       host: this.options.host,
       port: this.options.port,
       network: this.options.network,
@@ -120,31 +146,34 @@ export class P2PSyncProvider extends BaseSyncProvider {
       debug: this.options.debug,
       userAgent: this.options.userAgent,
     });
+    client.onMessage(MessageType.INV, msg => this.handleInvMessage(msg));
+    client.onClose(() => {
+      this.log('Connection closed');
+    });
+    return client;
   }
 
   /**
-   * Connect to the P2P node
+   * Get the underlying P2P client
+   */
+  getClient(): P2PClient {
+    return this.client;
+  }
+
+  /**
+   * Connect to the P2P node and sync headers to the tip
    */
   async connect(): Promise<void> {
-    await this.client.connect();
-    this.log('Connected to P2P node');
-
-    // Request headers-first announcements
-    this.client.sendSendHeaders();
-
-    // Get initial chain state
-    this.chainTipHeight = this.client.getPeerStartHeight();
-    this.log(`Peer reports height: ${this.chainTipHeight}`);
-
-    // Register block handler
-    this.client.onMessage(MessageType.BLOCK, (msg) => {
-      this.handleBlockMessage(msg);
-    });
-
-    // Sync headers to get chain tip
-    if (this.chainTipHeight > 0) {
-      await this.syncHeaders(0, Math.min(100, this.chainTipHeight));
+    if (this.client.isConnected()) {
+      return;
     }
+    // A closed P2PClient keeps its socket state; start fresh on reconnect.
+    this.client = this.createClient();
+    await this.client.connect();
+    this.log(`Connected to P2P node (peer height ${this.client.getPeerStartHeight()})`);
+
+    await this.syncHeaders();
+    this.log(`Headers synced to ${this.chainTipHeight}`);
   }
 
   /**
@@ -152,11 +181,10 @@ export class P2PSyncProvider extends BaseSyncProvider {
    */
   disconnect(): void {
     this.client.disconnect();
-    this.headersByHash.clear();
-    this.headersByHeight.clear();
-    this.blockCache.clear();
-    this.outputDataCache.clear();
-    this.chainTipHeight = -1;
+    this.pendingBlocks.clear();
+    this.blockRequestQueue = [];
+    this.activeBlockRequests = 0;
+    this.headerSyncInFlight = null;
   }
 
   /**
@@ -166,34 +194,36 @@ export class P2PSyncProvider extends BaseSyncProvider {
     return this.client.isConnected();
   }
 
+  // ============================================================================
+  // Chain tip / headers
+  // ============================================================================
+
   /**
-   * Get current chain tip height
+   * Get current chain tip height.
    *
-   * The cached tip only advances when headers are synced, and unsolicited
-   * block/header announcements are not processed, so a long-lived provider
-   * would otherwise report the tip from connect time forever. Refresh from
-   * the peer (rate-limited) so polling callers (isSyncNeeded, background
-   * sync) observe blocks mined after the connection was established.
+   * Always refreshes from the peer (one getheaders round-trip; the reply is
+   * empty when nothing changed), like the Electrum provider does, so callers
+   * that fix a sync range from this value never race a block the node has
+   * connected but not yet announced to us.
    */
   async getChainTipHeight(): Promise<number> {
-    // No headers synced yet (connect() seeds chainTipHeight from the
-    // handshake before any header round-trip): report the peer's height
-    // without triggering a refresh.
-    if (this.chainTipHeight < 0 || this.headersByHeight.size === 0) {
-      return this.chainTipHeight < 0 ? this.client.getPeerStartHeight() : this.chainTipHeight;
-    }
-
-    const now = Date.now();
-    if (now - this.lastTipRefreshMs >= P2PSyncProvider.TIP_REFRESH_INTERVAL_MS) {
-      this.lastTipRefreshMs = now;
-      try {
-        await this.syncHeaders(this.chainTipHeight + 1, this.options.maxHeadersPerRequest);
-      } catch (err: any) {
-        // Keep serving the cached tip; the next poll retries.
-        this.log(`Tip refresh failed: ${err?.message ?? err}`);
+    if (!this.client.isConnected()) {
+      if (this.chainTipHeight < 0) {
+        throw new Error('Not connected');
       }
+      // Serve the last known tip while disconnected; block/header fetches
+      // fail with "Not connected", which makes TransactionKeysSync reconnect.
+      return this.chainTipHeight;
     }
-
+    try {
+      await this.syncHeaders();
+    } catch (err: any) {
+      if (this.chainTipHeight < 0) {
+        throw err;
+      }
+      // Keep serving the cached tip; the next poll retries.
+      this.log(`Tip refresh failed: ${err?.message ?? err}`);
+    }
     return this.chainTipHeight;
   }
 
@@ -201,48 +231,34 @@ export class P2PSyncProvider extends BaseSyncProvider {
    * Get current chain tip
    */
   async getChainTip(): Promise<ChainTip> {
-    return {
-      height: this.chainTipHeight,
-      hash: this.chainTipHash,
-    };
+    const height = await this.getChainTipHeight();
+    return { height, hash: this.chainTipHash };
   }
 
   /**
-   * Get a single block header
+   * Get a single block header (80 bytes hex)
    */
   async getBlockHeader(height: number): Promise<string> {
-    // Check cache
+    if (height < 0) {
+      throw new Error(`Invalid block height: ${height}`);
+    }
     const cached = this.headersByHeight.get(height);
     if (cached) {
       return cached.rawHex;
     }
 
-    // getheaders never returns the genesis block itself, so serve height 0
-    // by fetching the genesis block (hash learned from block 1's prevHash)
-    // and slicing its 80-byte header. Deep reorg checks probe down to
-    // height 0 on short chains (e.g. regtest).
-    if (height === 0 && this.genesisHash) {
-      const blockData = await this.fetchBlock(this.genesisHash);
-      const rawHex = blockData.subarray(0, 80).toString('hex');
-      const header: CachedHeader = {
-        height: 0,
-        hash: this.genesisHash,
-        rawHex,
-        prevHash: '0'.repeat(64),
-      };
-      this.headersByHash.set(this.genesisHash, header);
-      this.headersByHeight.set(0, header);
-      return rawHex;
+    if (height === 0) {
+      return (await this.getGenesisHeader()).rawHex;
     }
 
-    // Need to fetch headers up to this height
-    await this.syncHeaders(height, 1);
+    if (height > this.chainTipHeight) {
+      await this.syncHeaders();
+    }
 
     const header = this.headersByHeight.get(height);
     if (!header) {
-      throw new Error(`Failed to fetch header at height ${height}`);
+      throw new Error(`Block height ${height} is beyond the chain tip (${this.chainTipHeight})`);
     }
-
     return header.rawHex;
   }
 
@@ -250,17 +266,21 @@ export class P2PSyncProvider extends BaseSyncProvider {
    * Get multiple block headers
    */
   async getBlockHeaders(startHeight: number, count: number): Promise<BlockHeadersResult> {
-    // Ensure we have headers cached
-    await this.syncHeaders(startHeight, count);
+    if (startHeight + count - 1 > this.chainTipHeight) {
+      await this.syncHeaders();
+    }
 
     const headers: string[] = [];
     for (let h = startHeight; h < startHeight + count; h++) {
+      if (h === 0) {
+        headers.push((await this.getGenesisHeader()).rawHex);
+        continue;
+      }
       const cached = this.headersByHeight.get(h);
-      if (cached) {
-        headers.push(cached.rawHex);
-      } else {
+      if (!cached) {
         break;
       }
+      headers.push(cached.rawHex);
     }
 
     return {
@@ -271,131 +291,260 @@ export class P2PSyncProvider extends BaseSyncProvider {
   }
 
   /**
-   * Sync headers from the network
+   * getheaders never returns the genesis block itself, so serve height 0 by
+   * fetching the genesis block (hash learned from block 1's prevHash).
    */
-  private async syncHeaders(fromHeight: number, count: number): Promise<void> {
-    // Build locator from known headers
-    const locatorHashes: Buffer[] = [];
-
-    // Start from just before the requested height
-    let step = 1;
-    let height = fromHeight > 0 ? fromHeight - 1 : 0;
-
-    while (height >= 0) {
-      const header = this.headersByHeight.get(height);
-      if (header) {
-        locatorHashes.push(P2PClient.hashFromDisplay(header.hash));
+  private async getGenesisHeader(): Promise<CachedHeader> {
+    const cached = this.headersByHeight.get(0);
+    if (cached) return cached;
+    if (!this.genesisHash) {
+      await this.syncHeaders();
+      if (!this.genesisHash) {
+        throw new Error('Genesis hash unknown: the node returned no headers');
       }
-      if (height === 0) break;
-      height -= step;
-      if (locatorHashes.length > 10) step *= 2;
     }
+    const block = await this.fetchBlock(this.genesisHash);
+    const header: CachedHeader = {
+      height: 0,
+      hash: this.genesisHash,
+      rawHex: block.headerHex,
+      prevHash: ZERO_HASH,
+    };
+    this.headersByHash.set(this.genesisHash, header);
+    this.headersByHeight.set(0, header);
+    return header;
+  }
 
-    // Always include genesis if we have it
-    if (this.genesisHash && locatorHashes.length === 0) {
-      locatorHashes.push(P2PClient.hashFromDisplay(this.genesisHash));
+  /**
+   * Sync headers from our tip to the node's tip (handles reorgs by
+   * truncating to the fork point). Concurrent calls share one round-trip.
+   */
+  private syncHeaders(): Promise<void> {
+    if (this.headerSyncInFlight) {
+      return this.headerSyncInFlight;
     }
+    const run = this.syncHeadersInner().finally(() => {
+      this.headerSyncInFlight = null;
+    });
+    this.headerSyncInFlight = run;
+    return run;
+  }
 
-    // If no locators, start from genesis
-    if (locatorHashes.length === 0) {
-      locatorHashes.push(Buffer.alloc(32)); // Zero hash = start from genesis
+  private async syncHeadersInner(): Promise<void> {
+    this.tipDirty = false;
+
+    for (let round = 0; ; round++) {
+      const locator = this.buildLocator();
+      const rawHeaders = await this.client.getHeaders(locator);
+      this.log(`Received ${rawHeaders.length} headers (round ${round})`);
+
+      const accepted = this.processHeaders(rawHeaders);
+      if (accepted.length > 0) {
+        this.notifyBlockHeaderSubscribers(accepted);
+      }
+
+      // Fewer than a full batch means we reached the node's tip.
+      if (rawHeaders.length < MAX_HEADERS_RESULTS || accepted.length === 0) {
+        break;
+      }
+      if (round > 100000) {
+        throw new Error('Header sync did not converge');
+      }
     }
+  }
 
-    // Request headers
-    const rawHeaders = await this.client.getHeaders(locatorHashes);
-    this.log(`Received ${rawHeaders.length} headers`);
+  /**
+   * Block locator: dense near the tip, exponentially sparser below, genesis last
+   */
+  private buildLocator(): Buffer[] {
+    const hashes: Buffer[] = [];
+    if (this.chainTipHeight >= 1) {
+      let step = 1;
+      let height = this.chainTipHeight;
+      while (height >= 1) {
+        const header = this.headersByHeight.get(height);
+        if (header) {
+          hashes.push(P2PClient.hashFromDisplay(header.hash));
+        }
+        if (hashes.length >= 10) step *= 2;
+        height -= step;
+      }
+    }
+    if (this.genesisHash) {
+      hashes.push(P2PClient.hashFromDisplay(this.genesisHash));
+    }
+    if (hashes.length === 0) {
+      // Unknown hash: the node answers from block 1
+      hashes.push(Buffer.alloc(32));
+    }
+    return hashes;
+  }
 
-    // Process headers - they arrive in order after the locator
-    // For initial sync from genesis, first header is block 0
-
-    // First pass: Find any headers we can chain from known blocks
-    const pendingHeaders: Array<{ rawHeader: Buffer; hash: string; prevHash: string; headerHex: string }> = [];
+  /**
+   * Chain received headers onto our cache. Returns the accepted headers in
+   * height order.
+   */
+  private processHeaders(rawHeaders: Buffer[]): CachedHeader[] {
+    const accepted: CachedHeader[] = [];
+    let expectedPrev: string | null = null;
+    let nextHeight = -1;
 
     for (const rawHeader of rawHeaders) {
       const headerHex = rawHeader.toString('hex');
       const hash = this.extractBlockHash(headerHex);
-      // Block header: version(4) + prevBlockHash(32) + merkleRoot(32) + timestamp(4) + bits(4) + nonce(4) = 80 bytes
-      // prevBlockHash is at offset 4, length 32 (bytes 4-35 inclusive)
-      // subarray(4, 36) gives bytes at indices 4,5,...,35 (32 bytes total)
-      const prevHashBytes = rawHeader.subarray(4, 36);
-      // Reverse for display format (little-endian to big-endian)
-      const prevHash = Buffer.from(prevHashBytes).reverse().toString('hex');
+      const prevHash = Buffer.from(rawHeader.subarray(4, 36)).reverse().toString('hex');
 
-      pendingHeaders.push({ rawHeader, hash, prevHash, headerHex });
-    }
-
-    // Process headers - they come in chain order from getheaders
-    // Headers are returned in order: each header's prevHash points to the previous header in the response
-    for (let i = 0; i < pendingHeaders.length; i++) {
-      const { hash, prevHash, headerHex } = pendingHeaders[i];
-
-      let headerHeight: number;
-
-      if (prevHash === '0'.repeat(64)) {
-        // Genesis block (prevHash is all zeros)
-        headerHeight = 0;
-        this.genesisHash = hash;
-      } else if (this.headersByHash.has(prevHash)) {
-        // We have the parent in our cache, chain from it
-        const prevHeader = this.headersByHash.get(prevHash)!;
-        headerHeight = prevHeader.height + 1;
-      } else if (i === 0 && this.headersByHeight.size === 0) {
-        // First header of the initial sync. getheaders never returns the
-        // genesis block itself — the response starts at block 1, whose
-        // prevHash IS the genesis hash. Labeling this header height 0 would
-        // shift every block (and every scanned wallet output) off by one.
-        this.log(`Initial sync: first header is block 1 (genesis = ${prevHash.substring(0, 16)}...)`);
-        headerHeight = 1;
-        this.genesisHash = prevHash;
-      } else if (i > 0) {
-        // Chain from the previous header in THIS batch
-        // Since getheaders returns headers in chain order, header[i].prevHash should equal header[i-1].hash
-        const prevInBatch = pendingHeaders[i - 1];
-        if (prevInBatch.hash === prevHash) {
-          const prevCached = this.headersByHash.get(prevInBatch.hash);
-          if (prevCached) {
-            headerHeight = prevCached.height + 1;
-          } else {
-            this.log(`Previous header in batch not yet cached: ${prevInBatch.hash.substring(0, 16)}...`);
-            continue;
-          }
-        } else {
-          // Skip verbose logging after first few
-          if (i < 5) {
-            this.log(`Header ${hash.substring(0, 16)}... doesn't chain from previous in batch`);
-          }
-          continue;
-        }
-      } else {
-        this.log(`Cannot determine height for header ${hash.substring(0, 16)}...`);
+      if (this.headersByHash.has(hash)) {
+        // Already known (node re-sent from the fork point)
+        const known = this.headersByHash.get(hash)!;
+        expectedPrev = hash;
+        nextHeight = known.height + 1;
         continue;
       }
 
-      const cached: CachedHeader = {
-        height: headerHeight,
-        hash,
-        rawHex: headerHex,
-        prevHash,
-      };
+      if (expectedPrev === null) {
+        // First new header of the batch: chain onto a known ancestor
+        const parent = this.headersByHash.get(prevHash);
+        if (parent) {
+          nextHeight = parent.height + 1;
+        } else if (
+          this.headersByHeight.size === 0 ||
+          prevHash === this.genesisHash ||
+          !this.genesisHash
+        ) {
+          // The node's response starts at block 1, whose prevHash is the
+          // genesis hash (getheaders never returns genesis itself).
+          nextHeight = 1;
+          this.genesisHash = prevHash;
+        } else {
+          this.log(
+            `Header ${hash.substring(0, 16)}... does not connect to a known block; ignoring batch`
+          );
+          break;
+        }
+        // Reorg: drop everything at/after the attach height
+        if (nextHeight <= this.chainTipHeight) {
+          this.log(
+            `Reorg: replacing headers from height ${nextHeight} (tip was ${this.chainTipHeight})`
+          );
+          this.truncateHeaders(nextHeight);
+        }
+      } else if (prevHash !== expectedPrev) {
+        this.log(`Header ${hash.substring(0, 16)}... breaks the chain in this batch; stopping`);
+        break;
+      }
 
+      const cached: CachedHeader = { height: nextHeight, hash, rawHex: headerHex, prevHash };
       this.headersByHash.set(hash, cached);
-      this.headersByHeight.set(headerHeight, cached);
+      this.headersByHeight.set(nextHeight, cached);
+      this.chainTipHeight = nextHeight;
+      this.chainTipHash = hash;
+      accepted.push(cached);
 
-      // Update chain tip
-      if (headerHeight > this.chainTipHeight) {
-        this.chainTipHeight = headerHeight;
-        this.chainTipHash = hash;
+      expectedPrev = hash;
+      nextHeight += 1;
+    }
+
+    return accepted;
+  }
+
+  private truncateHeaders(fromHeight: number): void {
+    for (let h = fromHeight; h <= this.chainTipHeight; h++) {
+      const header = this.headersByHeight.get(h);
+      if (header) {
+        this.headersByHash.delete(header.hash);
+        this.headersByHeight.delete(h);
       }
     }
+    this.chainTipHeight = fromHeight - 1;
+    const tip = this.headersByHeight.get(this.chainTipHeight);
+    this.chainTipHash = tip ? tip.hash : this.chainTipHeight === 0 ? this.genesisHash : '';
+  }
 
-    this.log(`Processed headers. Chain tip: height=${this.chainTipHeight}, cached=${this.headersByHeight.size} headers`);
-
-    // Continue syncing if we got max headers and need more
-    if (rawHeaders.length >= this.options.maxHeadersPerRequest - 1 && this.chainTipHeight < this.client.getPeerStartHeight()) {
-      // Request more headers from where we left off
-      await this.syncHeaders(this.chainTipHeight, count);
+  /**
+   * Node announced inventory. Block announcements mark the tip dirty and,
+   * when subscribers exist, trigger an immediate header refresh.
+   */
+  private handleInvMessage(msg: P2PMessage): void {
+    let invs;
+    try {
+      invs = P2PClient.parseInvPayload(msg.payload);
+    } catch {
+      return;
+    }
+    let sawBlock = false;
+    for (const inv of invs) {
+      if ((inv.type & ~InvType.MSG_WITNESS_FLAG) === InvType.MSG_BLOCK) {
+        const hash = P2PClient.hashToDisplay(inv.hash);
+        if (!this.headersByHash.has(hash)) {
+          sawBlock = true;
+          this.inboundBlockHashes.add(hash);
+        }
+      }
+    }
+    if (sawBlock) {
+      this.tipDirty = true;
+      if (this.blockHeaderCallbacks.length > 0) {
+        this.syncHeaders().catch(err =>
+          this.log(`Header refresh after inv failed: ${err?.message ?? err}`)
+        );
+      }
     }
   }
+
+  // ============================================================================
+  // Block header subscriptions (inv-driven)
+  // ============================================================================
+
+  /**
+   * Subscribe to new block headers. Announcements arrive as `inv` messages
+   * from the node and trigger a header refresh; each newly accepted header
+   * is delivered to the callback.
+   */
+  async subscribeBlockHeaders(callback: BlockHeaderCallback): Promise<BlockHeaderNotification> {
+    this.blockHeaderCallbacks.push(callback);
+    const height = await this.getChainTipHeight();
+    const hex = height >= 0 ? await this.getBlockHeader(height) : '';
+    return { height, hex };
+  }
+
+  unsubscribeBlockHeaders(callback: BlockHeaderCallback): boolean {
+    const idx = this.blockHeaderCallbacks.indexOf(callback);
+    if (idx < 0) return false;
+    this.blockHeaderCallbacks.splice(idx, 1);
+    return true;
+  }
+
+  unsubscribeAllBlockHeaders(): void {
+    this.blockHeaderCallbacks = [];
+  }
+
+  hasBlockHeaderSubscriptions(): boolean {
+    return this.blockHeaderCallbacks.length > 0;
+  }
+
+  private notifyBlockHeaderSubscribers(headers: CachedHeader[]): void {
+    if (this.blockHeaderCallbacks.length === 0) return;
+    for (const header of headers) {
+      this.inboundBlockHashes.delete(header.hash);
+      for (const cb of this.blockHeaderCallbacks) {
+        try {
+          const result: unknown = cb({ height: header.height, hex: header.rawHex });
+          if (result && typeof (result as Promise<void>).catch === 'function') {
+            (result as Promise<void>).catch(err =>
+              this.log(`Block header callback failed: ${err}`)
+            );
+          }
+        } catch (err) {
+          this.log(`Block header callback threw: ${err}`);
+        }
+      }
+    }
+  }
+
+  // ============================================================================
+  // Blocks / transaction keys
+  // ============================================================================
 
   /**
    * Get transaction keys for a range of blocks
@@ -404,726 +553,369 @@ export class P2PSyncProvider extends BaseSyncProvider {
     blocks: BlockTransactionKeys[];
     nextHeight: number;
   }> {
-    const blocks: BlockTransactionKeys[] = [];
     const maxBlocks = this.options.maxBlocksPerRequest;
-
-    // Calculate end height for this batch
-    const batchEndHeight = Math.min(startHeight + maxBlocks - 1, this.chainTipHeight);
-
-    // Try to ensure we have headers up to the batch end height
-    // This may fail if we're at the chain tip, which is OK
-    try {
-      await this.ensureHeadersSyncedTo(batchEndHeight);
-    } catch (e) {
-      this.log(`Could not sync headers to ${batchEndHeight}: ${e}`);
-      // Continue with what we have
+    const wantEnd = startHeight + maxBlocks - 1;
+    if (startHeight > this.chainTipHeight || this.tipDirty) {
+      await this.syncHeaders();
     }
 
-    // Find the highest header we actually have
-    let highestCached = 0;
-    for (const h of this.headersByHeight.keys()) {
-      if (h > highestCached) highestCached = h;
+    const endHeight = Math.min(wantEnd, this.chainTipHeight);
+    if (startHeight > endHeight) {
+      return { blocks: [], nextHeight: startHeight };
     }
 
-    // Don't try to sync past what we have headers for
-    const effectiveTip = Math.min(this.chainTipHeight, highestCached);
+    const heights: number[] = [];
+    for (let h = startHeight; h <= endHeight; h++) heights.push(h);
 
-    // If start height is beyond what we can sync, return empty
-    if (startHeight > effectiveTip) {
-      return {
-        blocks: [],
-        nextHeight: startHeight,
-      };
-    }
+    // Download concurrently (bounded by maxConcurrentBlockRequests inside
+    // fetchBlock); keep results in height order.
+    const parsed = await Promise.all(heights.map(h => this.fetchBlockAtHeight(h)));
 
-    for (let height = startHeight; height < startHeight + maxBlocks && height <= effectiveTip; height++) {
-      try {
-        const txKeys = await this.getBlockTransactionKeys(height);
-        blocks.push({
-          height,
-          txKeys,
-        });
-      } catch (e) {
-        this.log(`Error getting tx keys for block ${height}: ${e}`);
-        // Stop on error - don't skip blocks
-        break;
-      }
-    }
+    const blocks: BlockTransactionKeys[] = parsed.map((block, i) => ({
+      height: heights[i],
+      txKeys: this.extractTransactionKeys(block),
+      timestamp: block.timestamp,
+      isPoS: block.isPoS,
+    }));
 
-    const lastHeight = blocks.length > 0 ? blocks[blocks.length - 1].height : startHeight;
-    return {
-      blocks,
-      nextHeight: lastHeight + 1,
-    };
+    return { blocks, nextHeight: endHeight + 1 };
   }
 
   /**
    * Get transaction keys for a single block
    */
   async getBlockTransactionKeys(height: number): Promise<TransactionKeys[]> {
-    // Ensure we have headers synced up to this height
-    await this.ensureHeadersSyncedTo(height);
+    const block = await this.fetchBlockAtHeight(height);
+    return this.extractTransactionKeys(block);
+  }
 
-    const header = this.headersByHeight.get(height);
+  private async fetchBlockAtHeight(height: number): Promise<ParsedBlock> {
+    if (height === 0) {
+      return this.fetchBlock((await this.getGenesisHeader()).hash);
+    }
+    let header = this.headersByHeight.get(height);
     if (!header) {
-      throw new Error(`Cannot get header for height ${height}`);
+      await this.syncHeaders();
+      header = this.headersByHeight.get(height);
     }
-
-    // Fetch block
-    const blockData = await this.fetchBlock(header.hash);
-
-    // Parse block and extract transaction keys
-    return this.parseBlockTransactionKeys(blockData);
+    if (!header) {
+      throw new Error(`Block height ${height} is beyond the chain tip (${this.chainTipHeight})`);
+    }
+    return this.fetchBlock(header.hash);
   }
 
   /**
-   * Ensure headers are synced up to the specified height
+   * Extract per-transaction BLSCT keys (the shape TransactionKeysSync scans)
    */
-  private async ensureHeadersSyncedTo(targetHeight: number): Promise<void> {
-    // Already have the header
-    if (this.headersByHeight.has(targetHeight)) {
-      return;
-    }
-
-    // Find highest height we have
-    let highestKnown = -1;
-    for (const h of this.headersByHeight.keys()) {
-      if (h > highestKnown) highestKnown = h;
-    }
-
-    // If we're already at or past the target, we're done
-    if (highestKnown >= targetHeight) {
-      return;
-    }
-
-    // Keep syncing until we have headers up to target height or can't make progress
-    let attempts = 0;
-    const maxAttempts = 100; // Prevent infinite loop
-
-    while (!this.headersByHeight.has(targetHeight) && attempts < maxAttempts) {
-      attempts++;
-
-      this.log(`Need header ${targetHeight}, highest known: ${highestKnown}`);
-
-      // Sync more headers starting from where we are
-      const syncFrom = highestKnown + 1;
-      await this.syncHeaders(syncFrom, this.options.maxHeadersPerRequest);
-
-      // Check if we made progress
-      let newHighest = -1;
-      for (const h of this.headersByHeight.keys()) {
-        if (h > newHighest) newHighest = h;
+  private extractTransactionKeys(block: ParsedBlock): TransactionKeys[] {
+    const txKeys: TransactionKeys[] = [];
+    for (const tx of block.txs) {
+      const outputs = tx.outputs.filter(o => o.keys !== null).map(o => o.keys!);
+      if (outputs.length === 0 && tx.inputHashes.length === 0) {
+        continue;
       }
-
-      if (newHighest <= highestKnown) {
-        // No progress made - we're at the chain tip
-        // This is OK if we're close to the target
-        this.log(`No new headers available, highest: ${highestKnown}`);
-        return; // Don't throw, just return what we have
-      }
-
-      highestKnown = newHighest;
+      txKeys.push({
+        txHash: tx.txid,
+        keys: {
+          outputs,
+          inputs: tx.inputHashes.map(outputHash => ({ outputHash })),
+        },
+      });
     }
+    return txKeys;
   }
 
   /**
-   * Fetch a block by hash
+   * Fetch and parse a block by hash (display hex), with caching, dedupe and
+   * bounded concurrency
    */
-  private async fetchBlock(hashHex: string): Promise<Buffer> {
-    // Check cache
+  private async fetchBlock(hashHex: string): Promise<ParsedBlock> {
     const cached = this.blockCache.get(hashHex);
     if (cached) {
       return cached;
     }
 
-    // Check for pending request
     const pending = this.pendingBlocks.get(hashHex);
     if (pending) {
       return pending;
     }
 
-    // Request block
-    const blockHashBuffer = P2PClient.hashFromDisplay(hashHex);
-    const promise = this.client.getBlock(blockHashBuffer).then((msg) => {
-      this.pendingBlocks.delete(hashHex);
-
-      // Cache the block
-      if (this.blockCache.size >= this.maxBlockCacheSize) {
-        // Remove oldest entry
-        const oldest = this.blockCache.keys().next().value;
-        if (oldest) this.blockCache.delete(oldest);
+    const promise = (async () => {
+      await this.acquireBlockSlot();
+      try {
+        const msg = await this.client.getBlock(P2PClient.hashFromDisplay(hashHex));
+        const block = parseBlock(msg.payload);
+        this.rememberBlock(block);
+        return block;
+      } finally {
+        this.releaseBlockSlot();
+        this.pendingBlocks.delete(hashHex);
       }
-      this.blockCache.set(hashHex, msg.payload);
-
-      return msg.payload;
-    });
+    })();
 
     this.pendingBlocks.set(hashHex, promise);
     return promise;
   }
 
-  /**
-   * Handle incoming block message
-   */
-  private handleBlockMessage(msg: P2PMessage): void {
-    // Extract block hash from header
-    const headerHex = msg.payload.subarray(0, 80).toString('hex');
-    const hash = this.extractBlockHash(headerHex);
+  private acquireBlockSlot(): Promise<void> {
+    if (this.activeBlockRequests < this.options.maxConcurrentBlockRequests) {
+      this.activeBlockRequests++;
+      return Promise.resolve();
+    }
+    return new Promise(resolve => {
+      this.blockRequestQueue.push(() => {
+        this.activeBlockRequests++;
+        resolve();
+      });
+    });
+  }
 
-    // Cache the block
+  private releaseBlockSlot(): void {
+    this.activeBlockRequests--;
+    const next = this.blockRequestQueue.shift();
+    if (next) next();
+  }
+
+  private rememberBlock(block: ParsedBlock): void {
     if (this.blockCache.size >= this.maxBlockCacheSize) {
       const oldest = this.blockCache.keys().next().value;
-      if (oldest) this.blockCache.delete(oldest);
+      if (oldest !== undefined) this.blockCache.delete(oldest);
     }
-    this.blockCache.set(hash, msg.payload);
+    this.blockCache.set(block.hash, block);
 
-    this.log(`Received block: ${hash}`);
-  }
-
-  /**
-   * Parse block data and extract transaction keys
-   *
-   * Parses all transactions in the block and extracts BLSCT output keys
-   * for wallet output detection.
-   */
-  private parseBlockTransactionKeys(blockData: Buffer): TransactionKeys[] {
-    const txKeys: TransactionKeys[] = [];
-    let offset = 80; // Skip header
-
-    // Check if this is a PoS block (version bit 24 set = 0x01000000)
-    const version = blockData.readInt32LE(0);
-    const isPoS = (version & 0x01000000) !== 0;
-
-    this.log(`Block version: 0x${version.toString(16)}, isPoS: ${isPoS}, size: ${blockData.length}`);
-
-    // Skip PoS proof if present
-    if (isPoS) {
-      // Navio PoS blocks have a CStakeProof after the header
-      // Need to read and skip the proof carefully
-      const proofSkipResult = this.skipPoSProof(blockData, offset);
-      if (proofSkipResult.error) {
-        this.log(`Error skipping PoS proof: ${proofSkipResult.error}`);
-        return txKeys;
-      }
-      offset = proofSkipResult.newOffset;
-      this.log(`Skipped PoS proof, offset now: ${offset}`);
-    }
-
-    // Parse transaction count
-    const { value: txCount, bytesRead } = this.decodeVarInt(blockData, offset);
-    offset += bytesRead;
-
-    this.log(`Parsing ${txCount} transactions from block (offset: ${offset})`);
-
-    // Parse each transaction
-    for (let txIndex = 0; txIndex < Number(txCount); txIndex++) {
-      const result = this.parseBlsctTransaction(blockData, offset);
-      if (result.error) {
-        this.log(`Error parsing tx ${txIndex}/${txCount}: ${result.error}`);
-        break;
-      }
-
-      offset = result.newOffset;
-
-      if (result.outputKeys.length > 0 || result.inputHashes.length > 0) {
-        txKeys.push({
-          txHash: result.txHash,
-          keys: this.formatOutputKeys(result.outputKeys, result.inputHashes),
-        });
-      }
-    }
-
-    return txKeys;
-  }
-
-  /**
-   * Skip PoS proof in block data
-   */
-  private skipPoSProof(
-    data: Buffer,
-    offset: number
-  ): { newOffset: number; error?: string } {
-    try {
-      // PoS proof structure (blsct::ProofOfStake) from navio-core/src/blsct/pos/proof.h:
-      // - SetMemProof setMemProof
-      // - RangeProof rangeProof (serialized as RangeProofWithoutVs)
-      //
-      // SetMemProof contains:
-      // - 8 Points (phi, A1, A2, S1, S2, S3, T1, T2) = 8 × 48 = 384 bytes
-      // - 6 Scalars (tau_x, mu, z_alpha, z_tau, z_beta, t) = 6 × 32 = 192 bytes
-      // - Ls vector (variable: varint count + count × 48 bytes)
-      // - Rs vector (variable: varint count + count × 48 bytes)
-      // - 3 Scalars (a, b, omega) = 3 × 32 = 96 bytes
-
-      const G1_SIZE = 48;
-      const SCALAR_SIZE = 32;
-
-      // SetMemProof fixed part: 8 points + 6 scalars
-      offset += 8 * G1_SIZE; // phi, A1, A2, S1, S2, S3, T1, T2
-      offset += 6 * SCALAR_SIZE; // tau_x, mu, z_alpha, z_tau, z_beta, t
-
-      // Ls vector
-      const { value: lsCount, bytesRead: lsCountBytes } = this.decodeVarInt(data, offset);
-      offset += lsCountBytes;
-      offset += Number(lsCount) * G1_SIZE;
-
-      // Rs vector
-      const { value: rsCount, bytesRead: rsCountBytes } = this.decodeVarInt(data, offset);
-      offset += rsCountBytes;
-      offset += Number(rsCount) * G1_SIZE;
-
-      // 3 more scalars: a, b, omega
-      offset += 3 * SCALAR_SIZE;
-
-      // Now skip the RangeProof (RangeProofWithoutVs - no Vs vector)
-      // RangeProofWithoutVs contains:
-      // - Ls vector (varint + points)
-      // - Rs vector (varint + points)
-      // - A, A_wip, B (3 points)
-      // - r_prime, s_prime, delta_prime, alpha_hat, tau_x (5 scalars)
-
-      // Ls vector
-      const { value: rpLsCount, bytesRead: rpLsCountBytes } = this.decodeVarInt(data, offset);
-      offset += rpLsCountBytes;
-      offset += Number(rpLsCount) * G1_SIZE;
-
-      // Rs vector
-      const { value: rpRsCount, bytesRead: rpRsCountBytes } = this.decodeVarInt(data, offset);
-      offset += rpRsCountBytes;
-      offset += Number(rpRsCount) * G1_SIZE;
-
-      // A, A_wip, B (3 points)
-      offset += 3 * G1_SIZE;
-
-      // r_prime, s_prime, delta_prime, alpha_hat, tau_x (5 scalars)
-      offset += 5 * SCALAR_SIZE;
-
-      return { newOffset: offset };
-    } catch (e) {
-      return { newOffset: offset, error: String(e) };
-    }
-  }
-
-  // ============================================================================
-  // BLSCT Constants
-  // ============================================================================
-
-  private static readonly G1_POINT_SIZE = 48; // Compressed G1 point
-  private static readonly SCALAR_SIZE = 32; // MCL Scalar
-  private static readonly MAX_AMOUNT = BigInt('0x7FFFFFFFFFFFFFFF');
-  private static readonly BLSCT_MARKER = 0x1;
-  private static readonly TOKEN_MARKER = 0x2;
-  private static readonly PREDICATE_MARKER = 0x4;
-  private static readonly TRANSPARENT_VALUE_MARKER = 0x8;
-
-  /**
-   * Parse a BLSCT transaction and extract output keys
-   */
-  private parseBlsctTransaction(
-    data: Buffer,
-    offset: number
-  ): { txHash: string; outputKeys: ParsedOutputKeys[]; inputHashes: string[]; newOffset: number; error?: string } {
-    const startOffset = offset;
-    const outputKeys: ParsedOutputKeys[] = [];
-    const inputHashes: string[] = [];
-
-    try {
-      // Version (4 bytes)
-      const version = data.readInt32LE(offset);
-      offset += 4;
-
-      // Transaction BLSCT marker is 0x20 (1 << 5), different from block's 0x40000000
-      const TX_BLSCT_MARKER = 0x20;
-      const isBLSCT = (version & TX_BLSCT_MARKER) !== 0;
-
-      // Check for witness marker (0x00 followed by flags)
-      let hasWitness = false;
-      let witnessFlags = 0;
-      if (data[offset] === 0x00) {
-        // Read potential flags byte
-        if (offset + 1 < data.length && data[offset + 1] !== 0x00) {
-          witnessFlags = data[offset + 1];
-          hasWitness = (witnessFlags & 0x01) !== 0;
-          offset += 2; // Skip marker and flag
+    const header = this.headersByHash.get(block.hash);
+    for (const tx of block.txs) {
+      for (const out of tx.outputs) {
+        if (out.keys) {
+          this.cacheOutputData(out.outputHash, out.serializedHex);
         }
       }
-
-      // Input count
-      const { value: inputCount, bytesRead: inputCountBytes } = this.decodeVarInt(data, offset);
-      offset += inputCountBytes;
-
-      // Parse inputs
-      // NOTE: Navio's COutPoint only contains hash (no index/n field)
-      // This is different from Bitcoin where COutPoint has both hash and n
-      for (let i = 0; i < Number(inputCount); i++) {
-        // Previous output hash (prevout.hash) - Navio has no prevout.n!
-        // Record it (display hex) so spent-output detection can mark our
-        // wallet outputs consumed by this transaction.
-        inputHashes.push(Buffer.from(data.subarray(offset, offset + 32)).reverse().toString('hex'));
-        offset += 32;
-        
-        // scriptSig length + data
-        const { value: scriptSigLen, bytesRead: sigLenBytes } = this.decodeVarInt(data, offset);
-        offset += sigLenBytes;
-        if (Number(scriptSigLen) > 10000) {
-          return { txHash: '', outputKeys: [], inputHashes: [], newOffset: offset, error: `Invalid scriptSig length: ${scriptSigLen}` };
-        }
-        offset += Number(scriptSigLen);
-        offset += 4; // sequence
+      if (header) {
+        this.rememberTxLocation(tx.txid, header.height);
       }
-
-      // Output count
-      const { value: outputCount, bytesRead: outputCountBytes } = this.decodeVarInt(data, offset);
-      offset += outputCountBytes;
-
-      // Parse outputs
-      for (let i = 0; i < Number(outputCount); i++) {
-        const outputResult = this.parseBlsctOutput(data, offset);
-        if (outputResult.error) {
-          return { txHash: '', outputKeys: [], inputHashes: [], newOffset: offset, error: outputResult.error };
-        }
-        offset = outputResult.newOffset;
-        if (outputResult.keys) {
-          outputKeys.push(outputResult.keys);
-        }
-      }
-
-      // Parse witness data if present
-      if (hasWitness) {
-        for (let i = 0; i < Number(inputCount); i++) {
-          const { value: witnessCount, bytesRead: wcBytes } = this.decodeVarInt(data, offset);
-          offset += wcBytes;
-
-          for (let j = 0; j < Number(witnessCount); j++) {
-            const { value: itemLen, bytesRead: ilBytes } = this.decodeVarInt(data, offset);
-            offset += ilBytes;
-            offset += Number(itemLen);
-          }
-        }
-      }
-
-      // Lock time
-      offset += 4;
-
-      // BLSCT signature if present
-      if (isBLSCT) {
-        // blsct::Signature is 2 G1 points (96 bytes)
-        offset += 96;
-      }
-
-      // Calculate transaction hash
-      const txData = data.subarray(startOffset, offset);
-      const txHash = this.calculateBlsctTxHash(txData, hasWitness, startOffset, version);
-
-      return {
-        txHash,
-        outputKeys,
-        inputHashes,
-        newOffset: offset,
-      };
-    } catch (e) {
-      return {
-        txHash: '',
-        outputKeys: [],
-        inputHashes: [],
-        newOffset: offset,
-        error: `Parse error: ${e}`,
-      };
     }
   }
 
-  /**
-   * Parse a BLSCT output and extract keys
-   */
-  private parseBlsctOutput(
-    data: Buffer,
-    offset: number,
-  ): { keys: ParsedOutputKeys | null; newOffset: number; error?: string } {
-    const outputStart = offset;
-    try {
-      // Read value (8 bytes)
-      const rawValue = data.readBigInt64LE(offset);
-      offset += 8;
-
-      let flags = 0n;
-
-      // Check for extended format (value = MAX_AMOUNT indicates flags follow)
-      if (rawValue === P2PSyncProvider.MAX_AMOUNT) {
-        // Extended format with flags
-        flags = data.readBigUInt64LE(offset);
-        offset += 8;
-
-        if (flags & BigInt(P2PSyncProvider.TRANSPARENT_VALUE_MARKER)) {
-          // Skip the actual value (we don't need it for key extraction)
-          offset += 8;
-        }
+  private rememberTxLocation(txid: string, height: number): void {
+    if (this.txLocations.size >= this.options.txLocationCacheSize) {
+      const drop = Math.max(1, this.options.txLocationCacheSize >> 4);
+      let n = 0;
+      for (const key of this.txLocations.keys()) {
+        this.txLocations.delete(key);
+        if (++n >= drop) break;
       }
-
-      // Parse scriptPubKey
-      const { value: scriptLen, bytesRead: scriptLenBytes } = this.decodeVarInt(data, offset);
-      offset += scriptLenBytes;
-      offset += Number(scriptLen);
-
-      const hasBlsctData = (flags & BigInt(P2PSyncProvider.BLSCT_MARKER)) !== 0n;
-      const hasTokenId = (flags & BigInt(P2PSyncProvider.TOKEN_MARKER)) !== 0n;
-      const hasPredicate = (flags & BigInt(P2PSyncProvider.PREDICATE_MARKER)) !== 0n;
-
-      let keys: ParsedOutputKeys | null = null;
-
-      // Parse BLSCT data if present
-      if (hasBlsctData) {
-        const blsctResult = this.parseBlsctData(data, offset);
-        if (blsctResult.error) {
-          return { keys: null, newOffset: offset, error: blsctResult.error };
-        }
-        offset = blsctResult.newOffset;
-        keys = blsctResult.keys;
-      }
-
-      // Skip token ID if present
-      if (hasTokenId) {
-        // TokenId is a uint256 token hash + uint64 subid (40 bytes)
-        offset += 40;
-      }
-
-      // Skip predicate if present
-      if (hasPredicate) {
-        const { value: predicateLen, bytesRead: predLenBytes } = this.decodeVarInt(data, offset);
-        offset += predLenBytes;
-        offset += Number(predicateLen);
-      }
-
-      // The output hash is CTxOut::GetHash(): double-SHA256 of the full
-      // serialized output, displayed byte-reversed — the same identifier the
-      // ElectrumX backend reports and the daemon's getoutputdata expects.
-      if (keys) {
-        const serialized = data.subarray(outputStart, offset);
-        keys.outputHash = Buffer.from(sha256(sha256(serialized)))
-          .reverse()
-          .toString('hex');
-        this.cacheOutputData(keys.outputHash, serialized.toString('hex'));
-      }
-
-      return { keys, newOffset: offset };
-    } catch (e) {
-      return { keys: null, newOffset: offset, error: `Output parse error: ${e}` };
     }
-  }
-
-  /**
-   * Parse BLSCT data from output
-   */
-  private parseBlsctData(
-    data: Buffer,
-    offset: number,
-  ): { keys: ParsedOutputKeys | null; newOffset: number; error?: string } {
-    try {
-      // Parse range proof
-      const proofResult = this.parseRangeProof(data, offset);
-      if (proofResult.error) {
-        return { keys: null, newOffset: offset, error: proofResult.error };
-      }
-      offset = proofResult.newOffset;
-
-      // Parse keys (only if range proof has data)
-      if (proofResult.hasData) {
-        // spendingKey (G1 point)
-        const spendingKey = data.subarray(offset, offset + P2PSyncProvider.G1_POINT_SIZE).toString('hex');
-        offset += P2PSyncProvider.G1_POINT_SIZE;
-
-        // blindingKey (G1 point)
-        const blindingKey = data.subarray(offset, offset + P2PSyncProvider.G1_POINT_SIZE).toString('hex');
-        offset += P2PSyncProvider.G1_POINT_SIZE;
-
-        // ephemeralKey (G1 point)
-        const ephemeralKey = data.subarray(offset, offset + P2PSyncProvider.G1_POINT_SIZE).toString('hex');
-        offset += P2PSyncProvider.G1_POINT_SIZE;
-
-        // viewTag (2 bytes)
-        const viewTag = data.readUInt16LE(offset);
-        offset += 2;
-
-        return {
-          keys: {
-            blindingKey,
-            spendingKey,
-            ephemeralKey,
-            viewTag,
-            // Filled in by parseBlsctOutput once the full output (including
-            // any tokenId/predicate) has been consumed.
-            outputHash: '',
-            hasRangeProof: true,
-          },
-          newOffset: offset,
-        };
-      }
-
-      return { keys: null, newOffset: offset };
-    } catch (e) {
-      return { keys: null, newOffset: offset, error: `BLSCT data parse error: ${e}` };
-    }
-  }
-
-  /**
-   * Parse bulletproofs_plus range proof
-   */
-  private parseRangeProof(
-    data: Buffer,
-    offset: number
-  ): { hasData: boolean; newOffset: number; error?: string } {
-    try {
-      // ProofBase: Vs, Ls, Rs (vectors of Points)
-      // First, parse Vs
-      const { value: vsCount, bytesRead: vsCountBytes } = this.decodeVarInt(data, offset);
-      offset += vsCountBytes;
-
-      const numVs = Number(vsCount);
-      offset += numVs * P2PSyncProvider.G1_POINT_SIZE; // Vs
-
-      if (numVs > 0) {
-        // Parse Ls
-        const { value: lsCount, bytesRead: lsCountBytes } = this.decodeVarInt(data, offset);
-        offset += lsCountBytes;
-        offset += Number(lsCount) * P2PSyncProvider.G1_POINT_SIZE;
-
-        // Parse Rs
-        const { value: rsCount, bytesRead: rsCountBytes } = this.decodeVarInt(data, offset);
-        offset += rsCountBytes;
-        offset += Number(rsCount) * P2PSyncProvider.G1_POINT_SIZE;
-
-        // RangeProof additional fields
-        offset += P2PSyncProvider.G1_POINT_SIZE; // A
-        offset += P2PSyncProvider.G1_POINT_SIZE; // A_wip
-        offset += P2PSyncProvider.G1_POINT_SIZE; // B
-        offset += P2PSyncProvider.SCALAR_SIZE; // r_prime
-        offset += P2PSyncProvider.SCALAR_SIZE; // s_prime
-        offset += P2PSyncProvider.SCALAR_SIZE; // delta_prime
-        offset += P2PSyncProvider.SCALAR_SIZE; // alpha_hat
-        offset += P2PSyncProvider.SCALAR_SIZE; // tau_x
-      }
-
-      return { hasData: numVs > 0, newOffset: offset };
-    } catch (e) {
-      return { hasData: false, newOffset: offset, error: `RangeProof parse error: ${e}` };
-    }
-  }
-
-  /**
-   * Calculate BLSCT transaction hash
-   */
-  private calculateBlsctTxHash(txData: Buffer, _hasWitness: boolean, _startOffset: number, _version: number): string {
-    // For now, simple double SHA256 of the full transaction
-    // TODO: Handle witness stripping for proper txid calculation
-    const hash = sha256(sha256(txData));
-    return Buffer.from(hash).reverse().toString('hex');
-  }
-
-  /**
-   * Hash a buffer using SHA256
-   */
-  /**
-   * Format output keys for the sync interface
-   */
-  private formatOutputKeys(
-    outputKeys: ParsedOutputKeys[],
-    inputHashes: string[] = [],
-  ): { outputs: ParsedOutputKeys[]; inputs: Array<{ outputHash: string }> } {
-    return {
-      outputs: outputKeys,
-      inputs: inputHashes.map((outputHash) => ({ outputHash })),
-    };
-  }
-
-  /**
-   * Get serialized transaction output by output hash
-   */
-  async getTransactionKeys(_txHash: string): Promise<any> {
-    throw new Error('P2P provider does not support getTransactionKeys');
+    this.txLocations.set(txid, height);
   }
 
   private cacheOutputData(outputHash: string, serializedHex: string): void {
     if (this.outputDataCache.size >= this.maxOutputDataCacheSize) {
       // Drop the oldest entries (Map preserves insertion order).
       const drop = Math.max(1, this.maxOutputDataCacheSize >> 4);
+      let n = 0;
       for (const key of this.outputDataCache.keys()) {
         this.outputDataCache.delete(key);
-        if (this.outputDataCache.size <= this.maxOutputDataCacheSize - drop) break;
+        if (++n >= drop) break;
       }
     }
     this.outputDataCache.set(outputHash, serializedHex);
   }
 
+  // ============================================================================
+  // Transactions / outputs
+  // ============================================================================
+
+  /**
+   * Get transaction keys for a single transaction (mempool or recent block).
+   * Returns `{ txHash, outputs, inputs }` in the same shape as block keys.
+   */
+  async getTransactionKeys(txHash: string): Promise<any> {
+    const tx = await this.fetchTransaction(txHash);
+    return {
+      txHash: tx.txid,
+      outputs: tx.outputs.filter(o => o.keys !== null).map(o => o.keys!),
+      inputs: tx.inputHashes.map(outputHash => ({ outputHash })),
+    };
+  }
+
+  /**
+   * Get serialized transaction output by output hash (display hex)
+   */
   async getTransactionOutput(outputHash: string): Promise<string> {
-    // Serve from the parse-time cache when possible: the daemon's
-    // getoutputdata only answers for mempool / most-recent-block outputs,
-    // so confirmed outputs discovered during a block scan must come from
-    // the data we already downloaded.
     const cached = this.outputDataCache.get(outputHash);
     if (cached) {
       return cached;
     }
 
-    // Use GETOUTPUTDATA P2P message. Output hashes are handled in display
-    // (byte-reversed) hex throughout the SDK; the wire message carries the
-    // internal byte order.
-    const outputHashBuffer = Buffer.from(outputHash, 'hex').reverse();
-    const response = await this.client.getOutputData([outputHashBuffer]);
-
-    // Response should be a TX message containing the transaction
-    return response.payload.toString('hex');
+    // Output-hash lookup (getdata MSG_WITNESS_TX) answers for mempool /
+    // most-recent-block outputs only
+    const wanted = outputHash.toLowerCase();
+    let parsed: ParsedTransaction | null = null;
+    const payload = await this.client.getOutputData(
+      Buffer.from(wanted, 'hex').reverse(),
+      txPayload => {
+        try {
+          const tx = parseTransaction(txPayload, 0);
+          if (tx.outputs.some(o => o.outputHash === wanted)) {
+            parsed = tx;
+            return true;
+          }
+        } catch {
+          // not the tx we want
+        }
+        return false;
+      }
+    );
+    const tx: ParsedTransaction = parsed ?? parseTransaction(payload, 0);
+    for (const out of tx.outputs) {
+      if (out.keys) {
+        this.cacheOutputData(out.outputHash, out.serializedHex);
+      }
+    }
+    const output = tx.outputs.find(o => o.outputHash === wanted);
+    if (!output) {
+      throw new Error(`Output ${outputHash} not present in returned transaction ${tx.txid}`);
+    }
+    return output.serializedHex;
   }
 
   /**
-   * Broadcast a transaction
+   * Broadcast a transaction.
+   *
+   * Pushes an unsolicited `tx` message (navio-core accepts these), then
+   * confirms mempool acceptance by asking the node for the transaction's
+   * first output by output hash: the node answers that lookup straight from
+   * its mempool, so a `notfound` means the transaction was rejected.
    */
   async broadcastTransaction(rawTx: string): Promise<string> {
-    // Parse transaction to get hash
     const txData = Buffer.from(rawTx, 'hex');
-    const txHash = this.calculateBlsctTxHash(txData, false, 0, 0);
-
-    // TODO: Implement proper broadcast with INV/GETDATA dance
-    // For now, we would need to:
-    // 1. Send INV announcing the transaction
-    // 2. Wait for GETDATA request
-    // 3. Send the TX
-    // This requires exposing sendMessage as public or adding a broadcast method to P2PClient
-
-    this.log(`Broadcasting transaction: ${txHash}`);
-
-    return txHash;
-  }
-
-  /**
-   * Get raw transaction
-   */
-  async getRawTransaction(txHash: string, _verbose?: boolean): Promise<string> {
-    // Request transaction via GETDATA
-    const inv = [{ type: InvType.MSG_WITNESS_TX, hash: P2PClient.hashFromDisplay(txHash) }];
-
-    // Send getdata
-    await this.client.getData(inv);
-
-    // Wait for TX message
-    const response = await this.client.waitForMessage(MessageType.TX, this.options.timeout);
-
-    return response.payload.toString('hex');
-  }
-
-  /**
-   * Decode variable-length integer from buffer
-   */
-  private decodeVarInt(buffer: Buffer, offset: number): { value: bigint; bytesRead: number } {
-    const first = buffer.readUInt8(offset);
-
-    if (first < 0xfd) {
-      return { value: BigInt(first), bytesRead: 1 };
-    } else if (first === 0xfd) {
-      return { value: BigInt(buffer.readUInt16LE(offset + 1)), bytesRead: 3 };
-    } else if (first === 0xfe) {
-      return { value: BigInt(buffer.readUInt32LE(offset + 1)), bytesRead: 5 };
-    } else {
-      return { value: buffer.readBigUInt64LE(offset + 1), bytesRead: 9 };
+    const tx = parseTransaction(txData, 0);
+    if (tx.end !== txData.length) {
+      throw new Error(`Trailing bytes after transaction (${txData.length - tx.end})`);
     }
+    if (tx.outputs.length === 0) {
+      throw new Error('Transaction has no outputs');
+    }
+
+    this.log(`Broadcasting transaction ${tx.txid}`);
+    this.client.sendTransaction(txData);
+
+    // Messages from one peer are processed in order, so this request is
+    // answered after the node validated the transaction.
+    const probeHash = tx.outputs[0].outputHash;
+    let holder: ParsedTransaction | null = null;
+    try {
+      await this.client.getOutputData(Buffer.from(probeHash, 'hex').reverse(), txPayload => {
+        try {
+          const candidate = parseTransaction(txPayload, 0);
+          if (candidate.outputs.some(o => o.outputHash === probeHash)) {
+            holder = candidate;
+            return true;
+          }
+        } catch {
+          // not a transaction we can parse
+        }
+        return false;
+      });
+    } catch (err: any) {
+      const msg = String(err?.message ?? err);
+      if (msg.startsWith('Output not found')) {
+        throw new Error(
+          `Transaction ${tx.txid} was not accepted by the node's mempool ` +
+            '(the P2P protocol does not report the rejection reason; check the node debug log)'
+        );
+      }
+      throw new Error(`Broadcast of ${tx.txid} could not be confirmed: ${msg}`);
+    }
+    const accepted = holder as ParsedTransaction | null;
+    if (accepted && accepted.txid !== tx.txid && accepted.wtxid !== tx.wtxid) {
+      throw new Error(
+        `Transaction ${tx.txid} was not accepted by the node's mempool: ` +
+          `a different transaction (${accepted.txid}) with the same output is already there`
+      );
+    }
+
+    for (const out of tx.outputs) {
+      if (out.keys) {
+        this.cacheOutputData(out.outputHash, out.serializedHex);
+      }
+    }
+    return tx.txid;
+  }
+
+  /**
+   * Get raw transaction by txid (display hex).
+   *
+   * Served via getdata for mempool / most-recent-block transactions; older
+   * confirmed transactions are located through the txid index built while
+   * scanning blocks and re-read from the containing block.
+   */
+  async getRawTransaction(txHash: string, verbose?: boolean): Promise<string | unknown> {
+    const tx = await this.fetchTransaction(txHash);
+    if (!verbose) {
+      return tx.rawHex;
+    }
+    const height = this.txLocations.get(tx.txid);
+    const header = height !== undefined ? this.headersByHeight.get(height) : undefined;
+    return {
+      txid: tx.txid,
+      hash: tx.wtxid,
+      hex: tx.rawHex,
+      size: tx.rawHex.length / 2,
+      version: tx.version,
+      ...(height !== undefined ? { height } : {}),
+      ...(header ? { blockhash: header.hash } : {}),
+      confirmations: height !== undefined ? this.chainTipHeight - height + 1 : 0,
+    };
+  }
+
+  private async fetchTransaction(txHash: string): Promise<ParsedTransaction> {
+    const wanted = txHash.toLowerCase();
+
+    // Fast path: block cache
+    for (const block of this.blockCache.values()) {
+      const hit = block.txs.find(t => t.txid === wanted);
+      if (hit) return hit;
+    }
+
+    // getdata: mempool or most recent block
+    let parsed: ParsedTransaction | null = null;
+    try {
+      const payload = await this.client.getTransaction(
+        Buffer.from(wanted, 'hex').reverse(),
+        txPayload => {
+          try {
+            const tx = parseTransaction(txPayload, 0);
+            if (tx.txid === wanted || tx.wtxid === wanted) {
+              parsed = tx;
+              return true;
+            }
+          } catch {
+            // not the tx we want
+          }
+          return false;
+        }
+      );
+      return parsed ?? parseTransaction(payload, 0);
+    } catch (err: any) {
+      if (!String(err?.message ?? err).startsWith('Transaction not found')) {
+        throw err;
+      }
+    }
+
+    // Confirmed transaction: re-read its block
+    const height = this.txLocations.get(wanted);
+    if (height === undefined) {
+      throw new Error(
+        `Transaction ${txHash} not found: not in the node's mempool or most recent block, ` +
+          'and not in a block scanned by this provider'
+      );
+    }
+    const block = await this.fetchBlockAtHeight(height);
+    const hit = block.txs.find(t => t.txid === wanted);
+    if (!hit) {
+      throw new Error(`Transaction ${txHash} not found in block ${height} (reorg?)`);
+    }
+    return hit;
   }
 }
-
