@@ -361,6 +361,7 @@ export class WalletDB {
         memo TEXT,
         token_id TEXT,
         blinding_key TEXT,
+        ephemeral_key TEXT,
         spending_key TEXT,
         is_spent INTEGER NOT NULL DEFAULT 0,
         spent_tx_hash TEXT,
@@ -368,6 +369,21 @@ export class WalletDB {
         created_at INTEGER NOT NULL,
         tx_type TEXT NOT NULL DEFAULT 'received',
         timestamp INTEGER NOT NULL DEFAULT 0
+      )
+    `);
+
+    // Private blinding scalars for outputs this wallet created. Kept in its
+    // own table rather than as a column on wallet_outputs because that table's
+    // row mappers feed WalletOutput, which the public getters hand to callers
+    // — a secret must not ride along by accident.
+    //
+    // Safe on existing databases: CREATE TABLE IF NOT EXISTS just adds it, and
+    // a wallet with no rows here falls back to the seed derivation.
+    await this.adapter.run(`
+      CREATE TABLE IF NOT EXISTS output_blinding_keys (
+        output_hash TEXT PRIMARY KEY,
+        blinding_key TEXT NOT NULL,
+        created_at INTEGER NOT NULL
       )
     `);
 
@@ -379,6 +395,13 @@ export class WalletDB {
     }
     try {
       await this.adapter.run(`ALTER TABLE wallet_outputs ADD COLUMN timestamp INTEGER NOT NULL DEFAULT 0`);
+    } catch {
+      // Column already exists – ignore
+    }
+    try {
+      // The output's ephemeral key (k*G). Nullable, so existing rows simply
+      // carry NULL until they are re-synced.
+      await this.adapter.run(`ALTER TABLE wallet_outputs ADD COLUMN ephemeral_key TEXT`);
     } catch {
       // Column already exists – ignore
     }
@@ -993,6 +1016,8 @@ export class WalletDB {
     await this.adapter.run('DELETE FROM wallet_outputs');
     await this.adapter.run('DELETE FROM created_collections');
     await this.adapter.run('DELETE FROM standing_orders');
+    // Another seed's blinding scalars are not ours and can never verify.
+    await this.adapter.run('DELETE FROM output_blinding_keys');
     await this.clearSyncData();
   }
 
@@ -1272,17 +1297,43 @@ export class WalletDB {
     await stmt.free();
   }
 
+  async saveOutputBlindingKey(outputHash: string, blindingKeyPrivate: string): Promise<void> {
+    if (!this.adapter) throw new Error('Database not open');
+    const stmt = await this.adapter.prepare(
+      `INSERT OR REPLACE INTO output_blinding_keys (output_hash, blinding_key, created_at)
+       VALUES (?, ?, ?)`
+    );
+    await stmt.run([outputHash, blindingKeyPrivate, Date.now()]);
+    await stmt.free();
+  }
+
+  async getOutputBlindingKey(outputHash: string): Promise<string | null> {
+    if (!this.adapter) throw new Error('Database not open');
+    const stmt = await this.adapter.prepare(
+      'SELECT blinding_key FROM output_blinding_keys WHERE output_hash = ?'
+    );
+    stmt.bind([outputHash]);
+    let value: string | null = null;
+    if (await stmt.step()) {
+      const row = await stmt.getAsObject();
+      value = (row.blinding_key as string) ?? null;
+    }
+    await stmt.free();
+    return value;
+  }
+
   async storeWalletOutput(p: StoreOutputParams): Promise<void> {
     if (!this.adapter) throw new Error('Database not open');
     const stmt = await this.adapter.prepare(
       `INSERT OR REPLACE INTO wallet_outputs
        (output_hash, tx_hash, output_index, block_height, output_data, amount, gamma, memo, token_id,
-        blinding_key, spending_key, is_spent, spent_tx_hash, spent_block_height, created_at, tx_type, timestamp)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        blinding_key, ephemeral_key, spending_key, is_spent, spent_tx_hash, spent_block_height, created_at,
+        tx_type, timestamp)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     );
     await stmt.run([
       p.outputHash, p.txHash, p.outputIndex, p.blockHeight, p.outputData,
-      p.amount, p.gamma, p.memo, p.tokenId, p.blindingKey, p.spendingKey,
+      p.amount, p.gamma, p.memo, p.tokenId, p.blindingKey, p.ephemeralKey ?? null, p.spendingKey,
       p.isSpent ? 1 : 0, p.spentTxHash, p.spentBlockHeight, Date.now(),
       p.txType, p.timestamp,
     ]);
@@ -1479,7 +1530,7 @@ export class WalletDB {
 
     let query = `
       SELECT output_hash, tx_hash, output_index, block_height, amount, gamma, memo, token_id, 
-             blinding_key, spending_key, is_spent, spent_tx_hash, spent_block_height,
+             blinding_key, ephemeral_key, spending_key, is_spent, spent_tx_hash, spent_block_height,
              tx_type, timestamp
       FROM wallet_outputs 
       WHERE is_spent = 0
@@ -1509,6 +1560,7 @@ export class WalletDB {
         memo: row.memo as string | null,
         tokenId: row.token_id as string | null,
         blindingKey: row.blinding_key as string,
+        ephemeralKey: (row.ephemeral_key as string | null) ?? null,
         spendingKey: row.spending_key as string,
         isSpent: (row.is_spent as number) === 1,
         spentTxHash: row.spent_tx_hash as string | null,
@@ -1533,7 +1585,7 @@ export class WalletDB {
 
     const stmt = await this.adapter.prepare(`
       SELECT output_hash, tx_hash, output_index, block_height, amount, gamma, memo, token_id, 
-             blinding_key, spending_key, is_spent, spent_tx_hash, spent_block_height,
+             blinding_key, ephemeral_key, spending_key, is_spent, spent_tx_hash, spent_block_height,
              tx_type, timestamp
       FROM wallet_outputs 
       ORDER BY block_height ASC
@@ -1552,6 +1604,7 @@ export class WalletDB {
         memo: row.memo as string | null,
         tokenId: row.token_id as string | null,
         blindingKey: row.blinding_key as string,
+        ephemeralKey: (row.ephemeral_key as string | null) ?? null,
         spendingKey: row.spending_key as string,
         isSpent: (row.is_spent as number) === 1,
         spentTxHash: row.spent_tx_hash as string | null,

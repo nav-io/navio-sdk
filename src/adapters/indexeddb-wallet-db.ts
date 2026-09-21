@@ -27,7 +27,8 @@ import type {
 
 // v2: adds the createdCollections store
 // v3: adds the standingOrders store
-const IDB_VERSION = 3;
+// v4: adds the outputBlindingKeys store
+const IDB_VERSION = 4;
 const DEFAULT_TOKEN_ID = '0000000000000000000000000000000000000000000000000000000000000000';
 
 function idbReq<T>(req: IDBRequest<T>): Promise<T> {
@@ -122,6 +123,7 @@ export class IndexedDBWalletDB implements IWalletDB {
       ['blockHashes', { keyPath: 'height' }],
       ['createdCollections', { keyPath: 'collectionTokenId' }],
       ['standingOrders', { keyPath: 'localId' }],
+      ['outputBlindingKeys', { keyPath: 'outputHash' }],
     ];
     for (const [name, opts] of stores) {
       if (!db.objectStoreNames.contains(name)) db.createObjectStore(name, opts);
@@ -477,10 +479,15 @@ export class IndexedDBWalletDB implements IWalletDB {
   private async discardForeignWalletData(incoming: KeyManager): Promise<void> {
     if (!(await this.holdsDifferentWallet(incoming))) return;
     const db = this.ensureOpen();
-    const tx = db.transaction(['walletOutputs', 'createdCollections', 'standingOrders'], 'readwrite');
+    const tx = db.transaction(
+      ['walletOutputs', 'createdCollections', 'standingOrders', 'outputBlindingKeys'],
+      'readwrite',
+    );
     tx.objectStore('walletOutputs').clear();
     tx.objectStore('createdCollections').clear();
     tx.objectStore('standingOrders').clear();
+    // Another seed's blinding scalars are not ours and can never verify.
+    tx.objectStore('outputBlindingKeys').clear();
     await idbTx(tx);
     await this.clearSyncData();
   }
@@ -599,6 +606,7 @@ export class IndexedDBWalletDB implements IWalletDB {
     memo: r.memo ?? null,
     tokenId: r.tokenId ?? null,
     blindingKey: r.blindingKey,
+    ephemeralKey: r.ephemeralKey ?? null,
     spendingKey: r.spendingKey,
     isSpent: r.isSpent === 1,
     spentTxHash: r.spentTxHash ?? null,
@@ -705,6 +713,7 @@ export class IndexedDBWalletDB implements IWalletDB {
       memo: p.memo,
       tokenId: p.tokenId,
       blindingKey: p.blindingKey,
+      ephemeralKey: p.ephemeralKey ?? null,
       spendingKey: p.spendingKey,
       isSpent: p.isSpent ? 1 : 0,
       spentTxHash: p.spentTxHash,
@@ -763,6 +772,15 @@ export class IndexedDBWalletDB implements IWalletDB {
 
   async saveCreatedCollection(record: CreatedCollectionRecord): Promise<void> {
     await this.put('createdCollections', { ...record });
+  }
+
+  async saveOutputBlindingKey(outputHash: string, blindingKeyPrivate: string): Promise<void> {
+    await this.put('outputBlindingKeys', { outputHash, blindingKey: blindingKeyPrivate, createdAt: Date.now() });
+  }
+
+  async getOutputBlindingKey(outputHash: string): Promise<string | null> {
+    const rec = await this.get<{ outputHash: string; blindingKey: string }>('outputBlindingKeys', outputHash);
+    return rec?.blindingKey ?? null;
   }
 
   async saveStandingOrder(row: StandingOrderRow): Promise<void> {

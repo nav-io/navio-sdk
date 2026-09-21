@@ -10,6 +10,7 @@ export * from './wallet-db';
 export * from './wallet-db.interface';
 export * from './electrum';
 export * from './tx-keys-sync';
+export * from './blinding-key';
 export * from './crypto';
 
 // Database Adapters (cross-platform SQLite)

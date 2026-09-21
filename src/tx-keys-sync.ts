@@ -15,6 +15,7 @@ import type { BlockTransactionKeys, TransactionKeys } from './electrum';
 import type { IWalletDB, SyncState, TxType } from './wallet-db.interface';
 import * as blsctModule from '@nav-io/navio-blsct';
 import { sha256 } from '@noble/hashes/sha256';
+import { canonicalAnchorOutid, searchBlindingKey } from './blinding-key';
 
 /**
  * Serialization of an empty bulletproofs+ range proof: just the zero Vs
@@ -651,7 +652,7 @@ export class TransactionKeysSync {
 
     const {
       CTx, PublicKey, Point, RangeProof, AmountRecoveryReq,
-      getCTxOutBlindingKey, getCTxOutSpendingKey, getCTxOutViewTag,
+      getCTxOutBlindingKey, getCTxOutSpendingKey, getCTxOutViewTag, getCTxOutEphemeralKey,
     } = blsctModule as any;
 
     let ctx: any;
@@ -739,12 +740,22 @@ export class TransactionKeysSync {
       const spendingKeyHex = spendingKeyObj.serialize();
       const outputHash = `mempool:${txHash}:${i}`;
 
+      // k*G, the public counterpart of the sender's blinding scalar and the
+      // key signOutput's signatures verify against. Distinct from the
+      // blindingKey above, which is k*sk_destination.
+      let ephemeralKeyHex: string | null = null;
+      try {
+        ephemeralKeyHex = PublicKey.fromPoint(Point.fromObj(getCTxOutEphemeralKey(ctxOut.obj))).serialize();
+      } catch {
+        // Older bindings may not expose it; the field stays null.
+      }
+
       await this.storeWalletOutput(
         outputHash, txHash, i, 0, '',
         recoveredAmount, recoveredGamma, recoveredMemo, tokenIdHex,
         blindingKeyHex, spendingKeyHex,
         false, null, null,
-        mempoolTxType, mempoolTimestamp
+        mempoolTxType, mempoolTimestamp, ephemeralKeyHex
       );
     }
 
@@ -855,15 +866,36 @@ export class TransactionKeysSync {
     const txData = keys[1] || keys;
     const inputs: any[] = txData?.inputs || txData?.vin || [];
     let txType: TxType = 'received';
+    // Inputs this wallet recognises as spending its own outputs. Collected
+    // here rather than short-circuiting because the blinding-key backfill
+    // below needs the whole set to pick its canonical anchor.
+    const ownInputOutids: string[] = [];
     if (Array.isArray(inputs) && inputs.length > 0) {
       for (const input of inputs) {
         const outputHash = input?.prevoutHash || input?.outputHash || input?.output_hash || input?.prevout?.hash;
         if (outputHash && await this.walletDB.isOutputUnspent(outputHash)) {
           txType = isPoS ? 'stake' : 'sent';
-          break;
+          ownInputOutids.push(outputHash);
         }
       }
     }
+
+    // Derivation anchors for the backfill below: the canonical anchor over the
+    // inputs this wallet owns, then every input of the transaction as a
+    // fallback. Block aggregation merges other senders' inputs in and
+    // navio-core shuffles `vin` before broadcast, so no position is reliable.
+    //
+    // Only worth trying when this wallet spent into the transaction at all,
+    // which is what any txType other than 'received' means — checking for
+    // 'sent' alone would miss every transaction that landed in a PoS block,
+    // where the same condition is reported as 'stake'.
+    const allInputOutids: string[] = inputs
+      .map((input) => input?.prevoutHash || input?.outputHash || input?.output_hash || input?.prevout?.hash)
+      .filter((hash): hash is string => typeof hash === 'string' && hash.length > 0);
+    const anchor = canonicalAnchorOutid(ownInputOutids);
+    const candidateOutids: string[] = txType === 'received'
+      ? []
+      : (anchor === null ? allInputOutids : [anchor, ...allInputOutids]);
 
     for (let outputIndex = 0; outputIndex < outputs.length; outputIndex++) {
       const outputKeys = outputs[outputIndex];
@@ -913,6 +945,17 @@ export class TransactionKeysSync {
           outputHex
         );
 
+        // The public counterpart of the sender's blinding scalar is the
+        // EPHEMERAL key (k*G), not the field called blindingKey, which is
+        // k*sk_destination and bound to the recipient. The P2P backend reports
+        // it with the other keys; the Electrum key server does not, so fall
+        // back to reading it out of the serialized output.
+        const ephemeralKey: string | null =
+          outputKeys?.ephemeralKey
+          || outputKeys?.ephemeral_key
+          || (outputHex ? this.extractRangeProofFromOutput(outputHex).ephemeralKeyHex : null)
+          || null;
+
         // Store output as spendable with recovered amount
         await this.storeWalletOutput(
           outputHash,
@@ -930,9 +973,51 @@ export class TransactionKeysSync {
           null, // spent_tx_hash
           null, // spent_block_height
           txType,
-          blockTimestamp
+          blockTimestamp,
+          ephemeralKey
+        );
+
+        if (candidateOutids.length > 0 && ephemeralKey) {
+          await this.backfillBlindingKey(outputHash, candidateOutids, ephemeralKey);
+        }
+      }
+    }
+  }
+
+  /**
+   * Populate the stored blinding scalar for an output this wallet both created
+   * and can see — its own change, in practice.
+   *
+   * `recoverBlindingKey` derives on demand and does not need this, but filling
+   * the table during sync restores the fast path after a wallet is rebuilt
+   * from its mnemonic and re-scanned. Only attempted for transactions this
+   * wallet spent into, which bounds the work to our own outgoing transactions.
+   *
+   * Entirely best-effort: a failure here must never interrupt a sync.
+   *
+   * @param outputHash - Output hash, display hex
+   * @param candidateOutids - Anchors to try: the canonical one first, then
+   *   every input of the containing transaction
+   * @param ephemeralKey - The output's ephemeral key (k*G), hex
+   */
+  private async backfillBlindingKey(
+    outputHash: string,
+    candidateOutids: string[],
+    ephemeralKey: string,
+  ): Promise<void> {
+    try {
+      if (!this.keyManager || !this.keyManager.isUnlocked()) return;
+      if (await this.walletDB.getOutputBlindingKey(outputHash)) return;
+
+      const match = searchBlindingKey(this.keyManager.getMasterSeedKey(), candidateOutids, ephemeralKey);
+      if (match) {
+        await this.walletDB.saveOutputBlindingKey(
+          outputHash,
+          match.scalar.serialize().padStart(64, '0'),
         );
       }
+    } catch {
+      // Not ours, no seed, or a malformed key: nothing to store.
     }
   }
 
@@ -1095,7 +1180,12 @@ export class TransactionKeysSync {
    * @param outputHex - Serialized output data (hex)
    * @returns Object containing rangeProofHex and tokenIdHex
    */
-  private extractRangeProofFromOutput(outputHex: string): { rangeProofHex: string | null; tokenIdHex: string | null; transparentValue: bigint | null } {
+  private extractRangeProofFromOutput(outputHex: string): {
+    rangeProofHex: string | null;
+    tokenIdHex: string | null;
+    transparentValue: bigint | null;
+    ephemeralKeyHex: string | null;
+  } {
     try {
       const data = Buffer.from(outputHex, 'hex');
       let offset = 0;
@@ -1146,6 +1236,7 @@ export class TransactionKeysSync {
 
       let rangeProofHex: string | null = null;
       let tokenIdHex: string | null = null;
+      let ephemeralKeyHex: string | null = null;
 
       // Extract range proof if present
       if ((flags & HAS_BLSCT_KEYS) !== 0n) {
@@ -1187,7 +1278,11 @@ export class TransactionKeysSync {
         const rangeProofEnd = offset;
         rangeProofHex = data.subarray(rangeProofStart, rangeProofEnd).toString('hex');
         
-        // Skip BLSCT keys (spendingKey, blindingKey, ephemeralKey, viewTag)
+        // BLSCT keys: spendingKey, blindingKey, ephemeralKey (48 bytes each),
+        // then a 2-byte viewTag. The ephemeral key is the public counterpart
+        // of the sender's blinding scalar (k*G) — the Electrum key server does
+        // not report it, so this is the only way to get at it on that backend.
+        ephemeralKeyHex = data.subarray(offset + 2 * 48, offset + 3 * 48).toString('hex');
         offset += 3 * 48 + 2;
       }
 
@@ -1196,9 +1291,9 @@ export class TransactionKeysSync {
         tokenIdHex = data.subarray(offset, offset + TOKEN_ID_SIZE).toString('hex');
       }
 
-      return { rangeProofHex, tokenIdHex, transparentValue };
+      return { rangeProofHex, tokenIdHex, transparentValue, ephemeralKeyHex };
     } catch (e) {
-      return { rangeProofHex: null, tokenIdHex: null, transparentValue: null };
+      return { rangeProofHex: null, tokenIdHex: null, transparentValue: null, ephemeralKeyHex: null };
     }
   }
 
@@ -1218,7 +1313,8 @@ export class TransactionKeysSync {
     spentTxHash: string | null,
     spentBlockHeight: number | null,
     txType: TxType = 'received',
-    timestamp: number = 0
+    timestamp: number = 0,
+    ephemeralKey: string | null = null
   ): Promise<void> {
     // Normalize the NAV token id to null at the single write choke point.
     // TokenId.serialize() renders NAV as 64 zero chars + the ffff… no-subid
@@ -1231,7 +1327,7 @@ export class TransactionKeysSync {
       : tokenId;
     await this.walletDB.storeWalletOutput({
       outputHash, txHash, outputIndex, blockHeight, outputData,
-      amount, gamma, memo, tokenId: normalizedTokenId, blindingKey, spendingKey,
+      amount, gamma, memo, tokenId: normalizedTokenId, blindingKey, ephemeralKey, spendingKey,
       isSpent, spentTxHash, spentBlockHeight, txType, timestamp,
     });
   }

@@ -3,6 +3,88 @@
 All notable changes to navio-sdk are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/); versions follow [SemVer](https://semver.org/).
 
+## [0.2.0] - 2026-09-21
+
+### Added
+
+- **Recoverable output blinding keys.** A BLSCT output's blinding scalar used
+  to be `Scalar.random()` and was thrown away, so a sender had no way to prove
+  afterwards that they created a given output — the only thing that identifies
+  the sender of a confidential payment. The scalar is now derived
+  deterministically from the wallet seed and can be recomputed on demand.
+
+  **Recovery only applies to outputs created by this version or later.**
+  Outputs created by navio-sdk 0.1.36 or earlier, or by any other wallet, used
+  a random scalar that no longer exists anywhere; they cannot be recovered, and
+  no future version can change that.
+
+  - `client.recoverBlindingKey({ txid, vout })` returns the private scalar,
+    its public counterpart, and whether it came from the wallet database or
+    was re-derived from the seed.
+  - **`WalletOutput.ephemeralKey`** exposes the output's on-chain
+    `blsctData.ephemeralKey`. This is `k * G`, the public counterpart of the
+    sender's blinding scalar, and the key `signOutput`'s signatures verify
+    against — so a verifier (the bridge watchtower, for one) can check a
+    refund claim without any access to the sender's wallet. It is public data
+    and is persisted during sync on both backends. Note it is *not*
+    `WalletOutput.blindingKey`, which navio-core computes as
+    `k * sk_destination`: that one is bound to the recipient's spend key and
+    no signature made with `k` verifies against it.
+  - `client.signOutput({ txid, vout, message })` returns `{ signature,
+    blindingKey }`, signing the message exactly as given so it verifies under
+    `Signature.verify(publicKey, message)` in navio-blsct.
+  - The derivation is
+    `sha256("navio-blsct-blinding/v1" ‖ seed ‖ anchor.outid ‖ counter)` reduced
+    mod the BLS12-381 group order, with the seed as 32 zero-padded big-endian
+    bytes, the anchor outid in internal byte order, and `counter` a big-endian
+    uint32. It is normative and shared with navio-core's `signblsctoutput`, so
+    a seed can move between the two implementations without losing
+    recoverability.
+  - The **anchor** is the lexicographically smallest outid among the inputs
+    the sender itself contributed, compared as 32 bytes in internal order —
+    not `vin[0]`. navio-core shuffles `vin` before broadcast and block
+    aggregation splices other senders' inputs into the transaction, so no
+    position survives; a canonical choice over the sender's own input *set*
+    does.
+  - Recovery trusts neither the output's on-chain index nor any input
+    position. Navio merges every non-coinbase transaction in a block into one,
+    so an output's final position is not the one its sender assigned. Recovery
+    tries the canonical anchor first — 16 scalar multiplications in the normal
+    case — then falls back to every input against the first 16 ordinals, which
+    covers the case where the wallet can no longer tell which inputs were its
+    own. Each candidate is checked against the output's on-chain point, so a
+    wrong anchor can only cost time and never yields a false key, and a match
+    is proof rather than an assumption.
+  - The scalar is also persisted when the output is created, as a fast path.
+    It lives in its own `output_blinding_keys` table and is never part of
+    `WalletOutput`, so it cannot leak through `getUnspentOutputs`,
+    `getAllOutputs` or any other public getter. Existing databases gain the
+    table on open; no data is rewritten.
+  - Set `deterministicBlindingKeys: false` on the client, or
+    `randomBlindingKeys: true` on an individual send, to keep the old
+    random-and-discarded behaviour.
+
+### Changed
+
+- Blinding keys are assigned after coin selection rather than before, because
+  the derivation binds to the first input. `createTokenCollection`,
+  `createNftCollection`, `mintToken`, `mintNft` and `mintNfts` now build their
+  outputs inside the funding path instead of handing ready-made outputs to it.
+  Behaviour, output order and fees are unchanged.
+
+### Notes
+
+- Outputs synced before this version have `ephemeralKey === null` until they
+  are re-synced; the column is added to existing databases on open and nothing
+  is rewritten. `signOutput` reads the key from the chain and does not depend
+  on the stored value.
+
+- Swap halves (`buildSwapHalf`, used by `acceptQuote` / `broadcastOrder`) are
+  aggregated with the counterparty's half, so the combined transaction carries
+  their inputs too. Because the anchor is canonical over our own inputs rather
+  than positional, and recovery falls back to scanning every input, swap
+  outputs remain recoverable from the seed alone.
+
 ## [0.1.36] - 2026-09-17
 
 ### Fixed

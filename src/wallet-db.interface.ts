@@ -42,7 +42,23 @@ export interface WalletOutput {
   gamma: string;
   memo: string | null;
   tokenId: string | null;
+  /**
+   * The output's `blsctData.blindingKey` from the chain: `k * sk_destination`,
+   * bound to the recipient's spend key.
+   *
+   * This is NOT the public counterpart of the sender's blinding scalar — see
+   * {@link WalletOutput.ephemeralKey} for that.
+   */
   blindingKey: string;
+  /**
+   * The output's `blsctData.ephemeralKey` from the chain: `k * G`, the public
+   * counterpart of the sender's blinding scalar, and the key an output
+   * ownership signature (`signOutput`) verifies against.
+   *
+   * Public data — it is on chain. Null for outputs stored before this field
+   * existed, and on backends that do not report it.
+   */
+  ephemeralKey: string | null;
   spendingKey: string;
   isSpent: boolean;
   spentTxHash: string | null;
@@ -67,6 +83,8 @@ export interface StoreOutputParams {
   memo: string | null;
   tokenId: string | null;
   blindingKey: string;
+  /** The output's `blsctData.ephemeralKey` (`k * G`), when the backend reports it. */
+  ephemeralKey: string | null;
   spendingKey: string;
   isSpent: boolean;
   spentTxHash: string | null;
@@ -203,6 +221,27 @@ export interface IWalletDB {
   // -- pending/mempool balance ------------------------------------------
   getPendingSpentAmount(tokenId?: string | null): Promise<bigint>;
   deleteUnconfirmedOutputsByTxHash(txHash: string): Promise<void>;
+
+  // -- output blinding keys (secret; never part of WalletOutput) ---------
+  /**
+   * Persist the PRIVATE blinding scalar of an output this wallet created.
+   *
+   * This is the fast path for `recoverBlindingKey`; the seed derivation is the
+   * fallback that survives a restore. Deliberately kept out of `WalletOutput`
+   * (whose `blindingKey` is the public point) because that struct is handed to
+   * callers by `getUnspentOutputs`, `getAllOutputs` and friends.
+   *
+   * @param outputHash - Output hash, display hex
+   * @param blindingKeyPrivate - The scalar, 64 hex characters
+   */
+  saveOutputBlindingKey(outputHash: string, blindingKeyPrivate: string): Promise<void>;
+  /**
+   * The stored private blinding scalar for an output, or null if this wallet
+   * did not create it (or created it before this feature existed).
+   *
+   * @param outputHash - Output hash, display hex
+   */
+  getOutputBlindingKey(outputHash: string): Promise<string | null>;
 
   // -- created collections ----------------------------------------------
   saveCreatedCollection(record: CreatedCollectionRecord): Promise<void>;

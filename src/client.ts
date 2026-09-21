@@ -20,6 +20,13 @@ import { SyncProvider } from './sync-provider';
 import { P2PSyncProvider } from './p2p-sync';
 import { P2PConnectionOptions } from './p2p-protocol';
 import { ElectrumSyncProvider } from './electrum-sync';
+import { parseTransaction } from './p2p-block-parser';
+import {
+  BlindingKeyAllocator,
+  blindingPublicKeyHex,
+  canonicalAnchorOutid,
+  searchBlindingKey,
+} from './blinding-key';
 import * as blsctModule from '@nav-io/navio-blsct';
 import { BlsctChain, setChain } from '@nav-io/navio-blsct';
 import { sha256 } from '@noble/hashes/sha256';
@@ -40,7 +47,7 @@ import type {
 } from './trading.types';
 
 const {
-  Scalar, PublicKey, SubAddr,
+  Scalar, PublicKey, SubAddr, Signature,
   Address, TokenId, CTxId, OutPoint, TxIn, TxOut,
   TxOutputType, PrivSpendingKey,
   CTx, UnsignedInput, UnsignedOutput, UnsignedTransaction,
@@ -158,6 +165,16 @@ export interface SendTransactionOptions {
    * When provided, automatic UTXO selection is skipped.
    */
   selectedUtxos?: string[];
+  /**
+   * Use a fresh random blinding key for every output instead of the
+   * recoverable, seed-derived one (default: false).
+   *
+   * Deterministic keys are what make `recoverBlindingKey` / `signOutput` work
+   * after a seed-only restore. Opt out only when you specifically do not want
+   * the outputs of this transaction to be attributable to this seed; the
+   * scalars are then discarded and those outputs can never be recovered.
+   */
+  randomBlindingKeys?: boolean;
 }
 
 /**
@@ -195,6 +212,16 @@ export interface SendToManyOptions {
    * When provided, automatic UTXO selection is skipped.
    */
   selectedUtxos?: string[];
+  /**
+   * Use a fresh random blinding key for every output instead of the
+   * recoverable, seed-derived one (default: false).
+   *
+   * Deterministic keys are what make `recoverBlindingKey` / `signOutput` work
+   * after a seed-only restore. Opt out only when you specifically do not want
+   * the outputs of this transaction to be attributable to this seed; the
+   * scalars are then discarded and those outputs can never be recovered.
+   */
+  randomBlindingKeys?: boolean;
 }
 
 /**
@@ -316,6 +343,76 @@ export interface MintNftsResult extends SendTransactionResult {
   tokenPublicKey: string;
   /** Public on-chain token id — matches getAssetBalances/getTokenBalances. */
   publicTokenId: string;
+}
+
+/**
+ * Identifies one on-chain output.
+ */
+export interface OutputRef {
+  /** Transaction id of the transaction that contains the output. */
+  txid: string;
+  /** Index of the output within that transaction. */
+  vout: number;
+}
+
+/**
+ * Options for signing a message with an output's blinding key.
+ */
+export interface SignOutputOptions extends OutputRef {
+  /**
+   * The message to sign, passed to the BLS scheme exactly as given (no length
+   * prefix, no extra hashing), so it verifies under
+   * `Signature.verify(publicKey, message)`.
+   */
+  message: string;
+}
+
+/**
+ * A recovered output blinding key.
+ */
+export interface RecoveredBlindingKey {
+  /** The PRIVATE blinding scalar, 64 hex characters. Treat as a secret. */
+  blindingKey: string;
+  /**
+   * The public counterpart `k * G`, 96 hex characters — the output's
+   * `blsctData.ephemeralKey` on chain.
+   *
+   * Note this is NOT the field navio-core calls `blsctData.blindingKey`,
+   * which is `k * sk_destination` and verifies nothing signed with `k`.
+   */
+  publicKey: string;
+  /**
+   * How the scalar was obtained:
+   * - `stored`: read back from this wallet's database (the fast path)
+   * - `derived`: recomputed from the seed (the seed-restore fallback)
+   */
+  source: 'stored' | 'derived';
+  /** The sender-assigned counter that matched, when derived. */
+  counter?: number;
+  /**
+   * The input outid the derivation was anchored on, when derived.
+   *
+   * Not necessarily `vin[0]` of the containing transaction: block aggregation
+   * merges other senders' inputs in, and navio-core shuffles `vin` before
+   * broadcast, so recovery searches every input.
+   */
+  anchorOutid?: string;
+}
+
+/**
+ * A signature produced with an output's blinding key.
+ */
+export interface SignOutputResult {
+  /** The signature, 192 hex characters (96 bytes). */
+  signature: string;
+  /**
+   * The PUBLIC key the signature verifies against, 96 hex characters: `k * G`,
+   * which is on chain as the output's `blsctData.ephemeralKey`.
+   *
+   * Deliberately not `blsctData.blindingKey` — that field is
+   * `k * sk_destination` and no signature made with `k` verifies against it.
+   */
+  blindingKey: string;
 }
 
 /**
@@ -742,6 +839,17 @@ export interface NavioClientConfig {
 
   /** Create wallet if it doesn't exist (default: false) */
   createWalletIfNotExists?: boolean;
+
+  /**
+   * Derive output blinding keys deterministically from the wallet seed so they
+   * can be recovered later (default: true).
+   *
+   * This is what makes `recoverBlindingKey` and `signOutput` work, including
+   * after restoring the wallet from its mnemonic alone. Set to false to go
+   * back to a fresh random scalar per output, which is unrecoverable.
+   * Individual sends can override this with `randomBlindingKeys`.
+   */
+  deterministicBlindingKeys?: boolean;
 
   /** Restore wallet from seed (hex string) */
   restoreFromSeed?: string;
@@ -1932,6 +2040,7 @@ export class NavioClient {
       subtractFeeFromAmount = false,
       tokenId = null,
       selectedUtxos,
+      randomBlindingKeys,
     } = options;
 
     if (amount <= 0n) {
@@ -2032,6 +2141,10 @@ export class NavioClient {
           ));
         }
 
+        const candidateInputs = [
+          ...selectedAssetOutputs.map((output) => ({ output, tokenId: blsctTokenId })),
+          ...selectedNavOutputs.map((output) => ({ output, tokenId: TokenId.default() })),
+        ];
         const candidateOutputs = this.buildUnsignedSendOutputs(
           destSubAddr,
           blsctTokenId,
@@ -2039,11 +2152,8 @@ export class NavioClient {
           memo,
           assetChangeAmount,
           includeNavChange ? 1n : 0n,
+          this.makeBlindingKeyAllocator(candidateInputs, randomBlindingKeys),
         );
-        const candidateInputs = [
-          ...selectedAssetOutputs.map((output) => ({ output, tokenId: blsctTokenId })),
-          ...selectedNavOutputs.map((output) => ({ output, tokenId: TokenId.default() })),
-        ];
         const estimatedFee = this.estimateSignedUnsignedTransactionFee(candidateInputs, candidateOutputs);
 
         if (manualNavOutputs.length > 0) {
@@ -2080,6 +2190,9 @@ export class NavioClient {
         ...selectedAssetOutputs.map((output) => ({ output, tokenId: blsctTokenId })),
         ...selectedNavOutputs.map((output) => ({ output, tokenId: TokenId.default() })),
       ];
+      // Coin selection has settled, so the first input — which the derivation
+      // binds to — is now fixed.
+      const blindingKeys = this.makeBlindingKeyAllocator(selectedInputs, randomBlindingKeys);
       const outputs = this.buildUnsignedSendOutputs(
         destSubAddr,
         blsctTokenId,
@@ -2087,9 +2200,12 @@ export class NavioClient {
         memo,
         assetChangeAmount,
         navChangeAmount,
+        blindingKeys,
       );
 
-      return this.signAndBroadcastUnsignedTransaction(walletDB, selectedInputs, outputs, fee);
+      return this.signAndBroadcastUnsignedTransaction(
+        walletDB, selectedInputs, outputs, fee, blindingKeys,
+      );
     }
 
     // --- Select inputs ---
@@ -2164,6 +2280,10 @@ export class NavioClient {
     // --- Build inputs (independent of the fee) ---
     const inputs = selected.map((utxo) => ({ output: utxo, tokenId: blsctTokenId }));
 
+    // Coin selection is done, so the first input the signed transaction will
+    // carry is settled and the blinding keys can be bound to it.
+    const blindingKeys = this.makeBlindingKeyAllocator(inputs, randomBlindingKeys);
+
     // Build the dest + change outputs for a given fee via the manual
     // UnsignedTransaction path. NOTE: we do *not* use build_ctx here — that
     // native helper appends its own change output (to a zero/burn destination)
@@ -2191,13 +2311,16 @@ export class NavioClient {
         changeAmount = totalIn - amount - fee;
       }
 
+      // Rebuilt once per fee round; restart the counters so each output's key
+      // follows its position rather than the number of rounds taken.
+      blindingKeys.reset();
       const outputs: InstanceType<typeof UnsignedOutput>[] = [];
       outputs.push(this.toUnsignedOutput(
-        TxOut.generate(destSubAddr, Number(sendAmount), memo, blsctTokenId, TxOutputType.Normal, 0, false, Scalar.random()),
+        TxOut.generate(destSubAddr, Number(sendAmount), memo, blsctTokenId, TxOutputType.Normal, 0, false, blindingKeys.next()),
       ));
       if (changeAmount > 0n) {
         outputs.push(this.toUnsignedOutput(
-          TxOut.generate(this.getChangeSubAddress(), Number(changeAmount), '', blsctTokenId, TxOutputType.Normal, 0, false, Scalar.random()),
+          TxOut.generate(this.getChangeSubAddress(), Number(changeAmount), '', blsctTokenId, TxOutputType.Normal, 0, false, blindingKeys.next()),
         ));
       }
       return { outputs, changeAmount };
@@ -2219,7 +2342,7 @@ export class NavioClient {
       ({ outputs } = buildOutputs(fee));
     }
 
-    return this.signAndBroadcastUnsignedTransaction(walletDB, inputs, outputs, fee);
+    return this.signAndBroadcastUnsignedTransaction(walletDB, inputs, outputs, fee, blindingKeys);
   }
 
   /**
@@ -2251,7 +2374,7 @@ export class NavioClient {
   async sendToMany(options: SendToManyOptions): Promise<SendTransactionResult> {
     const { walletDB } = await this.ensureSpendReady();
 
-    const { recipients, selectedUtxos } = options;
+    const { recipients, selectedUtxos, randomBlindingKeys } = options;
 
     if (!Array.isArray(recipients) || recipients.length === 0) {
       throw new Error('At least one recipient is required');
@@ -2335,6 +2458,10 @@ export class NavioClient {
     const inputs = selected.map((utxo) => ({ output: utxo, tokenId: navTokenId }));
     const baseAmounts = decodedRecipients.map((recipient) => recipient.amount);
 
+    // Coin selection is done, so the first input is settled and the blinding
+    // keys can be bound to it.
+    const blindingKeys = this.makeBlindingKeyAllocator(inputs, randomBlindingKeys);
+
     // Build the recipient + change outputs for a candidate fee. Uses the manual
     // UnsignedTransaction path (not build_ctx): the tx then contains exactly the
     // recipient outputs, a single change output, and a single fee output.
@@ -2380,6 +2507,9 @@ export class NavioClient {
         changeAmount = totalIn - totalSendAmount - fee;
       }
 
+      // Rebuilt once per fee round; restart the counters so each output's key
+      // follows its position rather than the number of rounds taken.
+      blindingKeys.reset();
       const outputs: InstanceType<typeof UnsignedOutput>[] = [];
       for (let i = 0; i < decodedRecipients.length; i++) {
         const recipient = decodedRecipients[i];
@@ -2391,7 +2521,7 @@ export class NavioClient {
           TxOutputType.Normal,
           0,
           false,
-          Scalar.random(),
+          blindingKeys.next(),
         )));
       }
 
@@ -2404,7 +2534,7 @@ export class NavioClient {
           TxOutputType.Normal,
           0,
           false,
-          Scalar.random(),
+          blindingKeys.next(),
         )));
       }
 
@@ -2425,7 +2555,7 @@ export class NavioClient {
       ({ outputs } = buildOutputs(fee));
     }
 
-    return this.signAndBroadcastUnsignedTransaction(walletDB, inputs, outputs, fee);
+    return this.signAndBroadcastUnsignedTransaction(walletDB, inputs, outputs, fee, blindingKeys);
   }
 
   /**
@@ -2495,32 +2625,38 @@ export class NavioClient {
     const { tokenKey, tokenPublicKey } = this.buildCollectionTokenContext(collectionTokenId);
     const tokenInfo = TokenInfo.build(TokenType.Token, tokenPublicKey, metadata, totalSupply);
 
-    const outputs = [UnsignedOutput.createTokenCollection(tokenKey, tokenInfo)];
-
     let mintedAmount: bigint | undefined;
+    let mintAmount = 0;
+    let mintDestination: InstanceType<typeof SubAddr> | null = null;
     if (options.initialMint) {
-      const mintAmount = toSafeInteger(options.initialMint.amount, 'initialMint.amount');
+      mintAmount = toSafeInteger(options.initialMint.amount, 'initialMint.amount');
       if (mintAmount <= 0) {
         throw new Error('initialMint.amount must be positive');
       }
       if (mintAmount > totalSupply) {
         throw new Error('initialMint.amount exceeds totalSupply');
       }
-      const mintDestination = this.decodeDestinationAddress(options.initialMint.address);
-      // The create output must precede the mint output: consensus executes
-      // predicates in output order, and the mint predicate requires the
-      // token to already exist in the view.
-      outputs.push(
-        UnsignedOutput.mintToken(
-          mintDestination, mintAmount, Scalar.random(), tokenKey, tokenPublicKey, this.wantsTranscriptV2(),
-        )
-      );
+      mintDestination = this.decodeDestinationAddress(options.initialMint.address);
       mintedAmount = BigInt(mintAmount);
     }
 
     let result: SendTransactionResult;
     try {
-      result = await this.buildAndBroadcastUnsignedTransaction(outputs, options.selectedUtxos);
+      result = await this.buildAndBroadcastUnsignedTransaction((blindingKeys) => {
+        const outputs = [UnsignedOutput.createTokenCollection(tokenKey, tokenInfo)];
+        if (mintDestination !== null) {
+          // The create output must precede the mint output: consensus executes
+          // predicates in output order, and the mint predicate requires the
+          // token to already exist in the view.
+          outputs.push(
+            UnsignedOutput.mintToken(
+              mintDestination, mintAmount, blindingKeys.next(), tokenKey, tokenPublicKey,
+              this.wantsTranscriptV2(),
+            )
+          );
+        }
+        return outputs;
+      }, options.selectedUtxos);
     } catch (err) {
       throw options.initialMint ? augmentMintBroadcastError(err, collectionTokenId) : err;
     }
@@ -2550,7 +2686,7 @@ export class NavioClient {
     const tokenInfo = TokenInfo.build(TokenType.Nft, tokenPublicKey, metadata, totalSupply);
 
     const result = await this.buildAndBroadcastUnsignedTransaction(
-      UnsignedOutput.createTokenCollection(tokenKey, tokenInfo),
+      () => [UnsignedOutput.createTokenCollection(tokenKey, tokenInfo)],
       options.selectedUtxos
     );
 
@@ -2779,9 +2915,9 @@ export class NavioClient {
       // wantsTranscriptV2); a v1 mint output in a v2 transaction is rejected
       // with failed-rangeproof-check.
       result = await this.buildAndBroadcastUnsignedTransaction(
-        UnsignedOutput.mintToken(
-          destination, mintAmount, Scalar.random(), tokenKey, tokenPublicKey, this.wantsTranscriptV2(),
-        ),
+        (blindingKeys) => [UnsignedOutput.mintToken(
+          destination, mintAmount, blindingKeys.next(), tokenKey, tokenPublicKey, this.wantsTranscriptV2(),
+        )],
         options.selectedUtxos
       );
     } catch (err) {
@@ -2814,7 +2950,9 @@ export class NavioClient {
     let result: SendTransactionResult;
     try {
       result = await this.buildAndBroadcastUnsignedTransaction(
-        UnsignedOutput.mintNft(destination, Scalar.random(), tokenKey, tokenPublicKey, nftId, metadata),
+        (blindingKeys) => [
+          UnsignedOutput.mintNft(destination, blindingKeys.next(), tokenKey, tokenPublicKey, nftId, metadata),
+        ],
         options.selectedUtxos
       );
     } catch (err) {
@@ -2864,13 +3002,16 @@ export class NavioClient {
     const { collectionTokenId, tokenKey, tokenPublicKey } =
       await this.resolveCollectionTokenContext(options.collectionTokenId, 'nft');
 
-    const outputs = normalized.map((nft) =>
-      UnsignedOutput.mintNft(nft.destination, Scalar.random(), tokenKey, tokenPublicKey, nft.nftId, nft.metadata)
-    );
-
     let result: SendTransactionResult;
     try {
-      result = await this.buildAndBroadcastUnsignedTransaction(outputs, options.selectedUtxos);
+      result = await this.buildAndBroadcastUnsignedTransaction(
+        (blindingKeys) => normalized.map((nft) =>
+          UnsignedOutput.mintNft(
+            nft.destination, blindingKeys.next(), tokenKey, tokenPublicKey, nft.nftId, nft.metadata,
+          )
+        ),
+        options.selectedUtxos,
+      );
     } catch (err) {
       throw augmentMintBroadcastError(err, collectionTokenId);
     }
@@ -2906,6 +3047,241 @@ export class NavioClient {
     }
 
     throw new Error('Connected backend does not support transaction broadcasting');
+  }
+
+  // ============================================================================
+  // Output blinding key recovery
+  //
+  // A BLSCT output's public blinding point is on chain; the private scalar is
+  // the sender's. Recovering it proves, after the fact, that this wallet
+  // created the output — which is the only thing that identifies the sender of
+  // a confidential payment. See src/blinding-key.ts for the derivation, which
+  // is normative and shared with navio-core.
+  // ============================================================================
+
+  /**
+   * Fetch and parse the transaction containing an output.
+   */
+  private async fetchOutputContext(ref: OutputRef): Promise<{
+    /** Every input outid of the containing transaction, in wire order. */
+    inputOutids: string[];
+    outputHash: string;
+    /** The on-chain point equal to k*G. See the note in this method. */
+    blindingPublicKey: string;
+  }> {
+    if (!this.initialized) {
+      await this.initialize();
+    }
+    if (!this.isConnected()) {
+      throw new Error('Not connected to backend. Please reconnect before recovering blinding keys.');
+    }
+    if (!Number.isInteger(ref.vout) || ref.vout < 0) {
+      throw new Error(`Invalid vout: ${ref.vout}`);
+    }
+
+    let rawTx: string;
+    try {
+      const fetched = await this.syncProvider.getRawTransaction(ref.txid, false);
+      rawTx = typeof fetched === 'string' ? fetched : String((fetched as any)?.hex ?? '');
+    } catch (err) {
+      throw new Error(
+        `Could not fetch transaction ${ref.txid}: ${err instanceof Error ? err.message : String(err)}`
+      );
+    }
+    if (!rawTx) {
+      throw new Error(`Backend returned no raw transaction for ${ref.txid}`);
+    }
+
+    const parsed = parseTransaction(Buffer.from(rawTx, 'hex'));
+    if (ref.vout >= parsed.outputs.length) {
+      throw new Error(
+        `Transaction ${ref.txid} has ${parsed.outputs.length} outputs; vout ${ref.vout} is out of range`
+      );
+    }
+    if (parsed.inputHashes.length === 0) {
+      throw new Error(
+        `Transaction ${ref.txid} has no inputs, so it carries no outid to derive from ` +
+        '(coinbase and staking outputs are not recoverable this way)'
+      );
+    }
+
+    const output = parsed.outputs[ref.vout];
+
+    // The public counterpart of the blinding scalar k is the output's
+    // EPHEMERAL key, not the field that navio-core calls
+    // `blsctData.blindingKey`.
+    //
+    // From navio-core's UnsignedOutput::GenerateKeys
+    // (src/blsct/wallet/txfactory_global.cpp):
+    //
+    //     out.blsctData.ephemeralKey = PrivateKey(blindingKey).GetPoint();  // k*G
+    //     out.blsctData.blindingKey  = sk * blindingKey;                    // k*sk_dest
+    //
+    // so only ephemeralKey equals k*G and only it verifies a signature made
+    // with k. Comparing against blsctData.blindingKey would never match, and
+    // a signature would never verify against it.
+    const blindingPublicKey = output.keys?.ephemeralKey?.toLowerCase();
+    if (!blindingPublicKey) {
+      throw new Error(`Output ${ref.txid}:${ref.vout} carries no BLSCT keys`);
+    }
+
+    return {
+      inputOutids: parsed.inputHashes,
+      outputHash: output.outputHash,
+      blindingPublicKey,
+    };
+  }
+
+  /**
+   * The derivation anchor for an output this wallet created, if the wallet can
+   * still tell which of the transaction's inputs were its own.
+   *
+   * After block aggregation a transaction carries other senders' inputs too,
+   * so the anchor is the canonical one over the subset this wallet owns.
+   * Returns null when that subset cannot be determined, and the caller falls
+   * back to scanning every input.
+   *
+   * @param inputOutids - Every input outid of the containing transaction
+   */
+  private async ownAnchorOutid(inputOutids: string[]): Promise<string | null> {
+    if (!this.walletDB) {
+      return null;
+    }
+    try {
+      const owned = new Set((await this.walletDB.getAllOutputs()).map((output) => output.outputHash));
+      return canonicalAnchorOutid(inputOutids.filter((outid) => owned.has(outid)));
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Recover the private blinding scalar of an output this wallet created.
+   *
+   * Tries the scalar persisted when the output was built, then falls back to
+   * recomputing it from the wallet seed — which is what survives restoring the
+   * wallet from its mnemonic alone. Either way the result is checked against
+   * the public blinding point on chain before being returned, so a success is
+   * proof rather than an assumption.
+   *
+   * Because Navio merges every non-coinbase transaction in a block into one,
+   * an output's on-chain index is not the index its sender assigned, so the
+   * derivation is searched over the first {@link MAX_OUTPUT_SEARCH} counters
+   * rather than trusting `vout`.
+   *
+   * Only works for outputs created by a wallet running this SDK version or
+   * later: earlier outputs used a random scalar that was discarded.
+   *
+   * @param ref - The output to recover
+   * @returns The private scalar, the public point, and how it was obtained
+   * @throws If the wallet is locked, the transaction cannot be fetched, or the
+   *   output was not created by this wallet
+   *
+   * @example
+   * ```typescript
+   * const { blindingKey } = await client.recoverBlindingKey({ txid, vout: 0 });
+   * ```
+   */
+  async recoverBlindingKey(ref: OutputRef): Promise<RecoveredBlindingKey> {
+    const context = await this.fetchOutputContext(ref);
+
+    if (!this.keyManager) {
+      throw new Error('Client not initialized');
+    }
+    if (!this.keyManager.isUnlocked()) {
+      throw new Error('Wallet is locked. Unlock it before recovering blinding keys.');
+    }
+
+    // Fast path: the scalar this wallet stored when it built the output.
+    if (this.walletDB) {
+      const stored = await this.walletDB.getOutputBlindingKey(context.outputHash);
+      if (stored) {
+        const scalar = Scalar.deserialize(stored);
+        if (blindingPublicKeyHex(scalar) === context.blindingPublicKey) {
+          return {
+            blindingKey: stored,
+            publicKey: context.blindingPublicKey,
+            source: 'stored',
+          };
+        }
+        // A stored value that does not match the chain is stale or foreign;
+        // ignore it and let the derivation speak.
+      }
+    }
+
+    // Fallback: recompute from the seed. Survives a seed-only restore.
+    let seed: InstanceType<typeof Scalar>;
+    try {
+      seed = this.keyManager.getMasterSeedKey();
+    } catch {
+      throw new Error(
+        'This wallet has no HD seed (view-key-only wallets cannot recover blinding keys).'
+      );
+    }
+
+    // The canonical anchor over our own inputs is what the sender derived
+    // from, so it normally hits on the first try; every input is kept as a
+    // fallback for when this wallet can no longer tell which were its own (a
+    // partial rescan, say). A wrong anchor can only cost time — the search
+    // verifies every candidate against the chain.
+    const anchor = await this.ownAnchorOutid(context.inputOutids);
+    const candidates = anchor === null ? context.inputOutids : [anchor, ...context.inputOutids];
+
+    const match = searchBlindingKey(seed, candidates, context.blindingPublicKey);
+    if (match) {
+      return {
+        blindingKey: match.scalar.serialize().padStart(64, '0'),
+        publicKey: context.blindingPublicKey,
+        source: 'derived',
+        counter: match.counter,
+        anchorOutid: match.outid,
+      };
+    }
+
+    throw new Error(
+      `Could not recover the blinding key for ${ref.txid}:${ref.vout}. The output was not created ` +
+      'by this wallet, or it was created before deterministic blinding keys existed (recovery ' +
+      'applies only to outputs created by navio-sdk 0.2.0 or later).'
+    );
+  }
+
+  /**
+   * Sign an arbitrary message with the blinding key of an output this wallet
+   * created — a proof that this wallet was the sender of that output.
+   *
+   * The message is signed exactly as given, with no length prefix and no
+   * hashing beyond what the BLS scheme does, so the returned signature
+   * verifies under `Signature.verify(publicKey, message)` in navio-blsct.
+   *
+   * Note what this does and does not prove: it shows the signer created the
+   * output, not that they currently own the funds. That is the right property
+   * for a refund claim — the person who paid is the person entitled to the
+   * reversal.
+   *
+   * @param options - The output and the message to sign
+   * @returns The signature and the PUBLIC blinding key it verifies against
+   *
+   * @example
+   * ```typescript
+   * const { signature, blindingKey } = await client.signOutput({
+   *   txid, vout: 0, message: `navio-hl-refund/v1|${txid}|0|wrong address`,
+   * });
+   * ```
+   */
+  async signOutput(options: SignOutputOptions): Promise<SignOutputResult> {
+    const { txid, vout, message } = options;
+    if (typeof message !== 'string') {
+      throw new Error('message must be a string');
+    }
+
+    const recovered = await this.recoverBlindingKey({ txid, vout });
+    const scalar = Scalar.deserialize(recovered.blindingKey);
+    const signature = Signature.generate(scalar, message);
+
+    return {
+      signature: signature.serialize(),
+      blindingKey: recovered.publicKey,
+    };
   }
 
   // ============================================================================
@@ -3411,7 +3787,7 @@ export class NavioClient {
     /** outputHashes never to select automatically (reserved by standing orders) */
     excludeUtxos?: Set<string>;
   }): Promise<{ halfHex: string; fee: bigint; spentInputs: string[] }> {
-    const { keyManager } = await this.ensureSpendReady();
+    const { keyManager, walletDB } = await this.ensureSpendReady();
     const { payAmount, recvAmount, makerFee } = params;
     if (payAmount <= 0n || recvAmount <= 0n) {
       throw new Error('Swap amounts must be positive');
@@ -3486,26 +3862,31 @@ export class NavioClient {
     const recvDestination = keyManager.getSubAddress({ account: 0, address: 0 });
     const changeSubAddr = this.getChangeSubAddress();
 
+    // Assigned once coin selection below has settled; a swap half's outputs are
+    // only ever built inside the fee loop, which runs after that.
+    let blindingKeys = BlindingKeyAllocator.random();
+
     const buildOutputs = (
       payChange: bigint,
       navChange: bigint,
     ): InstanceType<typeof UnsignedOutput>[] => {
+      blindingKeys.reset();
       const outputs: InstanceType<typeof UnsignedOutput>[] = [];
       // The received leg: an output with no matching input in this half.
       outputs.push(this.toUnsignedOutput(TxOut.generate(
         recvDestination, toSafeInteger(recvAmount, 'recvAmount'), 'swap-recv', recv.blsct,
-        TxOutputType.Normal, 0, false, Scalar.random(),
+        TxOutputType.Normal, 0, false, blindingKeys.next(),
       )));
       if (payChange > 0n) {
         outputs.push(this.toUnsignedOutput(TxOut.generate(
           changeSubAddr, toSafeInteger(payChange, 'pay change'), '', pay.blsct,
-          TxOutputType.Normal, 0, false, Scalar.random(),
+          TxOutputType.Normal, 0, false, blindingKeys.next(),
         )));
       }
       if (navChange > 0n) {
         outputs.push(this.toUnsignedOutput(TxOut.generate(
           changeSubAddr, toSafeInteger(navChange, 'NAV change'), '', TokenId.default(),
-          TxOutputType.Normal, 0, false, Scalar.random(),
+          TxOutputType.Normal, 0, false, blindingKeys.next(),
         )));
       }
       return outputs;
@@ -3550,6 +3931,18 @@ export class NavioClient {
       ...selectedNav.filter(() => !payIsNav).map((output) => ({ output, tokenId: TokenId.default() })),
     ];
 
+    // Selection has settled, so the canonical anchor over this half's own
+    // inputs is fixed and the blinding keys can be derived from it.
+    //
+    // A swap half is later aggregated with the counterparty's half, so the
+    // combined transaction carries their inputs too and its first input may
+    // well be theirs. That is fine: the anchor is canonical over *our* inputs
+    // rather than positional, and recovery falls back to scanning every input
+    // of the containing transaction, so these outputs stay recoverable from
+    // the seed alone. The scalars are also persisted below, keyed by output
+    // hash — which aggregation does not change — as the fast path.
+    blindingKeys = this.makeBlindingKeyAllocator(makeInputs());
+
     // Fee fixpoint. Taker halves pay 0; maker halves must clear the consensus
     // minimum for their own signed size plus the taker allowance.
     let fee = 0n;
@@ -3582,6 +3975,8 @@ export class NavioClient {
       }
       fee = required;
     }
+
+    await this.persistBlindingKeys(walletDB, halfHex, blindingKeys);
 
     return {
       halfHex,
@@ -3892,19 +4287,51 @@ export class NavioClient {
     return { selected, totalIn, fee };
   }
 
+  /**
+   * Select NAV funding, then build and broadcast a transaction around outputs
+   * the caller supplies.
+   *
+   * Outputs are produced by a factory rather than passed in ready-made: the
+   * blinding-key derivation needs the first input's outid, so coin selection
+   * has to happen first. The factory is called with the allocator to draw keys
+   * from, and may be called more than once while the fee converges.
+   *
+   * @param buildAssetOutputs - Produces the transaction's non-change outputs
+   * @param selectedUtxos - Optional manual funding selection
+   * @param useRandomBlindingKeys - Opt out of recoverable blinding keys
+   */
   private async buildAndBroadcastUnsignedTransaction(
-    unsignedOutput: InstanceType<typeof UnsignedOutput> | InstanceType<typeof UnsignedOutput>[],
+    buildAssetOutputs: (blindingKeys: BlindingKeyAllocator) => InstanceType<typeof UnsignedOutput>[],
     selectedUtxos?: string[],
+    useRandomBlindingKeys?: boolean,
   ): Promise<SendTransactionResult> {
-    // Output order is preserved through signing and consensus executes output
-    // predicates in order, so callers may rely on it (e.g. a create-collection
-    // output registering the token before a mint output in the same tx).
-    const assetOutputs = Array.isArray(unsignedOutput) ? unsignedOutput : [unsignedOutput];
     const { walletDB } = await this.ensureSpendReady();
     const { selected, totalIn } = await this.selectFundingUtxos(walletDB, selectedUtxos);
     const inputs = selected.map((utxo) => ({ output: utxo, tokenId: TokenId.default() }));
+    const blindingKeys = this.makeBlindingKeyAllocator(inputs, useRandomBlindingKeys);
 
-    let outputs = [...assetOutputs];
+    // Output order is preserved through signing and consensus executes output
+    // predicates in order, so callers may rely on it (e.g. a create-collection
+    // output registering the token before a mint output in the same tx).
+    //
+    // The asset outputs are built once — mint outputs carry range proofs and
+    // are expensive — and only the change output is rebuilt as the fee moves.
+    // Rewinding the counter to the same position each round keeps the change
+    // output's key tied to its ordinal rather than to the round number.
+    blindingKeys.reset();
+    const assetOutputs = buildAssetOutputs(blindingKeys);
+    const changeCounter = blindingKeys.position;
+
+    const buildAll = (navChangeAmount: bigint): InstanceType<typeof UnsignedOutput>[] => {
+      const built = [...assetOutputs];
+      if (navChangeAmount > 0n) {
+        blindingKeys.reset(changeCounter);
+        built.push(this.buildUnsignedNavChangeOutput(navChangeAmount, blindingKeys));
+      }
+      return built;
+    };
+
+    let outputs = buildAll(0n);
     let fee = 0n;
     let previousNavChange: bigint | null = null;
 
@@ -3918,17 +4345,12 @@ export class NavioClient {
       }
 
       const navChangeAmount = totalIn - fee;
-      const nextOutputs = [...assetOutputs];
-      if (navChangeAmount > 0n) {
-        nextOutputs.push(this.buildUnsignedNavChangeOutput(navChangeAmount));
-      }
-
-      if (previousNavChange !== null && navChangeAmount === previousNavChange) {
-        outputs = nextOutputs;
-        break;
-      }
+      const nextOutputs = buildAll(navChangeAmount);
 
       outputs = nextOutputs;
+      if (previousNavChange !== null && navChangeAmount === previousNavChange) {
+        break;
+      }
       previousNavChange = navChangeAmount;
     }
 
@@ -3937,10 +4359,14 @@ export class NavioClient {
       inputs,
       outputs,
       fee,
+      blindingKeys,
     );
   }
 
-  private buildUnsignedNavChangeOutput(amount: bigint): InstanceType<typeof UnsignedOutput> {
+  private buildUnsignedNavChangeOutput(
+    amount: bigint,
+    blindingKeys: BlindingKeyAllocator,
+  ): InstanceType<typeof UnsignedOutput> {
     return this.toUnsignedOutput(TxOut.generate(
       this.getChangeSubAddress(),
       Number(amount),
@@ -3949,7 +4375,7 @@ export class NavioClient {
       TxOutputType.Normal,
       0,
       false,
-      Scalar.random(),
+      blindingKeys.next(),
     ));
   }
 
@@ -3960,9 +4386,15 @@ export class NavioClient {
     memo: string,
     assetChangeAmount: bigint,
     navChangeAmount: bigint,
+    blindingKeys: BlindingKeyAllocator,
   ): InstanceType<typeof UnsignedOutput>[] {
     const outputs: InstanceType<typeof UnsignedOutput>[] = [];
     const changeSubAddr = this.getChangeSubAddress();
+
+    // Fee estimation rebuilds the outputs several times; restart the counters
+    // so the key each output gets depends on its position, not on how many
+    // rounds the fee fixpoint happened to take.
+    blindingKeys.reset();
 
     outputs.push(this.toUnsignedOutput(TxOut.generate(
       destination,
@@ -3972,7 +4404,7 @@ export class NavioClient {
       TxOutputType.Normal,
       0,
       false,
-      Scalar.random(),
+      blindingKeys.next(),
     )));
 
     if (assetChangeAmount > 0n) {
@@ -3984,7 +4416,7 @@ export class NavioClient {
         TxOutputType.Normal,
         0,
         false,
-        Scalar.random(),
+        blindingKeys.next(),
       )));
     }
 
@@ -3997,7 +4429,7 @@ export class NavioClient {
         TxOutputType.Normal,
         0,
         false,
-        Scalar.random(),
+        blindingKeys.next(),
       )));
     }
 
@@ -4027,15 +4459,94 @@ export class NavioClient {
     return fee;
   }
 
+  /**
+   * Build the blinding-key source for a transaction.
+   *
+   * The derivation binds to the canonical anchor over the wallet's own
+   * selected inputs, so this must be called only once coin selection has
+   * settled — the anchor depends on the whole input set, not on their order.
+   *
+   * @param inputs - The selected inputs (all of them this wallet's own)
+   * @param useRandom - Caller opted out of recoverable keys
+   */
+  private makeBlindingKeyAllocator(
+    inputs: Array<{ output: WalletOutput }>,
+    useRandom?: boolean,
+  ): BlindingKeyAllocator {
+    const deterministic = useRandom === undefined
+      ? this.config.deterministicBlindingKeys !== false
+      : !useRandom;
+
+    if (!deterministic || inputs.length === 0 || !this.keyManager) {
+      return BlindingKeyAllocator.random();
+    }
+
+    let seed: InstanceType<typeof Scalar>;
+    try {
+      seed = this.keyManager.getMasterSeedKey();
+    } catch {
+      // Watch-only / view-key-only wallets have no seed. They cannot spend
+      // either, so this is belt and braces, but random keys keep the build
+      // working rather than throwing from a key-derivation detail.
+      return BlindingKeyAllocator.random();
+    }
+
+    return new BlindingKeyAllocator(seed, inputs.map((input) => input.output.outputHash));
+  }
+
+  /**
+   * Persist the private blinding scalars of the outputs we just created.
+   *
+   * Outputs are matched to scalars by their public blinding point rather than
+   * by position: the signed transaction carries an extra fee output, and this
+   * way the mapping does not depend on where the native builder puts it.
+   *
+   * Failure is non-fatal — the transaction is already broadcast, and the seed
+   * derivation recovers the same scalars without this table.
+   */
+  private async persistBlindingKeys(
+    walletDB: IWalletDB,
+    rawTx: string,
+    blindingKeys: BlindingKeyAllocator,
+  ): Promise<void> {
+    if (!blindingKeys.isDeterministic) {
+      return;
+    }
+    try {
+      const assigned = blindingKeys.assignedByPublicKey();
+      if (assigned.size === 0) {
+        return;
+      }
+      const parsed = parseTransaction(Buffer.from(rawTx, 'hex'));
+      for (const output of parsed.outputs) {
+        // ephemeralKey, not the field named blindingKey — see
+        // fetchOutputContext for why those are different points.
+        const publicHex = output.keys?.ephemeralKey?.toLowerCase();
+        if (!publicHex) continue;
+        const scalarHex = assigned.get(publicHex);
+        if (scalarHex) {
+          await walletDB.saveOutputBlindingKey(output.outputHash, scalarHex);
+        }
+      }
+    } catch {
+      // Best effort: the derivation is the source of truth.
+    }
+  }
+
   private async signAndBroadcastUnsignedTransaction(
     walletDB: IWalletDB,
     inputs: Array<{ output: WalletOutput; tokenId: InstanceType<typeof TokenId> }>,
     outputs: InstanceType<typeof UnsignedOutput>[],
     fee: bigint,
+    blindingKeys?: BlindingKeyAllocator,
   ): Promise<SendTransactionResult> {
     const { rawTx, txId, ctx } = this.signUnsignedTransaction(inputs, outputs, fee);
 
     await this.broadcastRawTransaction(rawTx);
+
+    if (blindingKeys) {
+      await this.persistBlindingKeys(walletDB, rawTx, blindingKeys);
+    }
 
     for (const input of inputs) {
       await walletDB.markOutputSpent(input.output.outputHash, txId, 0);

@@ -12,6 +12,7 @@ TypeScript SDK for interacting with the Navio blockchain. Provides wallet manage
 - **Balance Tracking** - Query wallet balance and UTXOs
 - **Token/NFT Transfer, Creation & Minting** - Create collections, mint assets, send tokenized outputs, and inspect owned assets
 - **RFQ Atomic-Swap Trading** - Trade tokens peer-to-peer as taker or maker over Navio's encrypted p2p messaging bus; swap halves are built and signed locally
+- **Recoverable Output Blinding Keys** - Prove after the fact that this wallet created a given confidential output, and sign arbitrary messages with its blinding key, even after a seed-only restore
 - **Spending Status Tracking** - Monitor spent/unspent outputs
 - **Blockchain Reorganization Handling** - Automatic reorg detection and recovery
 - **Cross-Platform Persistence** - Efficient SQLite storage (sql.js with IndexedDB for browser, better-sqlite3 for Node.js)
@@ -115,6 +116,9 @@ interface NavioClientConfig {
   restoreFromAuditKey?: string;      // Restore watch-only wallet from audit key (160 hex chars)
   restoreFromHeight?: number;        // Block height when wallet was created (for restore)
   creationHeight?: number;           // Creation height for new wallets (default: chainTip - 100)
+
+  // Output blinding keys
+  deterministicBlindingKeys?: boolean; // Derive recoverable blinding keys from the seed (default: true)
 }
 ```
 
@@ -250,7 +254,8 @@ interface WalletOutput {
   amount: bigint;
   memo: string | null;
   tokenId: string | null;           // 64-hex token hash for fungible tokens, 80-hex token ID for NFTs, or null for NAV
-  blindingKey: string;
+  blindingKey: string;              // blsctData.blindingKey: k * sk_destination (recipient-bound)
+  ephemeralKey: string | null;      // blsctData.ephemeralKey: k * G — what signOutput's signatures verify against
   spendingKey: string;
   isSpent: boolean;
   spentTxHash: string | null;
@@ -556,6 +561,61 @@ const batch = await client.mintNfts({
 });
 console.log(batch.tokenIds); // full 80-hex NFT token ids, input order
 ```
+
+#### Output Blinding Keys
+
+Prove that this wallet created a given confidential output. See
+[Prove You Sent an Output](#prove-you-sent-an-output) for the why and the
+caveats; recovery only works for outputs created by navio-sdk 0.2.0 or later.
+
+##### `recoverBlindingKey(ref: OutputRef): Promise<RecoveredBlindingKey>`
+
+Recover the private blinding scalar of an output this wallet created.
+
+Reads the scalar this wallet stored when it built the output, and otherwise
+recomputes it from the seed — which is what survives a restore from the
+mnemonic alone. Either way the candidate is checked against the output's
+on-chain point before being returned, so a success is proof rather than an
+assumption.
+
+Neither the output's on-chain index nor any input position is trusted. The
+derivation is anchored on the lexicographically smallest outid among the inputs
+the sender contributed, because navio-core shuffles `vin` before broadcast and
+block aggregation splices in other senders' inputs. Recovery tries that
+canonical anchor first and then falls back to every input, each against the
+first 16 ordinals, verifying every candidate against the chain.
+
+```typescript
+const { blindingKey, publicKey, source, counter } =
+  await client.recoverBlindingKey({ txid, vout: 0 });
+```
+
+| Field | Meaning |
+|-------|---------|
+| `blindingKey` | The **private** scalar, 64 hex chars. Treat as a secret. |
+| `publicKey` | `k * G`, 96 hex chars — the output's `blsctData.ephemeralKey`. |
+| `source` | `'stored'` (from this wallet's database) or `'derived'` (from the seed). |
+| `counter` | The sender-assigned counter that matched, when derived. |
+| `anchorOutid` | The input outid the derivation was anchored on, when derived. |
+
+Throws when the wallet is locked, when the transaction cannot be fetched, or
+when the output was not created by this wallet.
+
+##### `signOutput(options: SignOutputOptions): Promise<SignOutputResult>`
+
+Sign an arbitrary message with an output's blinding key.
+
+The message is signed exactly as given — no length prefix, no hashing beyond
+what the BLS scheme does — so the signature verifies under
+`Signature.verify(publicKey, message)` in navio-blsct.
+
+```typescript
+const { signature, blindingKey } = await client.signOutput({
+  txid, vout: 0, message: `navio-hl-refund/v1|${txid}|0|wrong address`,
+});
+```
+
+`blindingKey` is the **public** key the signature verifies against.
 
 #### Chain & Metadata
 
@@ -1196,6 +1256,54 @@ const result3 = await client.sendToMany({
 console.log('Multi-send tx:', result3.txId);
 ```
 
+### Prove You Sent an Output
+
+A confidential output carries nothing that identifies its sender. The blinding
+scalar is the exception: only the sender ever knew it. This SDK derives that
+scalar from the wallet seed instead of discarding it, so the sender can
+recompute it later and sign with it — the proof behind a refund claim for a
+payment that went to the wrong place.
+
+```typescript
+import { PublicKey, Signature } from '@nav-io/navio-blsct';
+
+// Works from a wallet restored from its mnemonic alone: the scalar is
+// re-derived from the seed, not read back from a database.
+const message = `navio-hl-refund/v1|${txid}|${vout}|paid the wrong address`;
+const { signature, blindingKey } = await client.signOutput({ txid, vout, message });
+
+// Anyone can now check the claim against the output's on-chain key.
+const ok = Signature.deserialize(signature).verify(PublicKey.deserialize(blindingKey), message);
+
+// Or take the scalar itself.
+const { blindingKey: scalar, source } = await client.recoverBlindingKey({ txid, vout });
+console.log(source); // 'stored' (this wallet's database) or 'derived' (from the seed)
+```
+
+Three things worth knowing:
+
+- **Only outputs created by navio-sdk 0.2.0 or later can be recovered.**
+  Earlier ones used a random scalar that was thrown away.
+- `blindingKey` in the result is the **public** point `k * G`, which is on
+  chain as the output's `blsctData.ephemeralKey`. It is deliberately not the
+  field navio-core calls `blsctData.blindingKey` — that one is
+  `k * sk_destination`, bound to the recipient's spend key, and no signature
+  made with `k` verifies against it. The same point is on every synced output
+  as `WalletOutput.ephemeralKey`, so a verifier can check a claim without
+  going near the sender's wallet:
+
+  ```typescript
+  const output = (await client.getAllOutputs()).find(o => o.outputHash === hash)!;
+  Signature.deserialize(signature).verify(PublicKey.deserialize(output.ephemeralKey!), message);
+  ```
+- A signature proves the signer **created** the output, not that they still own
+  the funds. For a refund that is the right property: the person who paid is
+  the person entitled to the reversal.
+
+To opt out and go back to random, unrecoverable keys, set
+`deterministicBlindingKeys: false` on the client or `randomBlindingKeys: true`
+on an individual send.
+
 ### Trade Tokens (RFQ Atomic Swaps)
 
 Light wallets can trade tokens peer-to-peer over Navio's encrypted p2p
@@ -1380,11 +1488,31 @@ The wallet database includes the following tables:
 | `master_seed` | Mnemonic phrase for wallet recovery |
 | `sub_addresses` | Sub-address mappings |
 | `wallet_outputs` | Wallet UTXOs with amounts |
+| `output_blinding_keys` | Private blinding scalars of outputs this wallet created |
 | `wallet_metadata` | Wallet creation info |
 | `encryption_metadata` | Encryption parameters (salt, verification hash) |
 | `tx_keys` | Transaction keys (optional) |
 | `block_hashes` | Block hashes for reorg detection |
 | `sync_state` | Synchronization state |
+
+### output_blinding_keys Schema
+
+Holds the **private** blinding scalar for each output this wallet created, as
+the fast path for `recoverBlindingKey`. Kept out of `wallet_outputs` on
+purpose: the row mappers for that table produce `WalletOutput`, which the
+public getters hand to callers, and a secret must not ride along by accident.
+(`WalletOutput.blindingKey` is the *public* point from the chain.)
+
+Existing databases gain this table when they are next opened; nothing is
+rewritten, and a wallet with no rows here falls back to deriving from the seed.
+
+```sql
+CREATE TABLE output_blinding_keys (
+  output_hash TEXT PRIMARY KEY,
+  blinding_key TEXT NOT NULL,   -- the private scalar, 64 hex chars
+  created_at INTEGER NOT NULL
+);
+```
 
 ### wallet_outputs Schema
 
@@ -1398,7 +1526,8 @@ CREATE TABLE wallet_outputs (
   amount INTEGER NOT NULL DEFAULT 0,
   memo TEXT,
   token_id TEXT,
-  blinding_key TEXT,
+  blinding_key TEXT,     -- blsctData.blindingKey: k * sk_destination
+  ephemeral_key TEXT,    -- blsctData.ephemeralKey: k * G (added in 0.2.0)
   spending_key TEXT,
   is_spent INTEGER NOT NULL DEFAULT 0,
   spent_tx_hash TEXT,
@@ -1528,6 +1657,12 @@ const isValid = await verifyPassword('password', salt, hash);
 1. **Token Support**: Token transfers are tracked but not fully implemented for spending.
 
 2. **Browser bech32m**: In browser environments using navio-blsct WASM, bech32m address encoding may fall back to hex representation.
+
+3. **Blinding key backfill during sync**: the sync-time backfill that
+   pre-populates the fast path only fires for transactions this wallet is seen
+   to have spent an input into. A transaction whose inputs predate the wallet's
+   restore height is classified as `received`, so its outputs are not
+   backfilled — `recoverBlindingKey` still derives them on demand.
 
 ---
 
