@@ -939,6 +939,15 @@ export class KeyManager {
   static readonly SUB_ADDRESS_RECOVERY_LOOKAHEAD = 500;
 
   /**
+   * Hard ceiling on sub-address derivations in one {@link findSubAddressIdByHashId} call.
+   *
+   * Recovery is a rare fallback, so it must be cheap to give up on. Each derivation is a scalar
+   * multiplication on the main thread; at roughly 0.4 ms apiece this caps a miss at a couple of
+   * seconds instead of the unbounded spin a large sub-address counter used to cause.
+   */
+  static readonly SUB_ADDRESS_RECOVERY_MAX_DERIVATIONS = 5000;
+
+  /**
    * Locate the sub-address a hash ID belongs to when it is not in the tracked
    * set, by deriving candidate sub-addresses for every known account up to
    * `lookahead` indices past the account's counter. On a match the sub-address
@@ -964,9 +973,22 @@ export class KeyManager {
       return null;
     }
 
+    // The scan is bounded by a derivation budget, not by the counter. `registerSubAddress`
+    // advances a counter to `address + 1`, so a wallet that uses sparse or hashed sub-address
+    // indices — as a bridge deriving one per user does — ends up with counters in the
+    // quadrillions. Deriving from 0 up to such a counter never finishes: each step is a scalar
+    // multiplication, the loop is synchronous, and the process pins a core forever with no error.
+    // Observed in the wild: an automatic coin selection that never returned, taking every other
+    // timer and I/O callback in the host process down with it.
+    let budget = KeyManager.SUB_ADDRESS_RECOVERY_MAX_DERIVATIONS;
     for (const account of this.knownSubAddressAccounts()) {
       const limit = (this.subAddressCounter.get(account) ?? 0) + Math.max(0, lookahead);
       for (let index = 0; index < limit; index++) {
+        if (budget-- <= 0) {
+          // Give up rather than hang. The caller treats null as "not this wallet's output",
+          // which is the same answer an exhausted scan would have produced.
+          return null;
+        }
         if (this.computeSubAddressHashIdHex(account, index) !== hashIdHex) {
           continue;
         }
