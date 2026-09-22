@@ -1,96 +1,96 @@
 {
-    "name": "navio-sdk",
-    "version": "0.2.0",
-    "description": "TypeScript SDK for interacting with the Navio blockchain",
-    "main": "dist/index.js",
-    "module": "dist/index.mjs",
-    "types": "dist/index.d.ts",
-    "exports": {
-        ".": {
-            "import": {
-                "types": "./dist/index.d.mts",
-                "default": "./dist/index.mjs"
-            },
-            "require": {
-                "types": "./dist/index.d.ts",
-                "default": "./dist/index.js"
-            }
-        }
-    },
-    "files": [
-        "dist"
-    ],
-    "allowScripts": {
-        "@nav-io/navio-blsct": true,
-        "better-sqlite3": true,
-        "esbuild": true
-    },
-    "scripts": {
-        "build": "tsup",
-        "dev": "tsup --watch",
-        "test": "vitest",
-        "test:watch": "vitest --watch",
-        "test:keymanager": "tsx scripts/test-keymanager.ts",
-        "test:walletdb": "tsx scripts/test-walletdb.ts",
-        "test:electrum": "tsx scripts/test-electrum.ts",
-        "test:client": "tsx scripts/test-client.ts",
-        "test:stress": "tsx scripts/stress-test-sync.ts",
-        "analyze:db": "tsx scripts/analyze-db.ts",
-        "test:tx-keys-sync": "tsx scripts/test-tx-keys-sync.ts",
-        "test:p2p": "tsx scripts/test-p2p-sync.ts",
-        "test:client:p2p": "tsx scripts/test-client-p2p.ts",
-        "test:p2p:regtest": "tsx scripts/test-p2p-regtest.ts",
-        "test:encryption": "tsx scripts/test-encryption.ts",
-        "test:swap-live": "tsx scripts/test-swap-live.ts",
-        "lint": "eslint src --ext .ts",
-        "lint:fix": "eslint src --ext .ts --fix",
-        "format": "prettier --write \"src/**/*.ts\" \"scripts/**/*.ts\"",
-        "typecheck": "tsc --noEmit",
-        "docs": "typedoc",
-        "docs:html": "typedoc --options typedoc.html.json",
-        "docs:watch": "typedoc --watch",
-        "prepublishOnly": "npm run build"
-    },
-    "keywords": [
-        "navio",
-        "blockchain",
-        "sdk",
-        "typescript"
-    ],
-    "author": "",
-    "license": "MIT",
-    "engines": {
-        "node": ">=20.19.0"
-    },
-    "repository": {
-        "type": "git",
-        "url": "https://github.com/nav-io/navio-sdk"
-    },
-    "devDependencies": {
-        "@types/better-sqlite3": "^7.6.0",
-        "@types/node": "^20.10.0",
-        "@types/ws": "^8.5.10",
-        "@typescript-eslint/eslint-plugin": "^6.13.0",
-        "@typescript-eslint/parser": "^6.13.0",
-        "eslint": "^8.54.0",
-        "eslint-config-prettier": "^9.0.0",
-        "eslint-plugin-prettier": "^5.0.1",
-        "prettier": "^3.1.0",
-        "tsup": "^8.0.1",
-        "tsx": "^4.7.0",
-        "typedoc": "^0.28.15",
-        "typedoc-plugin-markdown": "^4.9.0",
-        "typescript": "^5.3.2",
-        "vitest": "^1.0.4"
-    },
-    "dependencies": {
-        "@noble/hashes": "^1.3.3",
-        "@scure/bip39": "^2.0.1",
-        "hash-wasm": "^4.12.0",
-        "@nav-io/navio-blsct": "^1.2.0",
-        "ws": "^8.18.3"
-    },
-    "optionalDependencies": {
-        "better-sqlite3": "^11.0.0"
+  "name": "navio-sdk",
+  "version": "0.2.1",
+  "description": "TypeScript SDK for interacting with the Navio blockchain",
+  "main": "dist/index.js",
+  "module": "dist/index.mjs",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": {
+        "types": "./dist/index.d.mts",
+        "default": "./dist/index.mjs"
+      },
+      "require": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      }
     }
+  },
+  "files": [
+    "dist"
+  ],
+  "allowScripts": {
+    "@nav-io/navio-blsct": true,
+    "better-sqlite3": true,
+    "esbuild": true
+  },
+  "scripts": {
+    "build": "tsup",
+    "dev": "tsup --watch",
+    "test": "vitest",
+    "test:watch": "vitest --watch",
+    "test:keymanager": "tsx scripts/test-keymanager.ts",
+    "test:walletdb": "tsx scripts/test-walletdb.ts",
+    "test:electrum": "tsx scripts/test-electrum.ts",
+    "test:client": "tsx scripts/test-client.ts",
+    "test:stress": "tsx scripts/stress-test-sync.ts",
+    "analyze:db": "tsx scripts/analyze-db.ts",
+    "test:tx-keys-sync": "tsx scripts/test-tx-keys-sync.ts",
+    "test:p2p": "tsx scripts/test-p2p-sync.ts",
+    "test:client:p2p": "tsx scripts/test-client-p2p.ts",
+    "test:p2p:regtest": "tsx scripts/test-p2p-regtest.ts",
+    "test:encryption": "tsx scripts/test-encryption.ts",
+    "test:swap-live": "tsx scripts/test-swap-live.ts",
+    "lint": "eslint src --ext .ts",
+    "lint:fix": "eslint src --ext .ts --fix",
+    "format": "prettier --write \"src/**/*.ts\" \"scripts/**/*.ts\"",
+    "typecheck": "tsc --noEmit",
+    "docs": "typedoc",
+    "docs:html": "typedoc --options typedoc.html.json",
+    "docs:watch": "typedoc --watch",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "navio",
+    "blockchain",
+    "sdk",
+    "typescript"
+  ],
+  "author": "",
+  "license": "MIT",
+  "engines": {
+    "node": ">=20.19.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/nav-io/navio-sdk"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.0",
+    "@types/node": "^20.10.0",
+    "@types/ws": "^8.5.10",
+    "@typescript-eslint/eslint-plugin": "^6.13.0",
+    "@typescript-eslint/parser": "^6.13.0",
+    "eslint": "^8.54.0",
+    "eslint-config-prettier": "^9.0.0",
+    "eslint-plugin-prettier": "^5.0.1",
+    "prettier": "^3.1.0",
+    "tsup": "^8.0.1",
+    "tsx": "^4.7.0",
+    "typedoc": "^0.28.15",
+    "typedoc-plugin-markdown": "^4.9.0",
+    "typescript": "^5.3.2",
+    "vitest": "^1.0.4"
+  },
+  "dependencies": {
+    "@noble/hashes": "^1.3.3",
+    "@scure/bip39": "^2.0.1",
+    "hash-wasm": "^4.12.0",
+    "@nav-io/navio-blsct": "^1.2.0",
+    "ws": "^8.18.3"
+  },
+  "optionalDependencies": {
+    "better-sqlite3": "^11.0.0"
+  }
 }
