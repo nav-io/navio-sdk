@@ -67,6 +67,11 @@ export interface WalletOutput {
   txType: TxType;
   /** Unix epoch timestamp of the block (or current time for mempool outputs) */
   timestamp: number;
+  /**
+   * Whether the output is a staked commitment: NAV locked for staking. It is
+   * not part of the spendable balance and is not picked by coin selection.
+   */
+  isStakedCommitment: boolean;
 }
 
 /**
@@ -93,6 +98,8 @@ export interface StoreOutputParams {
   txType: TxType;
   /** Unix epoch timestamp of the block (or current time for mempool outputs) */
   timestamp: number;
+  /** Whether the output is a staked commitment (default false) */
+  isStakedCommitment?: boolean;
 }
 
 /**

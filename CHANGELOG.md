@@ -5,6 +5,35 @@ Format follows [Keep a Changelog](https://keepachangelog.com/); versions follow 
 
 ## [Unreleased]
 
+### Added
+
+- **Staked outputs are tracked.** `WalletOutput.isStakedCommitment` marks a
+  staked commitment (NAV locked for staking), recognised from the output's
+  `OP_STAKED_COMMITMENT` script during sync and on mempool transactions.
+  `getStakedOutputs()` and `getStakedBalance()` report them. Outputs stored by
+  an earlier version are flagged from their stored serialized output when the
+  database is opened: SQLite gains an `is_staked_commitment` column, added
+  and backfilled in one transaction so an interrupted upgrade is retried, and
+  the IndexedDB database moves to version 5.
+
+### Changed
+
+- **`getBalance()` and `getUnspentOutputs()` leave staked commitments out**
+  (the client methods and the `IWalletDB` implementations alike), and coin
+  selection no longer picks them, for sends, token fees, RFQ swaps and
+  standing orders alike. They were counted as spendable NAV before.
+  An input spending one is built with the staked-commitment flag set, as
+  navio-core's wallet records it.
+
+### Security
+
+- **`WalletDB` balance and output queries bind the token id.**
+  `getBalance`, `getUnspentOutputs` and `getPendingSpentAmount` spliced the
+  `tokenId` argument into their SQL, so a token id containing a quote changed
+  the query: `getBalance("x' OR '1'='1")` returned the sum of every output,
+  spent or not. The token id is now a bound parameter. The IndexedDB adapter
+  filters in JavaScript and was not affected.
+
 ### Fixed
 
 - **`DeepReorgError.reason` is `too-deep` at the `blockHashRetention` limit.**

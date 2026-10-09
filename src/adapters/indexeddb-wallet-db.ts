@@ -16,6 +16,7 @@
 import { KeyManager } from '../key-manager';
 import type { HDChain, SubAddressIdentifier } from '../key-manager.types';
 import * as blsctModule from '@nav-io/navio-blsct';
+import { isStakedCommitmentOutputHex } from '../staking';
 import type {
   IWalletDB,
   SyncState,
@@ -28,7 +29,8 @@ import type {
 // v2: adds the createdCollections store
 // v3: adds the standingOrders store
 // v4: adds the outputBlindingKeys store
-const IDB_VERSION = 4;
+// v5: walletOutputs records carry isStakedCommitment (backfilled on upgrade)
+const IDB_VERSION = 5;
 const DEFAULT_TOKEN_ID = '0000000000000000000000000000000000000000000000000000000000000000';
 
 function idbReq<T>(req: IDBRequest<T>): Promise<T> {
@@ -105,6 +107,9 @@ export class IndexedDBWalletDB implements IWalletDB {
       req.onupgradeneeded = (ev) => {
         const db = (ev.target as IDBOpenDBRequest).result;
         this.createStores(db);
+        if (ev.oldVersion > 0 && ev.oldVersion < 5 && req.transaction) {
+          this.backfillStakedCommitments(req.transaction);
+        }
       };
       req.onsuccess = () => resolve(req.result);
     });
@@ -138,6 +143,27 @@ export class IndexedDBWalletDB implements IWalletDB {
       s.createIndex('isSpent', 'isSpent', { unique: false });
       s.createIndex('spentBlockHeight', 'spentBlockHeight', { unique: false });
     }
+  }
+
+  /**
+   * Flag the staked commitments among outputs stored before records carried
+   * isStakedCommitment, from their serialized output. Runs inside the
+   * versionchange transaction, so the database opens only once it is done.
+   */
+  private backfillStakedCommitments(tx: IDBTransaction): void {
+    const cursorReq = tx.objectStore('walletOutputs').openCursor();
+    cursorReq.onsuccess = () => {
+      const cursor = cursorReq.result;
+      if (!cursor) return;
+      const rec = cursor.value;
+      if (rec.isStakedCommitment === undefined) {
+        cursor.update({
+          ...rec,
+          isStakedCommitment: isStakedCommitmentOutputHex(rec.outputData ?? '') ? 1 : 0,
+        });
+      }
+      cursor.continue();
+    };
   }
 
   // -- low-level helpers ------------------------------------------------
@@ -559,7 +585,8 @@ export class IndexedDBWalletDB implements IWalletDB {
         const cursor = req.result;
         if (cursor) {
           const rec = cursor.value;
-          if (this.matchesTokenFilter(rec.tokenId, tokenId)) {
+          // Spendable balance: staked commitments are locked for staking.
+          if (rec.isStakedCommitment !== 1 && this.matchesTokenFilter(rec.tokenId, tokenId)) {
             total += BigInt(rec.amount);
           }
           cursor.continue();
@@ -574,7 +601,7 @@ export class IndexedDBWalletDB implements IWalletDB {
   async getUnspentOutputs(tokenId: string | null = null): Promise<WalletOutput[]> {
     const recs = await this.getAllByIndex<any>('walletOutputs', 'isSpent', 0);
     return recs
-      .filter((r) => this.matchesTokenFilter(r.tokenId, tokenId))
+      .filter((r) => r.isStakedCommitment !== 1 && this.matchesTokenFilter(r.tokenId, tokenId))
       .sort((a, b) => a.blockHeight - b.blockHeight)
       .map(this.recordToOutput);
   }
@@ -613,6 +640,7 @@ export class IndexedDBWalletDB implements IWalletDB {
     spentBlockHeight: r.spentBlockHeight ?? null,
     txType: (r.txType ?? 'received') as TxType,
     timestamp: r.timestamp ?? 0,
+    isStakedCommitment: r.isStakedCommitment === 1,
   });
 
   // -- sync state -------------------------------------------------------
@@ -720,6 +748,7 @@ export class IndexedDBWalletDB implements IWalletDB {
       spentBlockHeight: p.spentBlockHeight,
       txType: p.txType,
       timestamp: p.timestamp,
+      isStakedCommitment: p.isStakedCommitment ? 1 : 0,
       createdAt: Date.now(),
     });
   }
