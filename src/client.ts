@@ -20,7 +20,8 @@ import { SyncProvider } from './sync-provider';
 import { P2PSyncProvider } from './p2p-sync';
 import { P2PConnectionOptions } from './p2p-protocol';
 import { ElectrumSyncProvider } from './electrum-sync';
-import { parseTransaction } from './p2p-block-parser';
+import { parseOutputHex, parseTransaction } from './p2p-block-parser';
+import { recoverStakeDelegation, type StakeDelegation } from './staking';
 import {
   BlindingKeyAllocator,
   blindingPublicKeyHex,
@@ -1942,7 +1943,8 @@ export class NavioClient {
   }
 
   /**
-   * Get unspent outputs (UTXOs)
+   * Get unspent outputs (UTXOs) that can be spent: staked commitments, which
+   * are locked for staking, are left out (see {@link getStakedOutputs}).
    * @param tokenId - Optional token ID to filter by (null for NAV)
    * @returns Array of unspent wallet outputs
    */
@@ -1953,7 +1955,7 @@ export class NavioClient {
     const outputs = await this.getAllOutputs();
     const resolvedTokenId = tokenId === null ? null : resolveRequestedTokenId(tokenId, outputs);
     return outputs.filter((output) => {
-      if (output.isSpent) {
+      if (output.isSpent || output.isStakedCommitment) {
         return false;
       }
       if (resolvedTokenId === null) {
@@ -1961,6 +1963,68 @@ export class NavioClient {
       }
       return output.tokenId === resolvedTokenId;
     });
+  }
+
+  /**
+   * Get the wallet's unspent staked commitments: NAV locked for staking,
+   * which {@link getUnspentOutputs} and the spendable balance leave out.
+   */
+  async getStakedOutputs(): Promise<WalletOutput[]> {
+    return (await this.getAllOutputs()).filter((output) => !output.isSpent && output.isStakedCommitment);
+  }
+
+  /**
+   * Get the NAV locked in the wallet's unspent staked commitments, in
+   * satoshis. Not part of {@link getBalance}.
+   */
+  async getStakedBalance(): Promise<bigint> {
+    return (await this.getStakedOutputs()).reduce((total, output) => total + output.amount, 0n);
+  }
+
+  /**
+   * Get the wallet's stake delegations: the unspent staked commitments it has
+   * delegated to a third-party staker, each with the staker's key and reward
+   * address read back from the output. Like navio-core's `listdelegations`,
+   * this works from the outputs sync already stored, so it needs no state of
+   * its own and survives a restore from seed. An output is listed once it
+   * confirms; mempool outputs and outputs whose serialized form the sync
+   * backend did not supply are not.
+   */
+  async getStakeDelegations(): Promise<StakeDelegation[]> {
+    const walletDB = this.walletDB;
+    if (!walletDB) {
+      throw new Error('Client not initialized');
+    }
+    if (!this.keyManager) {
+      throw new Error('KeyManager not available');
+    }
+    const delegations: StakeDelegation[] = [];
+    for (const output of await this.getStakedOutputs()) {
+      const outputData = await walletDB.getOutputData(output.outputHash);
+      if (outputData === null) {
+        continue;
+      }
+      try {
+        const delegation = recoverStakeDelegation(
+          parseOutputHex(outputData),
+          this.keyManager.calculateNonce(PublicKey.deserialize(output.blindingKey))
+        );
+        if (delegation) {
+          delegations.push({
+            outputHash: output.outputHash,
+            amount: output.amount,
+            blockHeight: output.blockHeight,
+            ...delegation,
+          });
+        }
+      } catch (error) {
+        console.warn(
+          `[NavioClient] Could not read the stake delegation of output ${output.outputHash.slice(0, 16)}…:`,
+          error
+        );
+      }
+    }
+    return delegations;
   }
 
   /**
@@ -2059,7 +2123,9 @@ export class NavioClient {
       const normalizedTokenId = resolveRequestedTokenId(tokenId, allOutputs);
       const blsctTokenId = TokenId.deserialize(publicToStoredTokenIdHex(normalizedTokenId));
       const requestedAssetOutputs = allOutputs.filter((output) => !output.isSpent && output.tokenId === normalizedTokenId);
-      const navOutputs = allOutputs.filter((output) => !output.isSpent && output.tokenId === null);
+      const navOutputs = allOutputs.filter(
+        (output) => !output.isSpent && !output.isStakedCommitment && output.tokenId === null,
+      );
       const confirmedAssetOutputs = requestedAssetOutputs.filter((output) => output.blockHeight > 0);
       const confirmedNavOutputs = navOutputs.filter((output) => output.blockHeight > 0);
 
@@ -3823,7 +3889,11 @@ export class NavioClient {
     // token branch). NAV outputs are stored with tokenId === null.
     const exclude = params.excludeUtxos ?? new Set<string>();
     const spendable = (utxo: WalletOutput, publicId: string | null): boolean =>
-      !utxo.isSpent && utxo.blockHeight > 0 && utxo.tokenId === publicId && !exclude.has(utxo.outputHash);
+      !utxo.isSpent &&
+      !utxo.isStakedCommitment &&
+      utxo.blockHeight > 0 &&
+      utxo.tokenId === publicId &&
+      !exclude.has(utxo.outputHash);
     const payUtxos = allOutputs.filter((utxo) => spendable(utxo, pay.publicId));
     const navUtxos = pay.publicId === null
       ? payUtxos
@@ -4645,6 +4715,7 @@ export class NavioClient {
       privSpendingKey,
       tokenId,
       outPoint,
+      utxo.isStakedCommitment,
     );
   }
 
