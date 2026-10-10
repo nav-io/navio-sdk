@@ -67,6 +67,11 @@ export interface WalletOutput {
   txType: TxType;
   /** Unix epoch timestamp of the block (or current time for mempool outputs) */
   timestamp: number;
+  /**
+   * Whether the output is a staked commitment: NAV locked for staking. It is
+   * not part of the spendable balance and is not picked by coin selection.
+   */
+  isStakedCommitment: boolean;
 }
 
 /**
@@ -93,6 +98,8 @@ export interface StoreOutputParams {
   txType: TxType;
   /** Unix epoch timestamp of the block (or current time for mempool outputs) */
   timestamp: number;
+  /** Whether the output is a staked commitment (default false) */
+  isStakedCommitment?: boolean;
 }
 
 /**
@@ -215,6 +222,14 @@ export interface IWalletDB {
   isOutputSpentInMempool(outputHash: string): Promise<boolean>;
   getMempoolSpentTxHash(outputHash: string): Promise<string | null>;
   markOutputSpent(outputHash: string, spentTxHash: string, spentBlockHeight: number): Promise<void>;
+  /**
+   * The serialized output (hex) sync stored for an output, or null when the
+   * output is unknown or none was stored (mempool outputs, and backends that
+   * do not serve standalone outputs).
+   *
+   * @param outputHash - Output hash, display hex
+   */
+  getOutputData(outputHash: string): Promise<string | null>;
   deleteOutputsByHeight(height: number): Promise<void>;
   unspendOutputsBySpentHeight(height: number): Promise<void>;
   /**

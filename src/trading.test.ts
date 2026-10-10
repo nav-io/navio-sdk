@@ -366,4 +366,43 @@ describe('broadcastOrder standing-order tracking', () => {
     stubElectrum(client, { swapBroadcastOrder: async () => 'q' });
     await expect(client.broadcastOrder({ ...order(), selectedUtxos: ['coin-a'] })).rejects.toThrow(/reserved by one of this wallet's standing orders/);
   });
+
+  describe('with a staked commitment in the wallet', () => {
+    // Real buildSwapHalf over a wallet holding 100 spendable NAV and a large
+    // staked commitment; selection must fail before any key material is used.
+    function makeStakedClient() {
+      const client = makeClient();
+      (client as any).walletDB = {
+        getStandingOrders: async () => [],
+        deleteStandingOrder: async () => undefined,
+        saveStandingOrder: async () => undefined,
+      };
+      (client as any).initialized = true;
+      (client as any).ensureSpendReady = async () => ({
+        keyManager: { getSubAddress: () => ({}) },
+        walletDB: (client as any).walletDB,
+      });
+      (client as any).getChangeSubAddress = () => ({});
+      const coin = (outputHash: string, amount: bigint, isStakedCommitment: boolean) => ({
+        outputHash, txHash: 't', outputIndex: 0, blockHeight: 5, amount, gamma: '01', memo: null, tokenId: null,
+        blindingKey: '02', spendingKey: '03', isSpent: false, spentTxHash: null, spentBlockHeight: null,
+        isStakedCommitment,
+      });
+      (client as any).getAllOutputs = async () => [coin('coin-a', 100n, false), coin('staked', 1_000_000n, true)];
+      stubElectrum(client, { swapBroadcastOrder: async () => 'q' });
+      return client;
+    }
+
+    it('leaves it out of automatic selection', async () => {
+      await expect(makeStakedClient().broadcastOrder(order())).rejects.toThrow(
+        /Insufficient funds: need 500 of the pay token but only have 100/
+      );
+    });
+
+    it('refuses it as a manual selection', async () => {
+      await expect(
+        makeStakedClient().broadcastOrder({ ...order(), selectedUtxos: ['staked'] })
+      ).rejects.toThrow(/Selected UTXO not found or not spendable/);
+    });
+  });
 });
