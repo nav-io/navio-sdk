@@ -5,6 +5,59 @@ Format follows [Keep a Changelog](https://keepachangelog.com/); versions follow 
 
 ## [Unreleased]
 
+### Added
+
+- **Staked outputs are tracked.** `WalletOutput.isStakedCommitment` marks a
+  staked commitment (NAV locked for staking), recognised from the output's
+  `OP_STAKED_COMMITMENT` script during sync and on mempool transactions.
+  `getStakedOutputs()` and `getStakedBalance()` report them. Outputs stored by
+  an earlier version are flagged from their stored serialized output when the
+  database is opened: SQLite gains an `is_staked_commitment` column, added
+  and backfilled in one transaction so an interrupted upgrade is retried, and
+  the IndexedDB database moves to version 5.
+- **Stake delegations are listed.** `getStakeDelegations()` returns the
+  wallet's unspent staked commitments delegated to a third-party staker (cold
+  staking), each with the staker's delegation key and the reward address,
+  decrypted from the output's delegation payload with the wallet's view key.
+  Like navio-core's `listdelegations` it reads only the outputs sync stored,
+  so it works after a restore from seed; a delegation shows once its output
+  confirms. `IWalletDB` gains `getOutputData(outputHash)`, which other
+  implementations of the interface must add.
+- **Stake can be delegated (cold staking).** `delegateStake({ amount,
+delegateKey, rewardAddress? })` stakes NAV to the wallet's staking address
+  with a delegation payload for a third-party staker, as navio-core's
+  `delegatestake` does: the staker can stake the output but never spend it.
+  The reward address defaults to the wallet's primary address. Each call adds
+  a new staked commitment; existing ones are not consolidated.
+  `getMinStakeAmount()` reports the chain's minimum stake, and the
+  `minStakeAmount` config option sets it for a chain whose minimum differs
+  from the network default (navio-core's blsctregtest).
+- **Stake can be unstaked.** `unstake({ stakedOutputs?, amount? })` spends
+  staked commitments back into spendable NAV, which also revokes their
+  delegation, as navio-core's `stakeunlock` does. The unlocked NAV, less the
+  fee, returns to the wallet's staking address. A partial unstake stakes the
+  rest again and, unlike `stakeunlock`, keeps the delegation the spent
+  commitments share; it refuses commitments delegated differently, or whose
+  delegation the wallet cannot read.
+
+### Changed
+
+- **`getBalance()` and `getUnspentOutputs()` leave staked commitments out**
+  (the client methods and the `IWalletDB` implementations alike), and coin
+  selection no longer picks them, for sends, token fees, RFQ swaps and
+  standing orders alike. They were counted as spendable NAV before.
+  An input spending one is built with the staked-commitment flag set, as
+  navio-core's wallet records it.
+
+### Security
+
+- **`WalletDB` balance and output queries bind the token id.**
+  `getBalance`, `getUnspentOutputs` and `getPendingSpentAmount` spliced the
+  `tokenId` argument into their SQL, so a token id containing a quote changed
+  the query: `getBalance("x' OR '1'='1")` returned the sum of every output,
+  spent or not. The token id is now a bound parameter. The IndexedDB adapter
+  filters in JavaScript and was not affected.
+
 ### Fixed
 
 - **`DeepReorgError.reason` is `too-deep` at the `blockHashRetention` limit.**

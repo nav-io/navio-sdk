@@ -23,6 +23,9 @@ import {
   MAX_REORG_DEPTH,
   ReorgError,
 } from './tx-keys-sync';
+import { parseTransaction } from './p2p-block-parser';
+import { isStakedCommitmentOutput } from './staking';
+import { STAKED_TX_HEX } from './test-fixtures/staked-tx';
 import { WalletDB } from './wallet-db';
 import { SyncProvider, ChainTip, BlockHeadersResult } from './sync-provider';
 import type { BlockTransactionKeys, TransactionKeys } from './electrum';
@@ -685,6 +688,68 @@ describe('TransactionKeysSync', () => {
       // No longer needs sync (if at tip)
       needsSync = await syncManager.isSyncNeeded();
       expect(needsSync).toBe(false);
+    });
+  });
+
+  describe('staked commitment flag', () => {
+    // Claims every output so the fixture's outputs are stored; amount recovery
+    // fails for them and is not what these tests are about.
+    function claimEverything(manager: TransactionKeysSync): void {
+      manager.setKeyManager({
+        isMineByKeys: () => true,
+        calculateNonce: () => {
+          throw new Error('not recovering amounts here');
+        },
+      } as any);
+    }
+
+    async function stakedFlags(): Promise<Record<string, boolean>> {
+      return Object.fromEntries(
+        (await walletDB.getAllOutputs()).map(o => [o.outputHash, o.isStakedCommitment])
+      );
+    }
+
+    const fixtureOutputs = () => parseTransaction(Buffer.from(STAKED_TX_HEX, 'hex')).outputs;
+
+    it('is set on staked outputs found by block sync', async () => {
+      const [staked, fee] = fixtureOutputs();
+      expect(isStakedCommitmentOutput(staked)).toBe(true);
+      expect(isStakedCommitmentOutput(fee)).toBe(false);
+
+      const keysOf = (outputHash: string) => ({
+        outputHash,
+        blindingKey: staked.keys!.blindingKey,
+        spendingKey: staked.keys!.spendingKey,
+        viewTag: staked.keys!.viewTag,
+      });
+      syncProvider = createMockSyncProvider({
+        chainTipHeight: 60,
+        blockTxKeys: new Map([
+          [60, [{ txHash: 'staking-tx', keys: { inputs: [], outputs: [keysOf('staked'), keysOf('fee')] } }]],
+        ]),
+      });
+      const serialized: Record<string, string> = { staked: staked.serializedHex, fee: fee.serializedHex };
+      syncProvider.getTransactionOutput = vi.fn(async (hash: string) => serialized[hash]);
+      syncManager = new TransactionKeysSync(walletDB, syncProvider);
+      await syncManager.initialize();
+      claimEverything(syncManager);
+
+      await syncManager.sync({ startHeight: 60, endHeight: 60, verifyHashes: false });
+
+      expect(await stakedFlags()).toEqual({ staked: true, fee: false });
+    });
+
+    it('is set on staked outputs found in the mempool', async () => {
+      syncProvider = createMockSyncProvider({ chainTipHeight: 100 });
+      syncManager = new TransactionKeysSync(walletDB, syncProvider);
+      claimEverything(syncManager);
+
+      await syncManager.processMempoolTransaction('staking-tx', STAKED_TX_HEX);
+
+      expect(await stakedFlags()).toEqual({
+        'mempool:staking-tx:0': true,
+        'mempool:staking-tx:1': false,
+      });
     });
   });
 

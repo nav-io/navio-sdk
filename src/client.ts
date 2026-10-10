@@ -20,7 +20,8 @@ import { SyncProvider } from './sync-provider';
 import { P2PSyncProvider } from './p2p-sync';
 import { P2PConnectionOptions } from './p2p-protocol';
 import { ElectrumSyncProvider } from './electrum-sync';
-import { parseTransaction } from './p2p-block-parser';
+import { parseOutputHex, parseTransaction } from './p2p-block-parser';
+import { recoverStakeDelegation, type StakeDelegation } from './staking';
 import {
   BlindingKeyAllocator,
   blindingPublicKeyHex,
@@ -47,8 +48,8 @@ import type {
 } from './trading.types';
 
 const {
-  Scalar, PublicKey, SubAddr, Signature,
-  Address, TokenId, CTxId, OutPoint, TxIn, TxOut,
+  Scalar, PublicKey, Point, SubAddr, Signature,
+  Address, AddressEncoding, TokenId, CTxId, OutPoint, TxIn, TxOut,
   TxOutputType, PrivSpendingKey,
   CTx, UnsignedInput, UnsignedOutput, UnsignedTransaction,
   TokenInfo, TokenType,
@@ -108,6 +109,26 @@ const NETWORK_BLSCT_PROOF_V2_HEIGHT: Record<NetworkType, number> = {
   signet: 2147483647,  // dormant
   regtest: 0,
 };
+
+/** Satoshis per NAV (navio-core `COIN`). */
+const SATS_PER_NAV = 100_000_000n;
+
+/**
+ * Consensus minimum stake (`nPePoSMinStakeAmount`) per network, in satoshis,
+ * from navio-core chainparams. A staked output's range proof is built against
+ * this amount and the node verifies it against its own, so the two must match.
+ * Core's blsctregtest chain shares the regtest address prefix but uses a lower
+ * minimum; a client on it sets `minStakeAmount` in its config.
+ */
+const NETWORK_MIN_STAKE: Record<NetworkType, bigint> = {
+  mainnet: 10_000n * SATS_PER_NAV,
+  testnet: 10_000n * SATS_PER_NAV,
+  signet: 10_000n * SATS_PER_NAV,
+  regtest: 10_000n * SATS_PER_NAV,
+};
+
+/** The compressed encoding of the BLS12-381 G1 identity point (hex). */
+const G1_IDENTITY_HEX = 'c0' + '00'.repeat(47);
 
 /**
  * Extra fee a maker's swap half over-funds so the combined transaction (its
@@ -221,6 +242,51 @@ export interface SendToManyOptions {
    * the outputs of this transaction to be attributable to this seed; the
    * scalars are then discarded and those outputs can never be recovered.
    */
+  randomBlindingKeys?: boolean;
+}
+
+/**
+ * Options for delegating a stake to a third-party staker (cold staking).
+ */
+export interface DelegateStakeOptions {
+  /** Amount to stake in satoshis; at least {@link NavioClient.getMinStakeAmount} */
+  amount: bigint;
+  /**
+   * The staker's delegation public key: a 48-byte G1 point (hex), published
+   * by the staking operator.
+   */
+  delegateKey: string;
+  /**
+   * Address the staker is asked to pay block rewards to. Defaults to this
+   * wallet's primary receive address. Advisory only: the staker controls its
+   * own coinbase.
+   */
+  rewardAddress?: string;
+  /**
+   * Optional list of specific UTXOs to fund the stake and fee from.
+   * Each entry must be an outputHash of an unspent, confirmed output.
+   */
+  selectedUtxos?: string[];
+  /** See {@link SendTransactionOptions.randomBlindingKeys}. */
+  randomBlindingKeys?: boolean;
+}
+
+/**
+ * Options for unstaking: spending staked commitments back into spendable NAV.
+ */
+export interface UnstakeOptions {
+  /**
+   * The staked commitments to spend, by outputHash. Defaults to every
+   * confirmed staked commitment of the wallet.
+   */
+  stakedOutputs?: string[];
+  /**
+   * NAV to unlock in satoshis, the fee included. Defaults to the whole of the
+   * spent commitments. The rest is staked again, under the same delegation,
+   * and must reach the minimum stake.
+   */
+  amount?: bigint;
+  /** See {@link SendTransactionOptions.randomBlindingKeys}. */
   randomBlindingKeys?: boolean;
 }
 
@@ -850,6 +916,13 @@ export interface NavioClientConfig {
    * Individual sends can override this with `randomBlindingKeys`.
    */
   deterministicBlindingKeys?: boolean;
+
+  /**
+   * The chain's minimum stake in satoshis, for a chain whose minimum differs
+   * from the network default (navio-core's blsctregtest, which uses the
+   * regtest address prefix). See {@link NavioClient.getMinStakeAmount}.
+   */
+  minStakeAmount?: bigint;
 
   /** Restore wallet from seed (hex string) */
   restoreFromSeed?: string;
@@ -1942,7 +2015,8 @@ export class NavioClient {
   }
 
   /**
-   * Get unspent outputs (UTXOs)
+   * Get unspent outputs (UTXOs) that can be spent: staked commitments, which
+   * are locked for staking, are left out (see {@link getStakedOutputs}).
    * @param tokenId - Optional token ID to filter by (null for NAV)
    * @returns Array of unspent wallet outputs
    */
@@ -1953,7 +2027,7 @@ export class NavioClient {
     const outputs = await this.getAllOutputs();
     const resolvedTokenId = tokenId === null ? null : resolveRequestedTokenId(tokenId, outputs);
     return outputs.filter((output) => {
-      if (output.isSpent) {
+      if (output.isSpent || output.isStakedCommitment) {
         return false;
       }
       if (resolvedTokenId === null) {
@@ -1961,6 +2035,332 @@ export class NavioClient {
       }
       return output.tokenId === resolvedTokenId;
     });
+  }
+
+  /**
+   * Get the wallet's unspent staked commitments: NAV locked for staking,
+   * which {@link getUnspentOutputs} and the spendable balance leave out.
+   */
+  async getStakedOutputs(): Promise<WalletOutput[]> {
+    return (await this.getAllOutputs()).filter((output) => !output.isSpent && output.isStakedCommitment);
+  }
+
+  /**
+   * Get the NAV locked in the wallet's unspent staked commitments, in
+   * satoshis. Not part of {@link getBalance}.
+   */
+  async getStakedBalance(): Promise<bigint> {
+    return (await this.getStakedOutputs()).reduce((total, output) => total + output.amount, 0n);
+  }
+
+  /**
+   * Get the wallet's stake delegations: the unspent staked commitments it has
+   * delegated to a third-party staker, each with the staker's key and reward
+   * address read back from the output. Like navio-core's `listdelegations`,
+   * this works from the outputs sync already stored, so it needs no state of
+   * its own and survives a restore from seed. An output is listed once it
+   * confirms; mempool outputs and outputs whose serialized form the sync
+   * backend did not supply are not.
+   */
+  async getStakeDelegations(): Promise<StakeDelegation[]> {
+    if (!this.keyManager) {
+      throw new Error('KeyManager not available');
+    }
+    const delegations: StakeDelegation[] = [];
+    for (const output of await this.getStakedOutputs()) {
+      try {
+        const found = await this.readStakeDelegation(output);
+        if (found.status === 'delegated') {
+          delegations.push({
+            outputHash: output.outputHash,
+            amount: output.amount,
+            blockHeight: output.blockHeight,
+            delegateKey: found.delegateKey,
+            rewardAddress: found.rewardAddress,
+          });
+        }
+      } catch (error) {
+        console.warn(
+          `[NavioClient] Could not read the stake delegation of output ${output.outputHash.slice(0, 16)}…:`,
+          error
+        );
+      }
+    }
+    return delegations;
+  }
+
+  /**
+   * Read the delegation a staked output of this wallet carries, from the
+   * serialized output sync stored. `unknown` when none was stored.
+   *
+   * @throws When the output carries a delegation payload this wallet's view
+   *   key does not open
+   */
+  private async readStakeDelegation(
+    output: WalletOutput
+  ): Promise<
+    | { status: 'delegated'; delegateKey: string; rewardAddress: string }
+    | { status: 'none' }
+    | { status: 'unknown' }
+  > {
+    if (!this.walletDB) {
+      throw new Error('Client not initialized');
+    }
+    if (!this.keyManager) {
+      throw new Error('KeyManager not available');
+    }
+    const outputData = await this.walletDB.getOutputData(output.outputHash);
+    if (outputData === null) {
+      return { status: 'unknown' };
+    }
+    const delegation = recoverStakeDelegation(
+      parseOutputHex(outputData),
+      this.keyManager.calculateNonce(PublicKey.deserialize(output.blindingKey))
+    );
+    return delegation === null ? { status: 'none' } : { status: 'delegated', ...delegation };
+  }
+
+  /**
+   * The minimum stake in satoshis on this client's chain: `minStakeAmount`
+   * from the config, else the network's consensus minimum.
+   */
+  getMinStakeAmount(): bigint {
+    return this.config.minStakeAmount ?? NETWORK_MIN_STAKE[this.getNetwork()];
+  }
+
+  /**
+   * Stake NAV and delegate block production to a third-party staker (cold
+   * staking), as navio-core's `delegatestake` does. The new staked commitment
+   * goes to this wallet's staking address and carries an encrypted copy of
+   * its opening for the staker, who can then stake it but never spend it.
+   * The wallet keeps the spending keys and can unstake at any time.
+   *
+   * Unlike `delegatestake`, existing staked commitments are not folded into
+   * the new one: each call adds a separate commitment.
+   *
+   * @param options - Amount, staker key and reward address
+   * @returns Transaction result with txId and details
+   */
+  async delegateStake(options: DelegateStakeOptions): Promise<SendTransactionResult> {
+    const { keyManager } = await this.ensureSpendReady();
+    const { amount, selectedUtxos, randomBlindingKeys } = options;
+
+    const minStake = this.getMinStakeAmount();
+    if (amount < minStake) {
+      throw new Error(`A minimum of ${minStake} sat is required to stake, got ${amount} sat`);
+    }
+    const delegateKey = NavioClient.parseDelegateKey(options.delegateKey);
+    const rewardAddress =
+      options.rewardAddress === undefined
+        ? keyManager.getSubAddressBech32m({ account: 0, address: 0 }, this.getNetwork())
+        : this.canonicalRewardAddress(options.rewardAddress);
+    const stakeAddress = this.getStakeSubAddress();
+
+    return this.buildAndBroadcastUnsignedTransaction(
+      blindingKeys => {
+        const staked = this.toUnsignedOutput(
+          TxOut.generate(
+            stakeAddress,
+            toSafeInteger(amount, 'amount'),
+            '',
+            TokenId.default(),
+            TxOutputType.StakedCommitment,
+            toSafeInteger(minStake, 'minimum stake'),
+            false,
+            blindingKeys.next()
+          )
+        );
+        staked.setStakeDelegation(stakeAddress, delegateKey, rewardAddress);
+        return [staked];
+      },
+      selectedUtxos,
+      randomBlindingKeys,
+      amount
+    );
+  }
+
+  /**
+   * Unstake: spend staked commitments back into spendable NAV, as navio-core's
+   * `stakeunlock` does. This also revokes their delegation: the staker can no
+   * longer stake them. The unlocked NAV, less the fee, goes to the wallet's
+   * staking address as a normal output.
+   *
+   * A partial unstake stakes the rest again. Unlike `stakeunlock`, which
+   * leaves that remainder undelegated, it keeps the delegation the spent
+   * commitments share; it refuses commitments delegated differently, or
+   * whose delegation the wallet cannot read, rather than choose for them.
+   *
+   * @param options - Which commitments to spend and how much to unlock
+   * @returns Transaction result with txId and details
+   */
+  async unstake(options: UnstakeOptions = {}): Promise<SendTransactionResult> {
+    const { walletDB } = await this.ensureSpendReady();
+
+    const confirmed = (await this.getStakedOutputs()).filter(output => output.blockHeight > 0);
+    let spent: WalletOutput[];
+    if (options.stakedOutputs === undefined) {
+      if (confirmed.length === 0) {
+        throw new Error('No confirmed staked outputs to unstake');
+      }
+      spent = confirmed;
+    } else {
+      if (options.stakedOutputs.length === 0) {
+        throw new Error('stakedOutputs must not be empty');
+      }
+      if (new Set(options.stakedOutputs).size !== options.stakedOutputs.length) {
+        throw new Error('stakedOutputs lists an output more than once');
+      }
+      const byHash = new Map(confirmed.map(output => [output.outputHash, output]));
+      spent = options.stakedOutputs.map(hash => {
+        const output = byHash.get(hash);
+        if (!output) {
+          throw new Error(
+            `Not a confirmed, unspent staked output of this wallet: ${hash.slice(0, 16)}...`
+          );
+        }
+        return output;
+      });
+    }
+
+    const total = spent.reduce((sum, output) => sum + output.amount, 0n);
+    const amount = options.amount ?? total;
+    if (amount <= 0n || amount > total) {
+      throw new Error(
+        `amount must be positive and at most the ${total} sat staked in the spent outputs, got ${amount}`
+      );
+    }
+    const restake = total - amount;
+    const minStake = this.getMinStakeAmount();
+    if (restake > 0n && restake < minStake) {
+      throw new Error(
+        `Unstaking ${amount} sat would leave ${restake} sat staked, below the minimum stake of ${minStake} sat`
+      );
+    }
+    const delegation = restake > 0n ? await this.sharedStakeDelegation(spent) : null;
+
+    const inputs = spent.map(output => ({ output, tokenId: TokenId.default() }));
+    const blindingKeys = this.makeBlindingKeyAllocator(inputs, options.randomBlindingKeys);
+    const stakeAddress = this.getStakeSubAddress();
+    const buildOutputs = (fee: bigint): InstanceType<typeof UnsignedOutput>[] => {
+      if (amount <= fee) {
+        throw new Error(`Unlocking ${amount} sat does not cover the ${fee} sat fee`);
+      }
+      // Rebuilt once per fee round; restart the counters so each output's key
+      // follows its position rather than the number of rounds taken.
+      blindingKeys.reset();
+      const outputs = [
+        this.toUnsignedOutput(
+          TxOut.generate(
+            stakeAddress,
+            toSafeInteger(amount - fee, 'unlocked amount'),
+            'Stake Unlock',
+            TokenId.default(),
+            TxOutputType.Normal,
+            0,
+            false,
+            blindingKeys.next()
+          )
+        ),
+      ];
+      if (restake > 0n) {
+        const staked = this.toUnsignedOutput(
+          TxOut.generate(
+            stakeAddress,
+            toSafeInteger(restake, 'restaked amount'),
+            '',
+            TokenId.default(),
+            TxOutputType.StakedCommitment,
+            toSafeInteger(minStake, 'minimum stake'),
+            false,
+            blindingKeys.next()
+          )
+        );
+        if (delegation !== null) {
+          staked.setStakeDelegation(
+            stakeAddress,
+            Point.deserialize(delegation.delegateKey),
+            delegation.rewardAddress
+          );
+        }
+        outputs.push(staked);
+      }
+      return outputs;
+    };
+
+    // Fee fixpoint on the signed size, as in sendTransaction.
+    let fee = 0n;
+    let outputs = buildOutputs(fee);
+    for (let i = 0; i < 6; i++) {
+      const { rawTx } = this.signUnsignedTransaction(inputs, outputs, fee);
+      const required = requiredBlsctFee(rawTx.length / 2);
+      if (fee >= required) break;
+      fee = required;
+      outputs = buildOutputs(fee);
+    }
+
+    return this.signAndBroadcastUnsignedTransaction(walletDB, inputs, outputs, fee, blindingKeys);
+  }
+
+  /**
+   * The delegation every one of `outputs` carries, or null when none carries
+   * one. Throws when they differ, or when one's delegation cannot be read.
+   */
+  private async sharedStakeDelegation(
+    outputs: WalletOutput[]
+  ): Promise<{ delegateKey: string; rewardAddress: string } | null> {
+    const found = await Promise.all(outputs.map(output => this.readStakeDelegation(output)));
+    if (found.some(f => f.status === 'unknown')) {
+      throw new Error(
+        'Cannot read the delegation of every staked output being spent, so the stake left behind could not keep it. ' +
+          'Unstake those outputs in full.'
+      );
+    }
+    const identities = new Set(
+      found.map(f => (f.status === 'delegated' ? `${f.delegateKey}|${f.rewardAddress}` : 'none'))
+    );
+    if (identities.size > 1) {
+      throw new Error(
+        'The staked outputs being spent are delegated differently, so the stake left behind has no single delegation ' +
+          'to keep. Unstake them in full, or pick outputs that share one with stakedOutputs.'
+      );
+    }
+    const first = found[0];
+    return first.status === 'delegated'
+      ? { delegateKey: first.delegateKey, rewardAddress: first.rewardAddress }
+      : null;
+  }
+
+  /**
+   * A staker's delegation key, refusing anything but a non-identity G1 point
+   * as navio-core's `delegatestake` does.
+   */
+  private static parseDelegateKey(hex: string): InstanceType<typeof Point> {
+    // Checked before the native decoder sees it; see resolveOutputSubAddress.
+    if (!/^[0-9a-fA-F]{96}$/.test(hex) || hex.toLowerCase() === G1_IDENTITY_HEX) {
+      throw new Error('delegateKey must be a non-identity G1 point (96 hex characters)');
+    }
+    try {
+      return Point.deserialize(hex);
+    } catch (err) {
+      throw new Error(`delegateKey is not a valid G1 point: ${(err as Error).message}`);
+    }
+  }
+
+  /**
+   * Validate a reward address and return its canonical encoding, refusing
+   * one whose keys include the identity point: the staker would then pay the
+   * reward into an output anyone can spend. Mirrors navio-core's
+   * `EnsureRewardAddress`, minus the transparent addresses it also allows.
+   */
+  private canonicalRewardAddress(address: string): string {
+    this.decodeDestinationAddress(address);
+    const keys = Address.decode(address);
+    const keysHex: string = keys.serialize().toLowerCase();
+    const half = keysHex.length / 2;
+    if (keysHex.slice(0, half) === G1_IDENTITY_HEX || keysHex.slice(half) === G1_IDENTITY_HEX) {
+      throw new Error(`Reward address "${address.slice(0, 12)}…" has null keys`);
+    }
+    return Address.encode(keys, AddressEncoding.Bech32M);
   }
 
   /**
@@ -2059,7 +2459,9 @@ export class NavioClient {
       const normalizedTokenId = resolveRequestedTokenId(tokenId, allOutputs);
       const blsctTokenId = TokenId.deserialize(publicToStoredTokenIdHex(normalizedTokenId));
       const requestedAssetOutputs = allOutputs.filter((output) => !output.isSpent && output.tokenId === normalizedTokenId);
-      const navOutputs = allOutputs.filter((output) => !output.isSpent && output.tokenId === null);
+      const navOutputs = allOutputs.filter(
+        (output) => !output.isSpent && !output.isStakedCommitment && output.tokenId === null,
+      );
       const confirmedAssetOutputs = requestedAssetOutputs.filter((output) => output.blockHeight > 0);
       const confirmedNavOutputs = navOutputs.filter((output) => output.blockHeight > 0);
 
@@ -3823,7 +4225,11 @@ export class NavioClient {
     // token branch). NAV outputs are stored with tokenId === null.
     const exclude = params.excludeUtxos ?? new Set<string>();
     const spendable = (utxo: WalletOutput, publicId: string | null): boolean =>
-      !utxo.isSpent && utxo.blockHeight > 0 && utxo.tokenId === publicId && !exclude.has(utxo.outputHash);
+      !utxo.isSpent &&
+      !utxo.isStakedCommitment &&
+      utxo.blockHeight > 0 &&
+      utxo.tokenId === publicId &&
+      !exclude.has(utxo.outputHash);
     const payUtxos = allOutputs.filter((utxo) => spendable(utxo, pay.publicId));
     const navUtxos = pay.publicId === null
       ? payUtxos
@@ -4246,9 +4652,18 @@ export class NavioClient {
     return { collectionTokenId: creationTokenId, ...resolved };
   }
 
+  private static insufficientFundingError(totalIn: bigint, fundedAmount: bigint, fee: bigint): Error {
+    return new Error(
+      fundedAmount === 0n
+        ? `Insufficient funds: need ${fee} sat for fees but only have ${totalIn} sat`
+        : `Insufficient funds: need ${fundedAmount + fee} sat (${fundedAmount} + ${fee} fee) but only have ${totalIn} sat`
+    );
+  }
+
   private async selectFundingUtxos(
     walletDB: IWalletDB,
     selectedUtxos?: string[],
+    fundedAmount: bigint = 0n,
   ): Promise<{ selected: WalletOutput[]; totalIn: bigint; fee: bigint }> {
     const allUtxos = await walletDB.getUnspentOutputs(null);
     const confirmedUtxos = allUtxos.filter((utxo) => utxo.blockHeight > 0);
@@ -4276,12 +4691,12 @@ export class NavioClient {
         }
         throw new Error('No unspent NAV outputs available to fund the transaction.');
       }
-      ({ selected, totalIn } = NavioClient.selectInputs(this.selectableUtxos(confirmedUtxos), 0n, false));
+      ({ selected, totalIn } = NavioClient.selectInputs(this.selectableUtxos(confirmedUtxos), fundedAmount, false));
     }
 
     const fee = BigInt((selected.length + 2) * DEFAULT_FEE_PER_COMPONENT);
-    if (totalIn < fee) {
-      throw new Error(`Insufficient funds: need ${fee} sat for fees but only have ${totalIn} sat`);
+    if (totalIn < fundedAmount + fee) {
+      throw NavioClient.insufficientFundingError(totalIn, fundedAmount, fee);
     }
 
     return { selected, totalIn, fee };
@@ -4299,14 +4714,17 @@ export class NavioClient {
    * @param buildAssetOutputs - Produces the transaction's non-change outputs
    * @param selectedUtxos - Optional manual funding selection
    * @param useRandomBlindingKeys - Opt out of recoverable blinding keys
+   * @param fundedAmount - NAV the asset outputs carry, funded from the
+   *   selected inputs on top of the fee
    */
   private async buildAndBroadcastUnsignedTransaction(
     buildAssetOutputs: (blindingKeys: BlindingKeyAllocator) => InstanceType<typeof UnsignedOutput>[],
     selectedUtxos?: string[],
     useRandomBlindingKeys?: boolean,
+    fundedAmount: bigint = 0n,
   ): Promise<SendTransactionResult> {
     const { walletDB } = await this.ensureSpendReady();
-    const { selected, totalIn } = await this.selectFundingUtxos(walletDB, selectedUtxos);
+    const { selected, totalIn } = await this.selectFundingUtxos(walletDB, selectedUtxos, fundedAmount);
     const inputs = selected.map((utxo) => ({ output: utxo, tokenId: TokenId.default() }));
     const blindingKeys = this.makeBlindingKeyAllocator(inputs, useRandomBlindingKeys);
 
@@ -4340,11 +4758,11 @@ export class NavioClient {
     // the final fee.
     for (let i = 0; i < 3; i++) {
       fee = this.estimateSignedUnsignedTransactionFee(inputs, outputs);
-      if (totalIn < fee) {
-        throw new Error(`Insufficient funds: need ${fee} sat for fees but only have ${totalIn} sat`);
+      if (totalIn < fundedAmount + fee) {
+        throw NavioClient.insufficientFundingError(totalIn, fundedAmount, fee);
       }
 
-      const navChangeAmount = totalIn - fee;
+      const navChangeAmount = totalIn - fundedAmount - fee;
       const nextOutputs = buildAll(navChangeAmount);
 
       outputs = nextOutputs;
@@ -4645,6 +5063,7 @@ export class NavioClient {
       privSpendingKey,
       tokenId,
       outPoint,
+      utxo.isStakedCommitment,
     );
   }
 
@@ -4750,5 +5169,16 @@ export class NavioClient {
       throw new Error('KeyManager not available');
     }
     return this.keyManager.getSubAddress({ account: -1, address: 0 });
+  }
+
+  /**
+   * The SubAddr staked commitments go to: the staking account (-2), whose
+   * single address navio-core's wallet also stakes to.
+   */
+  private getStakeSubAddress(): InstanceType<typeof SubAddr> {
+    if (!this.keyManager) {
+      throw new Error('KeyManager not available');
+    }
+    return this.keyManager.getSubAddress({ account: -2, address: 0 });
   }
 }

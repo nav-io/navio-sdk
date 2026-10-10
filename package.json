@@ -40,6 +40,7 @@
     "test:p2p": "tsx scripts/test-p2p-sync.ts",
     "test:client:p2p": "tsx scripts/test-client-p2p.ts",
     "test:p2p:regtest": "tsx scripts/test-p2p-regtest.ts",
+    "test:cold-staking:regtest": "tsx scripts/test-cold-staking-regtest.ts",
     "test:encryption": "tsx scripts/test-encryption.ts",
     "test:swap-live": "tsx scripts/test-swap-live.ts",
     "lint": "eslint src --ext .ts",
