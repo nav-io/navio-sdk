@@ -16,7 +16,8 @@ import type { IWalletDB, SyncState, TxType } from './wallet-db.interface';
 import * as blsctModule from '@nav-io/navio-blsct';
 import { sha256 } from '@noble/hashes/sha256';
 import { canonicalAnchorOutid, searchBlindingKey } from './blinding-key';
-import { parseOutputHex } from './p2p-block-parser';
+import { parseOutputHex, parseTransaction, type ParsedOutput } from './p2p-block-parser';
+import { isStakedCommitmentOutput, isStakedCommitmentOutputHex } from './staking';
 
 /**
  * Serialization of an empty bulletproofs+ range proof: just the zero Vs
@@ -798,6 +799,16 @@ export class TransactionKeysSync {
 
     const outs = ctx.getCTxOuts();
     const numOuts = outs.size();
+    // The binding's CTxOut cannot show a whole scriptPubKey, so read the
+    // outputs' scripts from the raw transaction to spot staked commitments.
+    let parsedOutputs: ParsedOutput[] = [];
+    try {
+      parsedOutputs = parseTransaction(Buffer.from(rawTx, 'hex')).outputs;
+    } catch (error) {
+      // The outputs are stored as not staked until block sync rewrites them,
+      // so a staked one counts in the balance meanwhile.
+      console.warn(`Could not parse mempool transaction ${txHash} to find staked outputs:`, error);
+    }
 
     for (let i = 0; i < numOuts; i++) {
       const ctxOut = outs.at(i);
@@ -865,7 +876,8 @@ export class TransactionKeysSync {
         recoveredAmount, recoveredGamma, recoveredMemo, tokenIdHex,
         blindingKeyHex, spendingKeyHex,
         false, null, null,
-        mempoolTxType, mempoolTimestamp, ephemeralKeyHex
+        mempoolTxType, mempoolTimestamp, ephemeralKeyHex,
+        parsedOutputs[i] !== undefined && isStakedCommitmentOutput(parsedOutputs[i])
       );
     }
 
@@ -1070,7 +1082,8 @@ export class TransactionKeysSync {
           null, // spent_block_height
           txType,
           blockTimestamp,
-          ephemeralKey
+          ephemeralKey,
+          isStakedCommitmentOutputHex(outputHex)
         );
 
         if (candidateOutids.length > 0 && ephemeralKey) {
@@ -1312,7 +1325,8 @@ export class TransactionKeysSync {
     spentBlockHeight: number | null,
     txType: TxType = 'received',
     timestamp: number = 0,
-    ephemeralKey: string | null = null
+    ephemeralKey: string | null = null,
+    isStakedCommitment: boolean = false
   ): Promise<void> {
     // Normalize the NAV token id to null at the single write choke point.
     // TokenId.serialize() renders NAV as 64 zero chars + the ffff… no-subid
@@ -1326,7 +1340,7 @@ export class TransactionKeysSync {
     await this.walletDB.storeWalletOutput({
       outputHash, txHash, outputIndex, blockHeight, outputData,
       amount, gamma, memo, tokenId: normalizedTokenId, blindingKey, ephemeralKey, spendingKey,
-      isSpent, spentTxHash, spentBlockHeight, txType, timestamp,
+      isSpent, spentTxHash, spentBlockHeight, txType, timestamp, isStakedCommitment,
     });
   }
 
