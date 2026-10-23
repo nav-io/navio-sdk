@@ -33,8 +33,8 @@ import type { HDChain, SubAddressIdentifier } from './key-manager.types';
 import * as blsctModule from '@nav-io/navio-blsct';
 import type { IDatabaseAdapter, DatabaseAdapterOptions } from './database-adapter';
 import { createDatabaseAdapter } from './database-adapter';
-import type { SyncState, StoreOutputParams, TxType, CreatedCollectionRecord, SubAddressEntry, StandingOrderRow } from './wallet-db.interface';
-export type { SyncState, WalletOutput, WalletMetadata, StoreOutputParams, IWalletDB, TxType, CreatedCollectionRecord, SubAddressEntry } from './wallet-db.interface';
+import type { SyncState, StoreOutputParams, TxType, CreatedCollectionRecord, SubAddressEntry, StandingOrderRow, PendingSpend } from './wallet-db.interface';
+export type { SyncState, WalletOutput, WalletMetadata, StoreOutputParams, IWalletDB, TxType, CreatedCollectionRecord, SubAddressEntry, PendingSpend } from './wallet-db.interface';
 
 // WalletOutput is re-exported from wallet-db.interface.ts
 import type { WalletOutput } from './wallet-db.interface';
@@ -379,7 +379,8 @@ export class WalletDB {
         created_at INTEGER NOT NULL,
         tx_type TEXT NOT NULL DEFAULT 'received',
         timestamp INTEGER NOT NULL DEFAULT 0,
-        is_staked_commitment INTEGER NOT NULL DEFAULT 0
+        is_staked_commitment INTEGER NOT NULL DEFAULT 0,
+        spent_at INTEGER
       )
     `);
 
@@ -419,6 +420,14 @@ export class WalletDB {
       // The output's ephemeral key (k*G). Nullable, so existing rows simply
       // carry NULL until they are re-synced.
       await this.adapter.run(`ALTER TABLE wallet_outputs ADD COLUMN ephemeral_key TEXT`);
+    } catch {
+      // Column already exists – ignore
+    }
+    try {
+      // When an output was marked spent by a not-yet-confirmed transaction
+      // (ms since epoch). NULL for confirmed spends, and for pending spends
+      // recorded before this column existed.
+      await this.adapter.run(`ALTER TABLE wallet_outputs ADD COLUMN spent_at INTEGER`);
     } catch {
       // Column already exists – ignore
     }
@@ -1484,9 +1493,54 @@ export class WalletDB {
   async markOutputSpent(outputHash: string, spentTxHash: string, spentBlockHeight: number): Promise<void> {
     if (!this.adapter) throw new Error('Database not open');
     await this.adapter.run(
-      `UPDATE wallet_outputs SET is_spent = 1, spent_tx_hash = ?, spent_block_height = ? WHERE output_hash = ?`,
-      [spentTxHash, spentBlockHeight, outputHash]
+      `UPDATE wallet_outputs SET is_spent = 1, spent_tx_hash = ?, spent_block_height = ?, spent_at = ?
+       WHERE output_hash = ?`,
+      [spentTxHash, spentBlockHeight, spentBlockHeight === 0 ? Date.now() : null, outputHash]
     );
+  }
+
+  async getPendingSpends(): Promise<PendingSpend[]> {
+    if (!this.adapter) throw new Error('Database not open');
+    const stmt = await this.adapter.prepare(
+      `SELECT output_hash, spent_tx_hash, spent_at FROM wallet_outputs
+       WHERE is_spent = 1 AND spent_block_height = 0 AND spent_tx_hash IS NOT NULL`
+    );
+    const spends: PendingSpend[] = [];
+    while (await stmt.step()) {
+      const row = await stmt.getAsObject();
+      spends.push({
+        outputHash: row.output_hash as string,
+        spentTxHash: row.spent_tx_hash as string,
+        pendingSince: row.spent_at === null || row.spent_at === undefined ? null : Number(row.spent_at),
+      });
+    }
+    await stmt.free();
+    return spends;
+  }
+
+  async releasePendingSpend(spentTxHash: string): Promise<string[]> {
+    if (!this.adapter) throw new Error('Database not open');
+    const released = (await this.getPendingSpends())
+      .filter((spend) => spend.spentTxHash === spentTxHash)
+      .map((spend) => spend.outputHash);
+
+    await this.adapter.run('BEGIN TRANSACTION');
+    try {
+      await this.adapter.run(
+        `UPDATE wallet_outputs SET is_spent = 0, spent_tx_hash = NULL, spent_block_height = NULL, spent_at = NULL
+         WHERE is_spent = 1 AND spent_block_height = 0 AND spent_tx_hash = ?`,
+        [spentTxHash]
+      );
+      await this.adapter.run(
+        'DELETE FROM wallet_outputs WHERE block_height = 0 AND tx_hash = ?',
+        [spentTxHash]
+      );
+      await this.adapter.run('COMMIT');
+    } catch (error) {
+      await this.adapter.run('ROLLBACK');
+      throw error;
+    }
+    return released;
   }
 
   async deleteOutputsByHeight(height: number): Promise<void> {

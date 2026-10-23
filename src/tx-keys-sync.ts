@@ -91,6 +91,32 @@ export interface SyncOptions {
   keepTxKeys?: boolean;
   /** Keep block hashes for last N blocks only (default: 10000) - 0 to keep all */
   blockHashRetention?: number;
+  /**
+   * How long (ms) a broadcast transaction may stay unconfirmed before sync
+   * asks the backend whether it still exists, and releases its inputs if the
+   * backend no longer has it (default: {@link DEFAULT_PENDING_SPEND_TIMEOUT_MS},
+   * 30 minutes). 0 disables the check. See
+   * {@link TransactionKeysSync.checkPendingSpends}.
+   */
+  pendingSpendTimeoutMs?: number;
+}
+
+/**
+ * Default age (ms) after which an unconfirmed spend is checked against the
+ * backend during sync: 30 minutes.
+ */
+export const DEFAULT_PENDING_SPEND_TIMEOUT_MS = 30 * 60 * 1000;
+
+/**
+ * Outcome of {@link TransactionKeysSync.checkPendingSpends}.
+ */
+export interface PendingSpendCheckResult {
+  /** Transactions the backend no longer has; their inputs were released */
+  released: string[];
+  /** Transactions the backend still has (mempool or chain) */
+  stillPending: string[];
+  /** Transactions the backend could not answer for; left as they were */
+  unknown: string[];
 }
 
 /**
@@ -257,6 +283,7 @@ export class TransactionKeysSync {
       getTransactionOutput: (outputHash: string) => client.getTransactionOutput(outputHash),
       broadcastTransaction: (rawTx: string) => client.broadcastTransaction(rawTx),
       getRawTransaction: (txHash: string, verbose?: boolean) => client.getRawTransaction(txHash, verbose),
+      hasTransaction: (txHash: string) => client.hasTransaction(txHash),
     };
   }
 
@@ -357,6 +384,7 @@ export class TransactionKeysSync {
       saveInterval = 100,
       keepTxKeys = false,
       blockHashRetention = 10000,
+      pendingSpendTimeoutMs = DEFAULT_PENDING_SPEND_TIMEOUT_MS,
     } = options;
 
     // Update retention setting
@@ -402,7 +430,11 @@ export class TransactionKeysSync {
     }
 
     if (syncStartHeight > syncEndHeight) {
-      return 0; // Already synced
+      // Already synced
+      if (syncEndHeight >= chainTip) {
+        await this.checkPendingSpendsQuietly(pendingSpendTimeoutMs);
+      }
+      return 0;
     }
 
     let totalTxKeysSynced = 0;
@@ -534,10 +566,98 @@ export class TransactionKeysSync {
       currentHeight = nextBatchHeight;
     }
 
+    // Only at the tip: a spend that confirmed in a block not yet scanned
+    // would otherwise look abandoned.
+    if (syncEndHeight >= chainTip) {
+      await this.checkPendingSpendsQuietly(pendingSpendTimeoutMs);
+    }
+
     // Final save after sync completes to ensure state is persisted
     await this.walletDB.saveDatabase();
 
     return totalTxKeysSynced;
+  }
+
+  /**
+   * Release the inputs of unconfirmed transactions the backend has dropped.
+   *
+   * An input spent by a broadcast transaction is marked spent at height 0
+   * until a block confirms it. If the transaction never confirms (evicted
+   * from the mempool, rejected after the broadcast was acknowledged, or
+   * conflicted), the input would stay spent forever and the transaction's
+   * own unconfirmed outputs would keep counting in the balance.
+   *
+   * For each transaction whose spends are older than `olderThanMs`, this asks
+   * the sync provider whether it still has the transaction (mempool or
+   * chain). If the provider says it does not, the inputs are marked unspent
+   * and the transaction's unconfirmed outputs deleted. If the provider cannot
+   * answer (or does not implement `hasTransaction`), nothing changes.
+   *
+   * Run this with the wallet synced to the tip: a transaction confirmed in a
+   * block the wallet has not scanned yet is no longer in the mempool and,
+   * since blocks aggregate transactions, not on chain under its own id
+   * either. Should that happen anyway, the next sync marks the inputs spent
+   * again when it scans the block.
+   *
+   * @param olderThanMs - Minimum age of a pending spend to check (default
+   *   {@link DEFAULT_PENDING_SPEND_TIMEOUT_MS})
+   * @returns Which transactions were released, still pending, or unknown
+   */
+  async checkPendingSpends(
+    olderThanMs: number = DEFAULT_PENDING_SPEND_TIMEOUT_MS
+  ): Promise<PendingSpendCheckResult> {
+    const result: PendingSpendCheckResult = { released: [], stillPending: [], unknown: [] };
+    const hasTransaction = this.syncProvider.hasTransaction?.bind(this.syncProvider);
+
+    // A transaction is due once its newest pending spend is old enough.
+    // Spends recorded before the timestamp existed count as old.
+    const newest = new Map<string, number>();
+    for (const spend of await this.walletDB.getPendingSpends()) {
+      const since = spend.pendingSince ?? 0;
+      newest.set(spend.spentTxHash, Math.max(newest.get(spend.spentTxHash) ?? 0, since));
+    }
+    const cutoff = Date.now() - olderThanMs;
+    const due = [...newest].filter(([, since]) => since <= cutoff).map(([txHash]) => txHash);
+    if (due.length === 0) {
+      return result;
+    }
+    if (!hasTransaction) {
+      result.unknown.push(...due);
+      return result;
+    }
+
+    for (const txHash of due) {
+      let found: boolean | null;
+      try {
+        found = await hasTransaction(txHash);
+      } catch {
+        found = null;
+      }
+      if (found === false) {
+        await this.walletDB.releasePendingSpend(txHash);
+        result.released.push(txHash);
+      } else if (found === true) {
+        result.stillPending.push(txHash);
+      } else {
+        result.unknown.push(txHash);
+      }
+    }
+    return result;
+  }
+
+  /** {@link checkPendingSpends} from sync(): never fails the sync. */
+  private async checkPendingSpendsQuietly(olderThanMs: number): Promise<void> {
+    if (!(olderThanMs > 0)) {
+      return;
+    }
+    try {
+      const { released } = await this.checkPendingSpends(olderThanMs);
+      if (released.length > 0) {
+        await this.walletDB.saveDatabase();
+      }
+    } catch (error) {
+      console.warn('Could not check unconfirmed spends:', error);
+    }
   }
 
   /**
@@ -775,6 +895,9 @@ export class TransactionKeysSync {
 
     // Determine txType: check if any inputs reference wallet-owned outputs.
     // Mempool transactions are never PoS blocks, so: spent wallet input → 'sent', else → 'received'.
+    // The wallet marks its own broadcast's inputs spent by it before
+    // processing it here, so an input already spent by this very transaction
+    // is the wallet's too.
     let mempoolTxType: TxType = 'received';
     try {
       const ins = ctx.getCTxIns();
@@ -784,7 +907,10 @@ export class TransactionKeysSync {
         const prevOutHash = ctxIn.getPrevOutHash();
         if (prevOutHash) {
           const outputHash = typeof prevOutHash === 'string' ? prevOutHash : prevOutHash.serialize();
-          if (await this.walletDB.isOutputUnspent(outputHash)) {
+          if (
+            (await this.walletDB.isOutputUnspent(outputHash)) ||
+            (await this.walletDB.getMempoolSpentTxHash(outputHash)) === txHash
+          ) {
             mempoolTxType = 'sent';
             break;
           }
@@ -977,11 +1103,17 @@ export class TransactionKeysSync {
     // Inputs this wallet recognises as spending its own outputs. Collected
     // here rather than short-circuiting because the blinding-key backfill
     // below needs the whole set to pick its canonical anchor.
+    // An input this wallet already spent in the mempool (its own broadcast,
+    // now confirming) is still its own.
     const ownInputOutids: string[] = [];
     if (Array.isArray(inputs) && inputs.length > 0) {
       for (const input of inputs) {
         const outputHash = input?.prevoutHash || input?.outputHash || input?.output_hash || input?.prevout?.hash;
-        if (outputHash && await this.walletDB.isOutputUnspent(outputHash)) {
+        if (
+          outputHash &&
+          ((await this.walletDB.isOutputUnspent(outputHash)) ||
+            (await this.walletDB.isOutputSpentInMempool(outputHash)))
+        ) {
           txType = isPoS ? 'stake' : 'sent';
           ownInputOutids.push(outputHash);
         }

@@ -869,6 +869,24 @@ export class P2PSyncProvider extends BaseSyncProvider {
     };
   }
 
+  /**
+   * Whether the node has the transaction: in its mempool or most recent
+   * block (getdata), or in a block this provider scanned.
+   *
+   * The node answers getdata from its mempool only for transactions it
+   * already announced to this connection, which a transaction that has sat
+   * in the mempool for minutes has been. A `notfound` therefore means the
+   * node does not hold it; any other failure leaves the answer unknown.
+   */
+  async hasTransaction(txHash: string): Promise<boolean | null> {
+    try {
+      await this.fetchTransaction(txHash);
+      return true;
+    } catch (err: any) {
+      return /^Transaction \S+ not found/.test(String(err?.message ?? err)) ? false : null;
+    }
+  }
+
   private async fetchTransaction(txHash: string): Promise<ParsedTransaction> {
     const wanted = txHash.toLowerCase();
 

@@ -184,6 +184,17 @@ export interface SyncProvider {
    */
   getRawTransaction(txHash: string, verbose?: boolean): Promise<string | unknown>;
 
+  /**
+   * Whether the backend knows a transaction, in its mempool or on chain
+   * (optional). Used to release the inputs of a broadcast transaction that
+   * never confirmed.
+   *
+   * @param txHash - Transaction hash (hex string)
+   * @returns true if found, false if the backend says it does not have it,
+   *   null if it cannot tell (an error other than "not found")
+   */
+  hasTransaction?(txHash: string): Promise<boolean | null>;
+
   // ============================================================================
   // Optional Subscription Methods (not all providers support these)
   // ============================================================================
