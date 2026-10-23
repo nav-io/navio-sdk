@@ -142,6 +142,24 @@ export interface StandingOrderRow {
 }
 
 /**
+ * A maker swap intent this wallet configured, as persisted (bigints as
+ * decimal strings). replyQuote answers only requests within a stored intent.
+ * See LocalSwapIntent.
+ */
+export interface SwapIntentRow {
+  localId: string;
+  /** Id the daemon assigned (not unique across daemons or restarts). */
+  intentId: number;
+  tokenInId: string | null;
+  tokenOutId: string | null;
+  minSize: string;
+  maxSize: string;
+  priceMin: string;
+  expiry: number;
+  createdAt: number;
+}
+
+/**
  * A persisted (hashId -> sub-address) mapping.
  */
 export interface SubAddressEntry {
@@ -284,6 +302,14 @@ export interface IWalletDB {
   getStandingOrders(): Promise<StandingOrderRow[]>;
   /** Drop a tracked standing order by localId. */
   deleteStandingOrder(localId: string): Promise<void>;
+
+  // -- swap intents (maker side) ----------------------------------------
+  /** Insert or replace a swap intent this wallet configured (keyed by localId). */
+  saveSwapIntent(row: SwapIntentRow): Promise<void>;
+  /** All stored swap intents, oldest first. */
+  getSwapIntents(): Promise<SwapIntentRow[]>;
+  /** Drop a stored swap intent by localId. */
+  deleteSwapIntent(localId: string): Promise<void>;
   getCreatedCollections(): Promise<CreatedCollectionRecord[]>;
 
   // -- persistence ------------------------------------------------------

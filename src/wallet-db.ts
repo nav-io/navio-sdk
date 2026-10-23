@@ -33,7 +33,7 @@ import type { HDChain, SubAddressIdentifier } from './key-manager.types';
 import * as blsctModule from '@nav-io/navio-blsct';
 import type { IDatabaseAdapter, DatabaseAdapterOptions } from './database-adapter';
 import { createDatabaseAdapter } from './database-adapter';
-import type { SyncState, StoreOutputParams, TxType, CreatedCollectionRecord, SubAddressEntry, StandingOrderRow } from './wallet-db.interface';
+import type { SyncState, StoreOutputParams, TxType, CreatedCollectionRecord, SubAddressEntry, StandingOrderRow, SwapIntentRow } from './wallet-db.interface';
 export type { SyncState, WalletOutput, WalletMetadata, StoreOutputParams, IWalletDB, TxType, CreatedCollectionRecord, SubAddressEntry } from './wallet-db.interface';
 
 // WalletOutput is re-exported from wallet-db.interface.ts
@@ -354,6 +354,22 @@ export class WalletDB {
         inputs TEXT NOT NULL,
         half_tx_hex TEXT NOT NULL,
         fee TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+      )
+    `);
+
+    // Swap intents this wallet configured (maker side); replyQuote answers
+    // only requests that fall within one of them
+    await this.adapter.run(`
+      CREATE TABLE IF NOT EXISTS swap_intents (
+        local_id TEXT PRIMARY KEY,
+        intent_id INTEGER NOT NULL,
+        token_in_id TEXT,
+        token_out_id TEXT,
+        min_size TEXT NOT NULL,
+        max_size TEXT NOT NULL,
+        price_min TEXT NOT NULL,
+        expiry INTEGER NOT NULL,
         created_at INTEGER NOT NULL
       )
     `);
@@ -1105,6 +1121,7 @@ export class WalletDB {
     await this.adapter.run('DELETE FROM wallet_outputs');
     await this.adapter.run('DELETE FROM created_collections');
     await this.adapter.run('DELETE FROM standing_orders');
+    await this.adapter.run('DELETE FROM swap_intents');
     // Another seed's blinding scalars are not ours and can never verify.
     await this.adapter.run('DELETE FROM output_blinding_keys');
     await this.clearSyncData();
@@ -1234,6 +1251,48 @@ export class WalletDB {
   async deleteStandingOrder(localId: string): Promise<void> {
     if (!this.adapter) throw new Error('Database not open');
     const stmt = await this.adapter.prepare('DELETE FROM standing_orders WHERE local_id = ?');
+    await stmt.run([localId]);
+    await stmt.free();
+    await this.persistToDisk();
+  }
+
+  async saveSwapIntent(row: SwapIntentRow): Promise<void> {
+    if (!this.adapter) throw new Error('Database not open');
+    const stmt = await this.adapter.prepare(`
+      INSERT OR REPLACE INTO swap_intents
+      (local_id, intent_id, token_in_id, token_out_id, min_size, max_size, price_min, expiry, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    await stmt.run([
+      row.localId, row.intentId, row.tokenInId, row.tokenOutId, row.minSize, row.maxSize, row.priceMin,
+      row.expiry, row.createdAt,
+    ]);
+    await stmt.free();
+    await this.persistToDisk();
+  }
+
+  async getSwapIntents(): Promise<SwapIntentRow[]> {
+    if (!this.adapter) throw new Error('Database not open');
+    const result = await this.adapter.exec(
+      'SELECT local_id, intent_id, token_in_id, token_out_id, min_size, max_size, price_min, expiry, created_at FROM swap_intents ORDER BY created_at'
+    );
+    if (result.length === 0) return [];
+    return result[0].values.map((row) => ({
+      localId: String(row[0]),
+      intentId: Number(row[1]),
+      tokenInId: row[2] === null || row[2] === undefined ? null : String(row[2]),
+      tokenOutId: row[3] === null || row[3] === undefined ? null : String(row[3]),
+      minSize: String(row[4]),
+      maxSize: String(row[5]),
+      priceMin: String(row[6]),
+      expiry: Number(row[7]),
+      createdAt: Number(row[8]),
+    }));
+  }
+
+  async deleteSwapIntent(localId: string): Promise<void> {
+    if (!this.adapter) throw new Error('Database not open');
+    const stmt = await this.adapter.prepare('DELETE FROM swap_intents WHERE local_id = ?');
     await stmt.run([localId]);
     await stmt.free();
     await this.persistToDisk();

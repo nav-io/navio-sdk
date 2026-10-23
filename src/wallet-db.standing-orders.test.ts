@@ -21,3 +21,27 @@ describe('WalletDB standing orders', () => {
     expect(await walletDB.getStandingOrders()).toEqual([]);
   });
 });
+
+describe('WalletDB swap intents', () => {
+  let walletDB: WalletDB | null = null;
+  afterEach(async () => { if (walletDB) { await walletDB.close(); walletDB = null; } });
+
+  it('round-trips, replaces by localId, and deletes', async () => {
+    walletDB = new WalletDB({ type: 'better-sqlite3' });
+    await walletDB.open(':memory:');
+    const row = {
+      localId: 'i1', intentId: 3, tokenInId: 'ab'.repeat(32), tokenOutId: null,
+      minSize: '100', maxSize: '9007199254740993', priceMin: '10000000', expiry: 2_000_000_000, createdAt: 1_700_000_000,
+    };
+    await walletDB.saveSwapIntent(row);
+    await walletDB.saveSwapIntent({ ...row, localId: 'i2', intentId: 4, tokenInId: null, tokenOutId: 'cd'.repeat(32), createdAt: 1_700_000_001 });
+    expect(await walletDB.getSwapIntents()).toEqual([
+      row,
+      { ...row, localId: 'i2', intentId: 4, tokenInId: null, tokenOutId: 'cd'.repeat(32), createdAt: 1_700_000_001 },
+    ]);
+    await walletDB.saveSwapIntent({ ...row, priceMin: '20000000' });
+    expect((await walletDB.getSwapIntents()).map((r) => [r.localId, r.priceMin])).toEqual([['i1', '20000000'], ['i2', '10000000']]);
+    await walletDB.deleteSwapIntent('i1');
+    expect((await walletDB.getSwapIntents()).map((r) => r.localId)).toEqual(['i2']);
+  });
+});

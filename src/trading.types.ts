@@ -37,7 +37,11 @@ export interface QuoteSummary {
   sellCost: bigint;
   /** sellCost / fill — lower is better for the taker */
   price: number;
-  /** Unix time (seconds) the quote expires */
+  /**
+   * Unix time (seconds) the quote expires. acceptQuote refuses a quote past
+   * it. This is daemon metadata only: the maker's signed half itself has no
+   * expiry (see {@link CancelSwapHalfOptions}).
+   */
   orderExpiry: number;
 }
 
@@ -92,6 +96,40 @@ export interface SwapIntentOptions {
   expiry: number;
 }
 
+/**
+ * Terms a maker accepts when answering a quote request: a request is within
+ * them when the taker buys `tokenInId` and sells `tokenOutId`, the fill lies
+ * in `[minSize, maxSize]`, and `sellCost * 1e8 >= fill * priceMin` (the
+ * daemon's own matching rule, computed exactly).
+ */
+export interface ReplyQuoteBounds {
+  /** Token this wallet pays out (the taker's buy token), or null for NAV */
+  tokenInId: string | null;
+  /** Token this wallet receives (the taker's sell token), or null for NAV */
+  tokenOutId: string | null;
+  /** Smallest fill accepted, in base units of tokenIn */
+  minSize: bigint;
+  /** Largest fill accepted, in base units of tokenIn */
+  maxSize: bigint;
+  /** Minimum price in tokenOut units per tokenIn unit, scaled by 1e8 */
+  priceMin: bigint;
+}
+
+/**
+ * A swap intent this wallet configured with setSwapIntent, as stored locally.
+ * replyQuote answers only requests within one of these.
+ */
+export interface LocalSwapIntent extends ReplyQuoteBounds {
+  /** Local id (stable for the intent's lifetime) */
+  localId: string;
+  /** Id the daemon assigned; pass it to clearSwapIntent */
+  intentId: number;
+  /** Unix time (seconds) the intent expires */
+  expiry: number;
+  /** Unix time (seconds) the intent was configured */
+  createdAt: number;
+}
+
 /** A maker swap intent as reported by the daemon. */
 export interface SwapIntent {
   id: number;
@@ -103,7 +141,12 @@ export interface SwapIntent {
   expiry: number;
 }
 
-/** An inbound RFQ request that matched a local intent and awaits a reply. */
+/**
+ * An inbound RFQ request that matched an intent on the daemon and awaits a
+ * reply. The daemon's intents are shared by every client of the server, so a
+ * pending request is not proof that this wallet agreed to its terms;
+ * replyQuote checks it against this wallet's own intents.
+ */
 export interface PendingQuoteRequest {
   /** The request uuid; pass to replyQuote */
   uuid: string;
@@ -123,10 +166,21 @@ export interface PendingQuoteRequest {
 export interface ReplyQuoteOptions {
   /** The pending request to answer, from getPendingQuoteRequests */
   request: PendingQuoteRequest;
-  /** Unix time (seconds) the quote expires (default: 10 minutes from now) */
+  /**
+   * Unix time (seconds) the quote expires (default: 10 minutes from now).
+   * Daemon metadata only: the signed half stays valid until its inputs are
+   * spent, whatever this says. See {@link CancelSwapHalfOptions}.
+   */
   orderExpiry?: number;
   /** Optional list of outputHashes to use as inputs (manual coin selection) */
   selectedUtxos?: string[];
+  /**
+   * Answer within these terms instead of this wallet's stored swap intents.
+   * For apps that manage intents themselves (e.g. set on another wallet or
+   * directly on the daemon). Without it, the request must fall within an
+   * unexpired intent set with this wallet's setSwapIntent.
+   */
+  bounds?: ReplyQuoteBounds;
 }
 
 /** Result of replying to a quote request or broadcasting a standing order. */
@@ -168,7 +222,11 @@ export interface StandingOrderRecord {
   offerAmount: bigint;
   wantTokenId: string | null;
   wantAmount: bigint;
-  /** Unix time (seconds) the order expires */
+  /**
+   * Unix time (seconds) the order expires: when peers drop it from their
+   * order cache. The signed half itself does not expire; anyone holding it
+   * can still complete the swap until one of its inputs is spent.
+   */
   expiry: number;
   /** outputHashes of the coins the order's half spends */
   inputs: string[];
@@ -188,7 +246,10 @@ export interface BroadcastOrderOptions {
   wantTokenId: string | null;
   /** Amount of the want token charged to the taker */
   wantAmount: bigint;
-  /** Unix time (seconds) the order expires (network caps at 14 days) */
+  /**
+   * Unix time (seconds) peers drop the order from their cache (network caps
+   * at 14 days). The signed half does not expire with it.
+   */
   expiry: number;
   /** Optional list of outputHashes to use as inputs (manual coin selection) */
   selectedUtxos?: string[];
@@ -199,4 +260,29 @@ export interface BroadcastOrderOptions {
    * from the same coins fails with "order rejected (... input conflict)".
    */
   reserveInputs?: boolean;
+}
+
+/**
+ * Which signed swap half to cancel: a tracked standing order (by local id or
+ * quote id), or the inputs of any half this wallet signed (e.g. the `inputs`
+ * replyQuote returned).
+ *
+ * A signed half carries no expiry the chain enforces: `orderExpiry` and a
+ * standing order's `expiry` only tell daemons when to stop relaying it. Anyone
+ * who saw the half (the taker, the server, every peer that cached a standing
+ * order) can still complete the swap until one of its inputs is spent.
+ * cancelSwapHalf spends them back to this wallet.
+ */
+export type CancelSwapHalfOptions =
+  | { orderId: string; inputs?: never }
+  | { inputs: string[]; orderId?: never };
+
+/** Result of cancelling a signed swap half. */
+export interface CancelSwapHalfResult {
+  /** Transaction id of the self-spend that invalidates the half */
+  txId: string;
+  /** Fee the self-spend paid, in NAV satoshis */
+  fee: bigint;
+  /** outputHashes of the half's inputs that the self-spend spent */
+  spentInputs: string[];
 }
