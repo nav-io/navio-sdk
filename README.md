@@ -115,7 +115,7 @@ interface NavioClientConfig {
   // Wallet options
   createWalletIfNotExists?: boolean; // Create wallet if missing (default: false)
   restoreFromSeed?: string; // Restore from seed (hex string)
-  restoreFromMnemonic?: string; // Restore from BIP39 mnemonic (12-24 words)
+  restoreFromMnemonic?: string; // Restore from BIP39 mnemonic (12-24 words, or 26 with a birthday)
   restoreFromAuditKey?: string; // Restore watch-only wallet from audit key (160 hex chars)
   restoreFromHeight?: number; // Block height when wallet was created (for restore)
   creationHeight?: number; // Creation height for new wallets (default: chainTip - 100)
@@ -160,7 +160,7 @@ Synchronizes transaction keys from the blockchain.
 ```typescript
 interface SyncOptions {
   startHeight?: number; // Start height (default: last synced + 1)
-  endHeight?: number; // End height (default: chain tip)
+  endHeight?: number; // End height (default: chain tip; capped at it)
   onProgress?: (
     currentHeight: number,
     chainTip: number,
@@ -187,6 +187,24 @@ reverts nothing. The fork search goes back at most `MAX_REORG_DEPTH` blocks
 height whose hash is no longer stored, throws `DeepReorgError` in either mode:
 call `resetSyncState()` on the sync manager (`client.getSyncManager()`) and
 sync again.
+
+`sync()` does not trust the server's data blindly. For every output it finds
+to be the wallet's, the serialized output must hash to its output hash and
+carry the keys the ownership check used, and a raw transaction it reads the
+amount from must hash to the transaction id and contain that output. A
+mismatch throws `SyncVerificationError`; the batch holding it is not
+committed, so the next sync retries from the last good block. (These are hash
+checks only: there are no merkle proofs, so a server can still withhold
+outputs, or invent a whole output together with its hash.)
+
+A reorg that lands while a batch is being fetched is caught too: each batch's
+keys and headers are checked against the block at the end height recorded
+when the sync began (and, with the P2P backend, against the hash of the block
+the keys came from). The batch is then fetched again from the new chain; if
+the chain keeps changing, `sync()` gives up after four attempts.
+
+Calls are serialized: a `sync()` made while another is running (for example
+during background sync) waits for it and then runs.
 
 ##### `isSyncNeeded(): Promise<boolean>`
 
@@ -1234,6 +1252,14 @@ await client.sync({
   },
 });
 ```
+
+A 26-word Navio birthday mnemonic records the week the wallet was created.
+Restored from one without `restoreFromHeight`, the client binary-searches the
+backend's block headers for the first block at that time (by median time
+past, since single block timestamps are not in order) and starts scanning a
+day's worth of blocks earlier. If the backend cannot serve headers it falls
+back to an estimate from the genesis time that assumes slow (240 s) blocks,
+so it starts too early rather than too late.
 
 ### Restore Watch-Only Wallet from Audit Key
 

@@ -368,3 +368,84 @@ describe('ElectrumClient getBlockTransactionKeysRange', () => {
     expect(res.nextHeight).toBe(500);
   });
 });
+
+describe('ElectrumClient socket lifecycle', () => {
+  /** Closes asynchronously, like a real socket: the close event comes later. */
+  class AsyncCloseWebSocket extends MockWebSocket {
+    close(): void {
+      setTimeout(() => (this as any).emit('close'), 5);
+    }
+  }
+
+  /** Never opens. */
+  class SilentWebSocket extends MockWebSocket {
+    constructor(url: string) {
+      super(url);
+      (this as any).emit = () => undefined;
+    }
+  }
+
+  beforeEach(() => {
+    MockWebSocket.reset();
+  });
+
+  afterEach(() => {
+    MockWebSocket.reset();
+    setWebSocketClass(null);
+  });
+
+  it('opens one socket for concurrent connect() calls', async () => {
+    setWebSocketClass(MockWebSocket);
+    const client = new ElectrumClient({ host: 'localhost', port: 50001 });
+
+    await Promise.all([client.connect(), client.connect(), client.connect()]);
+
+    expect(MockWebSocket.instances).toHaveLength(1);
+    expect(client.isConnected()).toBe(true);
+  });
+
+  it('ignores the late close event of a replaced socket', async () => {
+    setWebSocketClass(AsyncCloseWebSocket);
+    const client = new ElectrumClient({ host: 'localhost', port: 50001 });
+    await client.connect();
+    client.disconnect();
+    await client.connect();
+    expect(MockWebSocket.instances).toHaveLength(2);
+
+    // The mock never answers this method, so it stays pending unless a close
+    // rejects it.
+    let state = 'pending';
+    const request = client.call('test.unanswered').then(
+      () => { state = 'resolved'; },
+      (e: Error) => { state = e.message; },
+    );
+    await new Promise(resolve => setTimeout(resolve, 20)); // the first socket's close fires
+
+    expect(state).toBe('pending');
+    expect(client.isConnected()).toBe(true);
+    client.disconnect();
+    await request;
+    expect(state).toBe('Connection closed');
+  });
+
+  it('fails connect() when the socket does not open within the timeout', async () => {
+    setWebSocketClass(SilentWebSocket);
+    const client = new ElectrumClient({ host: 'localhost', port: 50001, timeout: 30 });
+
+    await expect(client.connect()).rejects.toThrow('Connection timeout');
+    expect(client.isConnected()).toBe(false);
+  });
+
+  it('fetchAllTransactionKeys stops when the server returns no blocks before the tip', async () => {
+    const client = new ElectrumClient({ host: 'localhost', port: 50001 });
+    (client as any).getChainTipHeight = vi.fn().mockResolvedValue(10);
+    let calls = 0;
+    (client as any).call = vi.fn(async () => {
+      if (++calls > 5) throw new Error('looping');
+      return { blocks: [] };
+    });
+
+    await expect(client.fetchAllTransactionKeys()).resolves.toEqual([]);
+    expect(calls).toBe(1);
+  });
+});

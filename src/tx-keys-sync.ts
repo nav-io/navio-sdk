@@ -197,6 +197,75 @@ export class DeepReorgError extends Error {
 }
 
 /**
+ * Thrown by sync() when the server's data does not match the hash it is
+ * served under: an output whose serialization does not hash to its output
+ * hash or whose keys differ from the keys the server listed for it, or a
+ * transaction that does not hash to its id. Without the check a malicious or
+ * broken server could make the wallet record any amount it liked.
+ *
+ * Nothing from the failing batch is committed: the sync state stays at the
+ * last good batch, so the next sync retries from there (against a server
+ * that answers correctly).
+ */
+export class SyncVerificationError extends Error {
+  constructor(message: string) {
+    super(`Server returned inconsistent data: ${message}`);
+    this.name = 'SyncVerificationError';
+  }
+}
+
+/**
+ * How many times one sync() call restarts a pass after the chain changed
+ * between fetching a batch's keys and its headers, before giving up.
+ */
+const MAX_SYNC_RESTARTS = 3;
+
+/**
+ * The chain changed under a sync pass: the keys and the headers of a batch
+ * may come from different branches. Internal; sync() restarts the pass.
+ */
+class ChainChangedError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'ChainChangedError';
+  }
+}
+
+/**
+ * What sync expects of an output it found to be the wallet's: the output
+ * hash and keys from the block's tx keys (lowercase hex).
+ */
+interface ExpectedOutputKeys {
+  outputHash: string;
+  blindingKey: string;
+  spendingKey: string;
+  viewTag: number;
+  /** Only the P2P provider lists it */
+  ephemeralKey: string | null;
+}
+
+/** Counters carried across the passes of one sync() call. */
+interface SyncPassProgress {
+  blocksProcessed: number;
+  txKeysSynced: number;
+}
+
+/**
+ * Mark a promise that may never be awaited (a prefetch) as observed, so its
+ * rejection cannot crash Node as an unhandled rejection. Returns the same
+ * promise: awaiting it still throws.
+ */
+function observed<T>(promise: Promise<T>): Promise<T> {
+  promise.catch(() => undefined);
+  return promise;
+}
+
+/** Display-hex double SHA-256, as block, transaction and output hashes are shown. */
+function hash256Display(data: Uint8Array): string {
+  return Buffer.from(sha256(sha256(data))).reverse().toString('hex');
+}
+
+/**
  * Transaction Keys Sync Manager
  *
  * Can be initialized with either:
@@ -211,6 +280,8 @@ export class TransactionKeysSync {
   private keyManager: KeyManager | null = null;
   private syncState: SyncState | null = null;
   private blockHashRetention: number = 10000;
+  /** Tail of the queue that serializes sync() calls; never rejects. */
+  private syncQueue: Promise<void> = Promise.resolve();
 
   /**
    * Create a new TransactionKeysSync instance
@@ -339,15 +410,76 @@ export class TransactionKeysSync {
   }
 
   /**
-   * Synchronize transaction keys from Electrum server
+   * Synchronize transaction keys from the sync provider.
+   *
+   * Calls are serialized: a sync() made while another is running (for
+   * example `client.sync()` during a background sync) waits for that one to
+   * finish and then runs with its own options.
+   *
    * @param options - Sync options
    * @returns Number of transaction keys synced
+   * @throws SyncVerificationError if the server's data does not hash to what
+   *   it claims; the batch holding it is not committed
    */
-  async sync(options: SyncOptions = {}): Promise<number> {
+  sync(options: SyncOptions = {}): Promise<number> {
+    const run = this.syncQueue.then(() => this.runSync(options));
+    // The queue only orders runs; each caller sees its own result.
+    this.syncQueue = run.then(
+      () => undefined,
+      () => undefined
+    );
+    return run;
+  }
+
+  /**
+   * One serialized sync() call: sync passes, restarted when the chain changes
+   * under a pass (at most {@link MAX_SYNC_RESTARTS} times).
+   */
+  private async runSync(options: SyncOptions): Promise<number> {
     if (!this.keyManager) {
       await this.initialize();
     }
 
+    // Update retention setting
+    this.blockHashRetention = options.blockHashRetention ?? 10000;
+
+    const progress: SyncPassProgress = { blocksProcessed: 0, txKeysSynced: 0 };
+    let startHeight = options.startHeight;
+    for (let attempt = 0; ; attempt++) {
+      try {
+        await this.syncPass({ ...options, startHeight }, progress);
+        return progress.txKeysSynced;
+      } catch (error) {
+        if (!(error instanceof ChainChangedError)) {
+          throw error;
+        }
+        if (attempt >= MAX_SYNC_RESTARTS) {
+          throw new Error(
+            `The chain kept changing during sync (${error.message}); ` +
+              `gave up after ${MAX_SYNC_RESTARTS + 1} attempts. Nothing past height ` +
+              `${this.getLastSyncedHeight()} was stored; sync again later.`
+          );
+        }
+        // Batches already committed stay; the next pass checks them for a
+        // reorg and continues after the last one.
+        if (progress.blocksProcessed > 0) {
+          startHeight = undefined;
+        }
+      }
+    }
+  }
+
+  /**
+   * One pass from the start height to the chain tip seen when it began.
+   *
+   * Before anything else is fetched it records the hash of the block at the
+   * end height (the anchor). Every batch is checked against it after its keys
+   * and headers arrived: while the anchor block is unchanged, so is every
+   * block below it, so the keys, the headers and the reorg check all describe
+   * one chain. A changed anchor (or a provider block hash that differs from
+   * the header) throws ChainChangedError before the batch is stored.
+   */
+  private async syncPass(options: SyncOptions, progress: SyncPassProgress): Promise<void> {
     const {
       startHeight,
       endHeight,
@@ -356,14 +488,17 @@ export class TransactionKeysSync {
       verifyHashes = true,
       saveInterval = 100,
       keepTxKeys = false,
-      blockHashRetention = 10000,
     } = options;
 
-    // Update retention setting
-    this.blockHashRetention = blockHashRetention;
-
     const chainTip = await this.syncProvider.getChainTipHeight();
-    const syncEndHeight = endHeight ?? chainTip;
+    // Blocks past the tip seen here are left for the next sync: the anchor
+    // below does not cover them.
+    const syncEndHeight = Math.min(endHeight ?? chainTip, chainTip);
+
+    const anchor =
+      verifyHashes && syncEndHeight >= 0
+        ? { height: syncEndHeight, hash: await this.fetchBlockHash(syncEndHeight) }
+        : null;
 
     // Check for a reorganization before choosing where to start: a revert
     // moves lastSyncedHeight back to the fork, and the replacement blocks from
@@ -402,18 +537,16 @@ export class TransactionKeysSync {
     }
 
     if (syncStartHeight > syncEndHeight) {
-      return 0; // Already synced
+      return; // Already synced
     }
 
-    let totalTxKeysSynced = 0;
     let currentHeight = syncStartHeight;
-    let blocksProcessed = 0;
     let lastSaveHeight = syncStartHeight - 1;
 
-    // Pipeline: prefetch the next batch of tx keys + headers while
-    // processing the current batch, eliminating the ~2s pause between batches.
-    // The first batch is fetched inside the loop; subsequent batches are
-    // prefetched at the end of each iteration so the download overlaps with
+    // Pipeline: prefetch the next batch of tx keys while processing the
+    // current batch, eliminating the ~2s pause between batches. The first
+    // batch is fetched inside the loop; subsequent batches are prefetched as
+    // soon as the current one arrives so the download overlaps with
     // processing.
 
     let pendingRangePromise: Promise<{ blocks: BlockTransactionKeys[]; nextHeight: number }> | null = null;
@@ -451,21 +584,23 @@ export class TransactionKeysSync {
       }
 
       // Immediately start prefetching the NEXT batch of tx keys so it
-      // downloads in parallel with our processing of the current batch.
+      // downloads in parallel with our processing of the current batch. This
+      // batch can still throw before the prefetch is awaited, so a rejection
+      // must not go unobserved (Node exits on an unhandled rejection).
       if (nextBatchHeight <= syncEndHeight) {
-        pendingRangePromise = this.syncProvider.getBlockTransactionKeysRange(nextBatchHeight);
+        pendingRangePromise = observed(
+          this.syncProvider.getBlockTransactionKeysRange(nextBatchHeight)
+        );
       }
 
-      // Header pipeline: one-ahead prefetch so the next chunk loads while we process the current one
-      const CS = TransactionKeysSync.HEADER_CHUNK_SIZE;
-      let chunkStart = firstHeight;
-      let currentHeaders = await this.fetchHeaderChunk(chunkStart, CS);
-      let nextChunkStart = chunkStart + CS;
-      let nextHeadersPromise: Promise<Map<number, string>> | null =
-        nextChunkStart <= lastHeight ? this.fetchHeaderChunk(nextChunkStart, CS) : null;
+      // All headers of the batch, fetched after its keys so that the anchor
+      // check below covers both.
+      const headers = await this.fetchHeaderRange(firstHeight, lastHeight);
+      if (anchor) {
+        await this.verifyBatchChain(blocksToProcess, headers, anchor);
+      }
 
       let lastBlockHash = '';
-      // Process each block using the current chunk; when we cross into the next chunk, swap and prefetch
       for (let blockIdx = 0; blockIdx < blocksToProcess.length; blockIdx++) {
         const block = blocksToProcess[blockIdx];
 
@@ -475,23 +610,17 @@ export class TransactionKeysSync {
           await yieldToMainThread();
         }
 
-        if (!currentHeaders.has(block.height) && nextHeadersPromise) {
-          currentHeaders = await nextHeadersPromise;
-          nextHeadersPromise = null;
-          chunkStart = nextChunkStart;
-          nextChunkStart = chunkStart + CS;
-          if (nextChunkStart <= lastHeight) {
-            nextHeadersPromise = this.fetchHeaderChunk(nextChunkStart, CS);
-          }
+        const headerHex = headers.get(block.height);
+        if (!headerHex) {
+          throw new Error(`Server returned no header for block ${block.height}`);
         }
-        const headerHex = currentHeaders.get(block.height)!;
         const blockHash = this.extractBlockHash(headerHex);
         lastBlockHash = blockHash;
 
         // Extract block timestamp and PoS flag from the 80-byte header
         let blockTimestamp = 0;
         let isPoS = false;
-        if (headerHex && headerHex.length >= 160) {
+        if (headerHex.length >= 160) {
           const headerBytes = Buffer.from(headerHex, 'hex');
           blockTimestamp = headerBytes.readUInt32LE(68);
           const blockVersion = headerBytes.readInt32LE(0);
@@ -508,27 +637,26 @@ export class TransactionKeysSync {
           await this.processBlockForSpentOutputs(block, blockHash);
         }
 
-        totalTxKeysSynced += txKeysCount;
-        blocksProcessed++;
+        progress.txKeysSynced += txKeysCount;
+        progress.blocksProcessed++;
 
         if (onProgress) {
-          onProgress(block.height, syncEndHeight, blocksProcessed, totalTxKeysSynced, false);
+          onProgress(block.height, syncEndHeight, progress.blocksProcessed, progress.txKeysSynced, false);
         }
       }
 
       // Update sync state after processing batch (lastBlockHash was set in the loop)
-      const lastBlock = blocksToProcess[blocksToProcess.length - 1];
       await this.updateSyncState({
-        lastSyncedHeight: lastBlock.height,
+        lastSyncedHeight: lastHeight,
         lastSyncedHash: lastBlockHash,
-        totalTxKeysSynced: (this.syncState?.totalTxKeysSynced ?? 0) + totalTxKeysSynced,
+        totalTxKeysSynced: (this.syncState?.totalTxKeysSynced ?? 0) + progress.txKeysSynced,
         lastSyncTime: Date.now(),
         chainTipAtLastSync: chainTip,
       });
 
-      if (saveInterval > 0 && lastBlock.height - lastSaveHeight >= saveInterval) {
+      if (saveInterval > 0 && lastHeight - lastSaveHeight >= saveInterval) {
         await this.walletDB.saveDatabase();
-        lastSaveHeight = lastBlock.height;
+        lastSaveHeight = lastHeight;
       }
 
       currentHeight = nextBatchHeight;
@@ -536,8 +664,44 @@ export class TransactionKeysSync {
 
     // Final save after sync completes to ensure state is persisted
     await this.walletDB.saveDatabase();
+  }
 
-    return totalTxKeysSynced;
+  /**
+   * Check that a batch's keys and headers describe the chain the pass
+   * started on: each block hash the provider reported matches the header at
+   * its height, and the anchor block is still the server's block at the
+   * anchor height.
+   * @throws ChainChangedError on any mismatch
+   */
+  private async verifyBatchChain(
+    blocks: BlockTransactionKeys[],
+    headers: Map<number, string>,
+    anchor: { height: number; hash: string }
+  ): Promise<void> {
+    for (const block of blocks) {
+      const headerHex = headers.get(block.height);
+      if (block.hash && headerHex) {
+        const headerHash = this.extractBlockHash(headerHex);
+        if (block.hash.toLowerCase() !== headerHash) {
+          throw new ChainChangedError(
+            `block ${block.height}: keys are from ${block.hash}, header is ${headerHash}`
+          );
+        }
+      }
+    }
+    const anchorHash = await this.fetchBlockHash(anchor.height);
+    if (anchorHash !== anchor.hash) {
+      throw new ChainChangedError(
+        `block ${anchor.height} changed from ${anchor.hash} to ${anchorHash}`
+      );
+    }
+  }
+
+  /** Hash of the server's block at `height`. */
+  private async fetchBlockHash(height: number): Promise<string> {
+    return this.extractBlockHash(
+      await this.withRetry(() => this.syncProvider.getBlockHeader(height))
+    );
   }
 
   /**
@@ -1036,6 +1200,16 @@ export class TransactionKeysSync {
         continue;
       }
       if (isMine) {
+        // The keys isMine accepted; whatever the server serves for this
+        // output must carry exactly these.
+        const expectedKeys: ExpectedOutputKeys = {
+          outputHash: String(outputHash).toLowerCase(),
+          blindingKey: String(blindingKey).toLowerCase(),
+          spendingKey: String(spendingKey).toLowerCase(),
+          viewTag: Number(viewTag),
+          ephemeralKey: outputKeys?.ephemeralKey || outputKeys?.ephemeral_key || null,
+        };
+
         let outputHex = '';
         try {
           outputHex = await this.withRetry(() =>
@@ -1045,12 +1219,15 @@ export class TransactionKeysSync {
           // Some providers may not expose standalone output serialization.
           // Recovery falls back to parsing the full raw transaction below.
         }
+        if (outputHex) {
+          this.verifyServedOutput(outputHex, expectedKeys, `output ${outputHash}`);
+        }
 
         const recoveredOutput = await this.recoverConfirmedOutput(
           txHash,
-          outputIndex,
           blindingKeyObj,
-          outputHex
+          outputHex,
+          expectedKeys
         );
 
         // The public counterpart of the sender's blinding scalar is the
@@ -1130,11 +1307,108 @@ export class TransactionKeysSync {
     }
   }
 
+  /**
+   * Check a serialized output the server returned: it must hash to the
+   * output hash it was requested by, parse, and carry the keys the wallet's
+   * ownership check used.
+   * @param outputHex - Serialized CTxOut (hex)
+   * @param expected - The output hash and keys from the block's tx keys
+   * @param what - What the output is, for the error message
+   * @returns The parsed output
+   * @throws SyncVerificationError on any mismatch
+   */
+  private verifyServedOutput(
+    outputHex: string,
+    expected: ExpectedOutputKeys,
+    what: string
+  ): ParsedOutput {
+    if (outputHex.length % 2 !== 0 || !/^[0-9a-fA-F]*$/.test(outputHex)) {
+      throw new SyncVerificationError(`${what} is not hex`);
+    }
+    const actualHash = hash256Display(Buffer.from(outputHex, 'hex'));
+    if (actualHash !== expected.outputHash) {
+      throw new SyncVerificationError(`${what} hashes to ${actualHash}`);
+    }
+    let parsed: ParsedOutput;
+    try {
+      parsed = parseOutputHex(outputHex);
+    } catch (error) {
+      throw new SyncVerificationError(`${what} does not parse: ${(error as Error).message}`);
+    }
+    this.checkOutputKeys(parsed, expected, what);
+    return parsed;
+  }
+
+  /**
+   * Check that a parsed output carries the keys the wallet's ownership check
+   * used.
+   * @throws SyncVerificationError on any difference
+   */
+  private checkOutputKeys(parsed: ParsedOutput, expected: ExpectedOutputKeys, what: string): void {
+    const keys = parsed.keys;
+    if (!keys) {
+      throw new SyncVerificationError(`${what} carries no BLSCT keys`);
+    }
+    const mismatched: string[] = [];
+    if (keys.blindingKey !== expected.blindingKey) mismatched.push('blinding key');
+    if (keys.spendingKey !== expected.spendingKey) mismatched.push('spending key');
+    if (keys.viewTag !== expected.viewTag) mismatched.push('view tag');
+    if (expected.ephemeralKey && keys.ephemeralKey !== expected.ephemeralKey.toLowerCase()) {
+      mismatched.push('ephemeral key');
+    }
+    if (mismatched.length > 0) {
+      throw new SyncVerificationError(
+        `${what} does not carry the keys listed for it (${mismatched.join(', ')} differ)`
+      );
+    }
+  }
+
+  /**
+   * Fetch the raw transaction holding an output and check it: it must hash
+   * to `txHash` and contain the output, with the expected keys.
+   * @returns The raw transaction and the output's index in it, or null when
+   *   the provider returns no hex
+   * @throws SyncVerificationError on any mismatch
+   */
+  private async fetchVerifiedRawTransaction(
+    txHash: string,
+    expected: ExpectedOutputKeys
+  ): Promise<{ rawTx: string; outputIndex: number } | null> {
+    const rawTx = await this.withRetry(() => this.syncProvider.getRawTransaction(txHash));
+    if (typeof rawTx !== 'string') {
+      return null;
+    }
+    let parsed: ReturnType<typeof parseTransaction>;
+    try {
+      const bytes = Buffer.from(rawTx, 'hex');
+      parsed = parseTransaction(bytes);
+      if (parsed.end !== bytes.length || bytes.length * 2 !== rawTx.length) {
+        throw new Error('trailing data');
+      }
+    } catch (error) {
+      throw new SyncVerificationError(
+        `transaction ${txHash} does not parse: ${(error as Error).message}`
+      );
+    }
+    const wanted = txHash.toLowerCase();
+    if (parsed.txid !== wanted && parsed.wtxid !== wanted) {
+      throw new SyncVerificationError(`transaction ${txHash} hashes to ${parsed.txid}`);
+    }
+    const output = parsed.outputs.find((o) => o.outputHash === expected.outputHash);
+    if (!output) {
+      throw new SyncVerificationError(
+        `transaction ${txHash} does not contain output ${expected.outputHash}`
+      );
+    }
+    this.checkOutputKeys(output, expected, `output ${expected.outputHash} of transaction ${txHash}`);
+    return { rawTx, outputIndex: output.index };
+  }
+
   private async recoverConfirmedOutput(
     txHash: string,
-    outputIndex: number,
     blindingKeyObj: any,
-    outputHex: string
+    outputHex: string,
+    expected: ExpectedOutputKeys
   ): Promise<{ amount: number; gamma: string; memo: string | null; tokenIdHex: string | null }> {
     // Fast path: hand-parse the serialized output. This reliably recovers
     // plain (NAV) outputs, but the parser mis-handles token/predicate outputs
@@ -1148,9 +1422,16 @@ export class TransactionKeysSync {
       return fastRecovery;
     }
 
-    const rawTx = await this.withRetry(() => this.syncProvider.getRawTransaction(txHash));
-    if (typeof rawTx === 'string') {
-      const rawRecovery = this.tryRecoverFromRawTransaction(rawTx, outputIndex, blindingKeyObj);
+    // The output is located by its hash rather than by position: the key
+    // lists of both providers skip outputs, so a list index need not be the
+    // output's index in the transaction.
+    const verified = await this.fetchVerifiedRawTransaction(txHash, expected);
+    if (verified) {
+      const rawRecovery = this.tryRecoverFromRawTransaction(
+        verified.rawTx,
+        verified.outputIndex,
+        blindingKeyObj
+      );
       if (rawRecovery !== null && rawRecovery.amount > 0) {
         return rawRecovery;
       }
@@ -1357,6 +1638,26 @@ export class TransactionKeysSync {
   }
 
   private static readonly HEADER_CHUNK_SIZE = 2016;
+
+  /**
+   * Fetch the headers of heights `firstHeight`..`lastHeight` as a map of
+   * height -> header hex, in concurrent chunks of HEADER_CHUNK_SIZE.
+   */
+  private async fetchHeaderRange(
+    firstHeight: number,
+    lastHeight: number
+  ): Promise<Map<number, string>> {
+    const CS = TransactionKeysSync.HEADER_CHUNK_SIZE;
+    const chunks: Promise<Map<number, string>>[] = [];
+    for (let start = firstHeight; start <= lastHeight; start += CS) {
+      chunks.push(this.fetchHeaderChunk(start, Math.min(CS, lastHeight - start + 1)));
+    }
+    const map = new Map<number, string>();
+    for (const chunk of await Promise.all(chunks)) {
+      for (const [height, hex] of chunk) map.set(height, hex);
+    }
+    return map;
+  }
 
   /**
    * Fetch a chunk of block headers and return them as a map of height -> header hex.

@@ -108,11 +108,16 @@ export class P2PSyncProvider extends BaseSyncProvider {
   // Pending block requests (dedupe concurrent fetches of one hash)
   private pendingBlocks: Map<string, Promise<ParsedBlock>> = new Map();
   private activeBlockRequests = 0;
-  private blockRequestQueue: Array<() => void> = [];
+  private blockRequestQueue: Array<{ grant: () => void; fail: (err: Error) => void }> = [];
+  /**
+   * Bumped by disconnect(). A block request holds the generation it got its
+   * slot in, and releasing a slot from an earlier generation does nothing:
+   * disconnect() already reset the count.
+   */
+  private blockSlotGeneration = 0;
 
   // Block header subscriptions
   private blockHeaderCallbacks: BlockHeaderCallback[] = [];
-  private inboundBlockHashes: Set<string> = new Set();
 
   constructor(options: P2PSyncOptions) {
     super(options);
@@ -182,8 +187,14 @@ export class P2PSyncProvider extends BaseSyncProvider {
   disconnect(): void {
     this.client.disconnect();
     this.pendingBlocks.clear();
+    // Requests still waiting for a slot would otherwise wait forever.
+    const queued = this.blockRequestQueue;
     this.blockRequestQueue = [];
     this.activeBlockRequests = 0;
+    this.blockSlotGeneration++;
+    for (const waiter of queued) {
+      waiter.fail(new Error('Not connected'));
+    }
     this.headerSyncInFlight = null;
   }
 
@@ -383,6 +394,14 @@ export class P2PSyncProvider extends BaseSyncProvider {
   /**
    * Chain received headers onto our cache. Returns the accepted headers in
    * height order.
+   *
+   * Every new header is placed at its parent's height + 1. When that height
+   * is already taken, the header starts a competing branch the node now
+   * prefers, so our headers from that height up are dropped (hashes too)
+   * before it is stored. This holds for any header of the batch, not just
+   * the first new one: with a sparse locator after a deep reorg, the node
+   * answers from a common ancestor below the fork, and the batch opens with
+   * headers we already have.
    */
   private processHeaders(rawHeaders: Buffer[]): CachedHeader[] {
     const accepted: CachedHeader[] = [];
@@ -394,16 +413,22 @@ export class P2PSyncProvider extends BaseSyncProvider {
       const hash = this.extractBlockHash(headerHex);
       const prevHash = Buffer.from(rawHeader.subarray(4, 36)).reverse().toString('hex');
 
-      if (this.headersByHash.has(hash)) {
-        // Already known (node re-sent from the fork point)
-        const known = this.headersByHash.get(hash)!;
+      if (expectedPrev !== null && prevHash !== expectedPrev) {
+        this.log(`Header ${hash.substring(0, 16)}... breaks the chain in this batch; stopping`);
+        break;
+      }
+
+      const known = this.headersByHash.get(hash);
+      if (known) {
+        // Already on our chain (orphaned hashes are dropped on truncation);
+        // the node re-sent it from a common ancestor.
         expectedPrev = hash;
         nextHeight = known.height + 1;
         continue;
       }
 
       if (expectedPrev === null) {
-        // First new header of the batch: chain onto a known ancestor
+        // First header of the batch: chain onto a known ancestor
         const parent = this.headersByHash.get(prevHash);
         if (parent) {
           nextHeight = parent.height + 1;
@@ -422,16 +447,15 @@ export class P2PSyncProvider extends BaseSyncProvider {
           );
           break;
         }
-        // Reorg: drop everything at/after the attach height
-        if (nextHeight <= this.chainTipHeight) {
-          this.log(
-            `Reorg: replacing headers from height ${nextHeight} (tip was ${this.chainTipHeight})`
-          );
-          this.truncateHeaders(nextHeight);
-        }
-      } else if (prevHash !== expectedPrev) {
-        this.log(`Header ${hash.substring(0, 16)}... breaks the chain in this batch; stopping`);
-        break;
+      }
+
+      // Reorg: a new header at a height we already hold replaces our branch
+      // from there up.
+      if (nextHeight <= this.chainTipHeight) {
+        this.log(
+          `Reorg: replacing headers from height ${nextHeight} (tip was ${this.chainTipHeight})`
+        );
+        this.truncateHeaders(nextHeight);
       }
 
       const cached: CachedHeader = { height: nextHeight, hash, rawHex: headerHex, prevHash };
@@ -448,10 +472,10 @@ export class P2PSyncProvider extends BaseSyncProvider {
     return accepted;
   }
 
+  /** Drop every cached header at or above `fromHeight`, hashes included. */
   private truncateHeaders(fromHeight: number): void {
-    for (let h = fromHeight; h <= this.chainTipHeight; h++) {
-      const header = this.headersByHeight.get(h);
-      if (header) {
+    for (const [h, header] of this.headersByHeight) {
+      if (h >= fromHeight) {
         this.headersByHash.delete(header.hash);
         this.headersByHeight.delete(h);
       }
@@ -478,7 +502,6 @@ export class P2PSyncProvider extends BaseSyncProvider {
         const hash = P2PClient.hashToDisplay(inv.hash);
         if (!this.headersByHash.has(hash)) {
           sawBlock = true;
-          this.inboundBlockHashes.add(hash);
         }
       }
     }
@@ -526,7 +549,6 @@ export class P2PSyncProvider extends BaseSyncProvider {
   private notifyBlockHeaderSubscribers(headers: CachedHeader[]): void {
     if (this.blockHeaderCallbacks.length === 0) return;
     for (const header of headers) {
-      this.inboundBlockHashes.delete(header.hash);
       for (const cb of this.blockHeaderCallbacks) {
         try {
           const result: unknown = cb({ height: header.height, hex: header.rawHex });
@@ -576,6 +598,7 @@ export class P2PSyncProvider extends BaseSyncProvider {
       txKeys: this.extractTransactionKeys(block),
       timestamp: block.timestamp,
       isPoS: block.isPoS,
+      hash: block.hash,
     }));
 
     return { blocks, nextHeight: endHeight + 1 };
@@ -640,40 +663,52 @@ export class P2PSyncProvider extends BaseSyncProvider {
       return pending;
     }
 
-    const promise = (async () => {
-      await this.acquireBlockSlot();
-      try {
-        const msg = await this.client.getBlock(P2PClient.hashFromDisplay(hashHex));
-        const block = parseBlock(msg.payload);
-        this.rememberBlock(block);
-        return block;
-      } finally {
-        this.releaseBlockSlot();
-        this.pendingBlocks.delete(hashHex);
-      }
-    })();
-
+    const promise = this.downloadBlock(hashHex);
     this.pendingBlocks.set(hashHex, promise);
+    // A disconnect may have cleared the map and a new request taken the key.
+    const forget = () => {
+      if (this.pendingBlocks.get(hashHex) === promise) this.pendingBlocks.delete(hashHex);
+    };
+    promise.then(forget, forget);
     return promise;
   }
 
-  private acquireBlockSlot(): Promise<void> {
+  private async downloadBlock(hashHex: string): Promise<ParsedBlock> {
+    const generation = await this.acquireBlockSlot();
+    try {
+      const msg = await this.client.getBlock(P2PClient.hashFromDisplay(hashHex));
+      const block = parseBlock(msg.payload);
+      this.rememberBlock(block);
+      return block;
+    } finally {
+      this.releaseBlockSlot(generation);
+    }
+  }
+
+  /** Wait for a block request slot; resolves with the slot's generation. */
+  private acquireBlockSlot(): Promise<number> {
     if (this.activeBlockRequests < this.options.maxConcurrentBlockRequests) {
       this.activeBlockRequests++;
-      return Promise.resolve();
+      return Promise.resolve(this.blockSlotGeneration);
     }
-    return new Promise(resolve => {
-      this.blockRequestQueue.push(() => {
-        this.activeBlockRequests++;
-        resolve();
+    return new Promise((resolve, reject) => {
+      this.blockRequestQueue.push({
+        grant: () => {
+          this.activeBlockRequests++;
+          resolve(this.blockSlotGeneration);
+        },
+        fail: reject,
       });
     });
   }
 
-  private releaseBlockSlot(): void {
-    this.activeBlockRequests--;
+  private releaseBlockSlot(generation: number): void {
+    if (generation !== this.blockSlotGeneration) {
+      return; // disconnect() already reset the count
+    }
+    this.activeBlockRequests = Math.max(0, this.activeBlockRequests - 1);
     const next = this.blockRequestQueue.shift();
-    if (next) next();
+    if (next) next.grant();
   }
 
   private rememberBlock(block: ParsedBlock): void {

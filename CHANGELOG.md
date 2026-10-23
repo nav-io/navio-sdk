@@ -23,6 +23,63 @@ Format follows [Keep a Changelog](https://keepachangelog.com/); versions follow 
   is kept, so no save loses the seed. SQLite gains an `encrypted_seed` column
   and turns on `secure_delete`, so the replaced plaintext does not linger in
   free pages.
+- **Sync checks what the server serves against its hashes.** The output
+  bytes from `getTransactionOutput()` and the raw transaction from
+  `getRawTransaction()` were used for amount recovery unchecked, so an
+  Electrum server could make the wallet record any amount. Sync now requires
+  the output to hash to its output hash and carry the keys the ownership
+  check matched, and the raw transaction to hash to its id and contain the
+  output. A mismatch throws the new `SyncVerificationError` and the batch is
+  not committed. Recovery from a raw transaction also finds the output by
+  hash instead of by its position in the server's key list, which skips
+  outputs. Hash checks only; there are no merkle proofs.
+
+### Fixed
+
+- **A dropped connection during sync no longer crashes Node.** The prefetch
+  of the next batch of tx keys (and of the next header chunk) had no
+  rejection handler until awaited, so a connection that dropped while the
+  current batch failed left an unhandled rejection. Prefetches are now
+  observed when created; awaiting them still throws.
+- **P2P header sync follows deep reorgs.** `P2PSyncProvider` only replaced
+  its headers when the first new header of a reply attached below its tip.
+  After a reorg of 10 or more blocks the node answers from below the fork, so
+  the reply opened with known headers and the new branch was written over the
+  old one, leaving the old branch's headers above a shorter new tip and its
+  hashes in the cache, which broke a later reorg back. Every new header is
+  now checked, and orphaned headers are dropped with their hashes.
+- **A reorg between fetching a batch's keys and its headers is caught.**
+  Sync could store one branch's block hashes with the other branch's
+  outputs, and nothing later noticed. Each pass records the hash of the
+  block at its end height first and checks it again after each batch's keys
+  and headers arrived; P2P batches are also checked block by block against
+  the hash of the block the keys came from (new `BlockTransactionKeys.hash`).
+  On a mismatch the batch is fetched again from the new chain, up to three
+  times.
+- **`TransactionKeysSync.sync()` calls are serialized.** `client.sync()`
+  during a background sync ran two syncs over the same database at once. A
+  second call now waits for the first.
+- **`ElectrumClient` socket lifecycle.** Concurrent `connect()` calls opened
+  one socket each; they now share one attempt. A replaced socket's late
+  `close` event cleared the live socket and failed its requests; events of a
+  socket that is no longer live are ignored. `connect()` now fails after the
+  `timeout` option instead of waiting forever for a socket that never opens.
+- **Restoring from a birthday mnemonic no longer starts past the birthday.**
+  The start height assumed 120 s blocks, so on mainnet (about 130 s) it
+  overshot the wallet's first outputs once the wallet was a couple of weeks
+  younger than the chain. It is now found by binary search over the
+  backend's block headers (median time past, so out-of-order timestamps do
+  not mislead it), less a day's worth of 60 s blocks. Without headers the
+  fallback estimate assumes 240 s blocks and so errs low.
+- `ElectrumClient.fetchAllTransactionKeys()` looped forever when the server
+  returned no blocks before the tip it reported.
+- `P2PSyncProvider.disconnect()` left block requests waiting for a download
+  slot pending forever, and requests in flight drove the slot count negative
+  when they failed, lifting the concurrency limit. Waiting requests are now
+  rejected and the count stays at zero.
+- `P2PClient` drops a peer that announces a message over 32 MB
+  (`MAX_P2P_MESSAGE_LENGTH`) instead of buffering it, and joins a large
+  message's chunks once instead of on every chunk.
 
 ### Changed
 
@@ -34,6 +91,13 @@ Format follows [Keep a Changelog](https://keepachangelog.com/); versions follow 
   an unencrypted wallet is saved over an encrypted one.
 - `KeyManager.setEncryptionParams()` clears private keys a plaintext seed had
   derived into memory, since the wallet it describes starts locked.
+- `sync()` stops at the chain tip it saw when it started, even when
+  `endHeight` is higher; blocks found since are left for the next sync. With
+  `verifyHashes` (the default) each pass reads one more header, the anchor
+  block, at the start and after every batch, and a batch's headers are all
+  fetched before it is processed.
+- A wallet restored from a birthday mnemonic connects to the backend before
+  it is created, to read the headers.
 
 ## [0.4.0] - 2026-10-17
 
