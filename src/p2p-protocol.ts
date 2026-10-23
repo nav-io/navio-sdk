@@ -118,6 +118,13 @@ export const PROTOCOL_VERSION = 70016;
 export const MAX_HEADERS_RESULTS = 2000;
 
 /**
+ * Largest message payload accepted from a peer (32 MB, twice navio-core's
+ * MAX_PROTOCOL_MESSAGE_LENGTH). A header announcing more drops the
+ * connection instead of buffering whatever the peer sends.
+ */
+export const MAX_P2P_MESSAGE_LENGTH = 32 * 1024 * 1024;
+
+/**
  * P2P connection options
  */
 export interface P2PConnectionOptions {
@@ -233,6 +240,14 @@ export class P2PClient {
   private connected = false;
   private handshakeComplete = false;
   private receiveBuffer = Buffer.alloc(0);
+  /**
+   * Chunks received while waiting for the rest of a message, joined into
+   * `receiveBuffer` once `receiveNeeded` more bytes arrived, so a large
+   * message is copied once rather than on every chunk.
+   */
+  private receiveChunks: Buffer[] = [];
+  private receiveChunksLength = 0;
+  private receiveNeeded = 0;
   private waiters: Waiter[] = [];
   private messageHandlers: Map<string, ((msg: P2PMessage) => void)[]> = new Map();
   private closeHandlers: ((err?: Error) => void)[] = [];
@@ -284,7 +299,7 @@ export class P2PClient {
     return new Promise((resolve, reject) => {
       const socket = new net.Socket();
       this.socket = socket;
-      this.receiveBuffer = Buffer.alloc(0);
+      this.resetReceiveBuffer();
       this.versionReceived = false;
       this.verackReceived = false;
       this.handshakeComplete = false;
@@ -355,20 +370,32 @@ export class P2PClient {
    * Disconnect from the peer
    */
   disconnect(): void {
+    this.closeWith(new Error('Disconnected'));
+  }
+
+  /** Destroy the socket and fail everything waiting on it with `err`. */
+  private closeWith(err: Error): void {
     const socket = this.socket;
     this.socket = null;
     if (socket) {
       socket.removeAllListeners('data');
       socket.destroy();
     }
-    this.onClosed(new Error('Disconnected'));
+    this.onClosed(err);
+  }
+
+  private resetReceiveBuffer(): void {
+    this.receiveBuffer = Buffer.alloc(0);
+    this.receiveChunks = [];
+    this.receiveChunksLength = 0;
+    this.receiveNeeded = 0;
   }
 
   private onClosed(err: Error): void {
     const wasConnected = this.connected;
     this.connected = false;
     this.handshakeComplete = false;
-    this.receiveBuffer = Buffer.alloc(0);
+    this.resetReceiveBuffer();
     const waiters = this.waiters;
     this.waiters = [];
     for (const w of waiters) {
@@ -432,7 +459,15 @@ export class P2PClient {
    * Handle incoming data
    */
   private handleData(data: Buffer): void {
-    this.receiveBuffer = Buffer.concat([this.receiveBuffer, data]);
+    this.receiveChunks.push(data);
+    this.receiveChunksLength += data.length;
+    if (this.receiveChunksLength < this.receiveNeeded) {
+      return; // the message being received is still incomplete
+    }
+    this.receiveBuffer = Buffer.concat([this.receiveBuffer, ...this.receiveChunks]);
+    this.receiveChunks = [];
+    this.receiveChunksLength = 0;
+    this.receiveNeeded = 0;
 
     // Try to parse complete messages
     while (this.receiveBuffer.length >= 24) {
@@ -450,10 +485,21 @@ export class P2PClient {
 
       // Parse header
       const header = this.parseHeader(this.receiveBuffer);
+      if (header.length > MAX_P2P_MESSAGE_LENGTH) {
+        this.log(`Oversized ${header.command} message (${header.length} bytes); disconnecting`);
+        this.closeWith(
+          new Error(
+            `Peer sent an oversized ${header.command} message ` +
+              `(${header.length} bytes, limit ${MAX_P2P_MESSAGE_LENGTH})`
+          )
+        );
+        return;
+      }
       const totalLength = 24 + header.length;
 
       // Check if we have the full message
       if (this.receiveBuffer.length < totalLength) {
+        this.receiveNeeded = totalLength - this.receiveBuffer.length;
         return; // Wait for more data
       }
 

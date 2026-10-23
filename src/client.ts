@@ -14,6 +14,7 @@ import { ElectrumClient, ElectrumOptions } from './electrum';
 import { TransactionKeysSync, SyncOptions, BackgroundSyncOptions } from './tx-keys-sync';
 import { KeyManager } from './key-manager';
 import { parseBirthdayMnemonic } from './crypto/birthday-mnemonic';
+import { findHeightForTimestamp } from './birthday-height';
 import { randomBytes } from './crypto/encryption';
 import type { IWalletDB, WalletOutput, StandingOrderRow } from './wallet-db.interface';
 import { SyncProvider } from './sync-provider';
@@ -60,24 +61,6 @@ const {
  * Network type for Navio
  */
 export type NetworkType = 'mainnet' | 'testnet' | 'signet' | 'regtest';
-
-/**
- * Genesis block timestamps and target block interval, used to turn a wallet
- * birthday (from a 26-word Navio birthday mnemonic) into a scan height.
- */
-const NETWORK_GENESIS_TIME: Partial<Record<NetworkType, number>> = {
-  mainnet: 1782910800,
-  testnet: 1777481682,
-};
-const BLOCK_INTERVAL_SECONDS = 120;
-
-/** Estimate the chain height at a unix timestamp (with a one-day margin). */
-function estimateHeightForTimestamp(network: NetworkType, ts: number): number {
-  const genesis = NETWORK_GENESIS_TIME[network];
-  if (!genesis || ts <= genesis) return 0;
-  const margin = 24 * 3600;
-  return Math.max(0, Math.floor((ts - genesis - margin) / BLOCK_INTERVAL_SECONDS));
-}
 
 /**
  * Fee per input+output in satoshis (matches navio-core default)
@@ -1192,19 +1175,23 @@ export class NavioClient {
     } else if (this.config.restoreFromMnemonic) {
       // Restore from mnemonic. A 26-word Navio birthday mnemonic carries the
       // wallet creation time; when no explicit height is given, start
-      // scanning at the encoded week instead of from genesis.
+      // scanning a day before the first block at that time (found from the
+      // chain's headers) instead of from genesis.
       let restoreHeight = this.config.restoreFromHeight;
       if (restoreHeight === undefined) {
+        let birthday: number | null = null;
         try {
-          const parsed = parseBirthdayMnemonic(this.config.restoreFromMnemonic);
-          if (parsed.birthday !== null) {
-            restoreHeight = estimateHeightForTimestamp(
-              this.config.network as NetworkType,
-              parsed.birthday
-            );
-          }
+          birthday = parseBirthdayMnemonic(this.config.restoreFromMnemonic).birthday;
         } catch {
           // invalid phrases surface from restoreWalletFromMnemonic below
+        }
+        if (birthday !== null) {
+          await this.syncProvider.connect();
+          restoreHeight = await findHeightForTimestamp(
+            this.syncProvider,
+            this.config.network ?? 'mainnet',
+            birthday
+          );
         }
       }
       this.keyManager = await this.walletDB.restoreWalletFromMnemonic(

@@ -176,6 +176,12 @@ export interface BlockTransactionKeys {
   timestamp?: number;
   /** Whether this block is a Proof-of-Stake block */
   isPoS?: boolean;
+  /**
+   * Hash of the block the keys were read from (display hex), when the
+   * provider knows it. Sync checks it against the header it stores for the
+   * height, so keys and header cannot come from different branches of a reorg.
+   */
+  hash?: string;
 }
 
 /**
@@ -248,7 +254,10 @@ export class ElectrumClient {
   >();
   private connected = false;
   private options: Required<ElectrumOptions>;
-  private reconnectAttempts = 0;
+  /** The connection attempt in progress, shared by concurrent connect() calls. */
+  private connectInFlight: Promise<void> | null = null;
+  /** Fails the connection attempt in progress (set while one runs). */
+  private abortConnect: ((error: Error) => void) | null = null;
 
   /**
    * Cached chain tip from blockchain.headers.subscribe.
@@ -294,7 +303,21 @@ export class ElectrumClient {
     if (this.connected && this.ws) {
       return;
     }
+    // Concurrent callers share one attempt instead of each opening a socket.
+    if (!this.connectInFlight) {
+      this.connectInFlight = this.openConnection().finally(() => {
+        this.connectInFlight = null;
+      });
+    }
+    return this.connectInFlight;
+  }
 
+  /**
+   * Open a socket and run the server.version handshake. Fails after the
+   * `timeout` option if the socket does not open or the handshake does not
+   * finish, closing the socket.
+   */
+  private async openConnection(): Promise<void> {
     // Ensure WebSocket is loaded (handles async loading for ESM)
     await ensureWebSocketLoaded();
 
@@ -302,13 +325,43 @@ export class ElectrumClient {
       const protocol = this.options.ssl ? 'wss' : 'ws';
       const url = `${protocol}://${this.options.host}:${this.options.port}`;
 
+      let ws: any = null;
+      let settled = false;
+      const settle = (error?: Error) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(connectTimer);
+        this.abortConnect = null;
+        if (error) {
+          if (ws && this.ws === ws) {
+            this.dropSocket(ws, error);
+          }
+          try {
+            ws?.close();
+          } catch {
+            // already closed
+          }
+          reject(error);
+        } else {
+          resolve();
+        }
+      };
+      const connectTimer = setTimeout(() => {
+        settle(new Error(`Connection timeout (${url})`));
+      }, this.options.timeout);
+      this.abortConnect = (error: Error) => settle(error);
+
       try {
         const WsClass = getWebSocketClass();
-        this.ws = new WsClass(url);
+        ws = new WsClass(url);
+        this.ws = ws;
 
-        attachWebSocketHandler(this.ws, 'open', async () => {
+        // Every handler ignores events from a socket that is no longer the
+        // live one: a stale socket's late `close` must not tear down its
+        // replacement or fail the replacement's requests.
+        attachWebSocketHandler(ws, 'open', async () => {
+          if (this.ws !== ws || settled) return;
           this.connected = true;
-          this.reconnectAttempts = 0;
 
           // Send server.version as required by Electrum protocol
           try {
@@ -316,13 +369,14 @@ export class ElectrumClient {
             // Re-register Electrum-side subscriptions; WebSocket sessions do not preserve them
             // after a drop, and we intentionally keep app callbacks across unexpected close.
             await this.renewSubscriptionsAfterReconnect();
-            resolve();
+            settle();
           } catch (error) {
-            reject(error);
+            settle(error as Error);
           }
         });
 
-        attachWebSocketHandler(this.ws, 'message', (data: Buffer | string) => {
+        attachWebSocketHandler(ws, 'message', (data: Buffer | string) => {
+          if (this.ws !== ws) return;
           try {
             // Handle both Buffer (Node.js) and string (browser) data
             const dataStr = typeof data === 'string' ? data : data.toString();
@@ -333,31 +387,41 @@ export class ElectrumClient {
           }
         });
 
-        attachWebSocketHandler(this.ws, 'error', (error: Error) => {
+        attachWebSocketHandler(ws, 'error', (error: Error) => {
+          if (this.ws !== ws) return;
           this.connected = false;
-          if (this.reconnectAttempts === 0) {
-            reject(error);
-          }
+          settle(error ?? new Error('WebSocket error'));
         });
 
-        attachWebSocketHandler(this.ws, 'close', () => {
-          this.connected = false;
-          this.chainTipSubscribed = false;
-          this.cachedChainTip = null;
-          this.ws = null;
-          for (const [, { reject, timeout }] of Array.from(this.pendingRequests)) {
-            clearTimeout(timeout);
-            reject(new Error('Connection closed'));
-          }
-          this.pendingRequests.clear();
-          // Do not clear `subscriptionCallbacks` here — app handlers must survive
-          // transient disconnects so we can re-send `blockchain.headers.subscribe` on reconnect.
-          // Explicit `disconnect()` still clears callbacks.
+        attachWebSocketHandler(ws, 'close', () => {
+          if (this.ws !== ws) return;
+          this.dropSocket(ws, new Error('Connection closed'));
+          settle(new Error('Connection closed before the handshake completed'));
         });
       } catch (error) {
-        reject(error);
+        settle(error as Error);
       }
     });
+  }
+
+  /**
+   * Forget the live socket after it closed or failed: reject its pending
+   * requests and reset the chain-tip subscription state.
+   */
+  private dropSocket(ws: any, error: Error): void {
+    if (this.ws !== ws) return;
+    this.connected = false;
+    this.chainTipSubscribed = false;
+    this.cachedChainTip = null;
+    this.ws = null;
+    for (const [, { reject, timeout }] of Array.from(this.pendingRequests)) {
+      clearTimeout(timeout);
+      reject(error);
+    }
+    this.pendingRequests.clear();
+    // Do not clear `subscriptionCallbacks` here — app handlers must survive
+    // transient disconnects so we can re-send `blockchain.headers.subscribe` on reconnect.
+    // Explicit `disconnect()` still clears callbacks.
   }
 
   /**
@@ -483,12 +547,16 @@ export class ElectrumClient {
    */
   disconnect(): void {
     this.subscriptionCallbacks.clear();
+    this.abortConnect?.(new Error('Disconnected'));
+    const ws = this.ws;
+    if (ws) {
+      // Fail its requests now: the socket's own close event is ignored once
+      // it is no longer the live socket.
+      this.dropSocket(ws, new Error('Connection closed'));
+      ws.close();
+    }
     this.cachedChainTip = null;
     this.chainTipSubscribed = false;
-    if (this.ws) {
-      this.ws.close();
-      this.ws = null;
-    }
     this.connected = false;
   }
 
@@ -743,6 +811,11 @@ export class ElectrumClient {
 
     while (currentHeight <= tipHeight) {
       const rangeResult = await this.getBlockTransactionKeysRange(currentHeight);
+      if (rangeResult.blocks.length === 0) {
+        // The server has nothing from here on (it is behind the tip it
+        // reported); asking again from the same height would loop forever.
+        break;
+      }
 
       allBlocks.push(...rangeResult.blocks);
       totalBlocksProcessed += rangeResult.blocks.length;

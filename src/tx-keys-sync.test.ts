@@ -23,7 +23,7 @@ import {
   MAX_REORG_DEPTH,
   ReorgError,
 } from './tx-keys-sync';
-import { parseTransaction } from './p2p-block-parser';
+import { parseTransaction, type ParsedOutput } from './p2p-block-parser';
 import { isStakedCommitmentOutput } from './staking';
 import { STAKED_TX_HEX } from './test-fixtures/staked-tx';
 import { WalletDB } from './wallet-db';
@@ -47,6 +47,17 @@ function defaultHeader(height: number): string {
 /** A header for `height` on a competing branch, distinct from defaultHeader(). */
 function branchHeader(height: number, branch: number = 1): string {
   return branch.toString(16).padStart(2, '0').repeat(76) + height.toString(16).padStart(8, '0');
+}
+
+/** The output hash and keys sync's ownership check saw for a parsed output. */
+function expectedKeysOf(output: ParsedOutput) {
+  return {
+    outputHash: output.outputHash,
+    blindingKey: output.keys!.blindingKey,
+    spendingKey: output.keys!.spendingKey,
+    viewTag: output.keys!.viewTag,
+    ephemeralKey: null,
+  };
 }
 
 type MockSyncProvider = SyncProvider & { setChainTip(height: number): void };
@@ -327,11 +338,12 @@ describe('TransactionKeysSync', () => {
       syncManager = new TransactionKeysSync(walletDB, syncProvider);
       syncManager.setKeyManager(keyManager);
 
+      const minted = parseTransaction(Buffer.from(rawTx, 'hex'));
       const recovered = await (syncManager as any).recoverConfirmedOutput(
-        'minted-token-tx',
-        0,
+        minted.txid,
         blindingKeyObj,
         '',
+        expectedKeysOf(minted.outputs[0]),
       );
 
       expect(recovered.amount).toBe(123_456);
@@ -571,7 +583,9 @@ describe('TransactionKeysSync', () => {
         lastSyncedHeight: tip,
         searchedDownTo: tip - MAX_REORG_DEPTH,
       });
-      expect(provider.getBlockHeader).toHaveBeenCalledTimes(1);
+      // One header for the sync's anchor, one for the reorg check, and one
+      // batched request for the walk down.
+      expect(provider.getBlockHeader).toHaveBeenCalledTimes(2);
       expect(provider.getBlockHeaders).toHaveBeenCalledTimes(1);
       expect(syncManager.getLastSyncedHeight()).toBe(tip);
       expect(await walletDB.getBlockHash(tip)).toBe(hashHeader(defaultHeader(tip)));
@@ -592,7 +606,9 @@ describe('TransactionKeysSync', () => {
         lastSyncedHeight: 60,
         searchedDownTo: 57,
       });
-      expect(provider.getBlockHeader).toHaveBeenCalledTimes(1);
+      // One header for the sync's anchor, one for the reorg check, and one
+      // batched request for the walk down.
+      expect(provider.getBlockHeader).toHaveBeenCalledTimes(2);
       expect(provider.getBlockHeaders).toHaveBeenCalledTimes(1);
       expect(syncManager.getLastSyncedHeight()).toBe(60);
     });
@@ -716,27 +732,30 @@ describe('TransactionKeysSync', () => {
       expect(isStakedCommitmentOutput(staked)).toBe(true);
       expect(isStakedCommitmentOutput(fee)).toBe(false);
 
-      const keysOf = (outputHash: string) => ({
-        outputHash,
-        blindingKey: staked.keys!.blindingKey,
-        spendingKey: staked.keys!.spendingKey,
-        viewTag: staked.keys!.viewTag,
+      const keysOf = (output: typeof staked) => ({
+        outputHash: output.outputHash,
+        blindingKey: output.keys!.blindingKey,
+        spendingKey: output.keys!.spendingKey,
+        viewTag: output.keys!.viewTag,
       });
+      const txid = parseTransaction(Buffer.from(STAKED_TX_HEX, 'hex')).txid;
       syncProvider = createMockSyncProvider({
         chainTipHeight: 60,
         blockTxKeys: new Map([
-          [60, [{ txHash: 'staking-tx', keys: { inputs: [], outputs: [keysOf('staked'), keysOf('fee')] } }]],
+          // The fee output carries no BLSCT keys, so no key list includes it.
+          [60, [{ txHash: txid, keys: { inputs: [], outputs: [keysOf(staked)] } }]],
         ]),
       });
-      const serialized: Record<string, string> = { staked: staked.serializedHex, fee: fee.serializedHex };
+      const serialized: Record<string, string> = { [staked.outputHash]: staked.serializedHex };
       syncProvider.getTransactionOutput = vi.fn(async (hash: string) => serialized[hash]);
+      syncProvider.getRawTransaction = vi.fn().mockResolvedValue(STAKED_TX_HEX);
       syncManager = new TransactionKeysSync(walletDB, syncProvider);
       await syncManager.initialize();
       claimEverything(syncManager);
 
       await syncManager.sync({ startHeight: 60, endHeight: 60, verifyHashes: false });
 
-      expect(await stakedFlags()).toEqual({ staked: true, fee: false });
+      expect(await stakedFlags()).toEqual({ [staked.outputHash]: true });
     });
 
     it('is set on staked outputs found in the mempool', async () => {
