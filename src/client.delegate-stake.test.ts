@@ -76,7 +76,7 @@ describe('NavioClient.delegateStake', () => {
       outputIndex: 0,
       blockHeight: 10,
       outputData: '',
-      amount: Number(amount),
+      amount,
       gamma: '0',
       memo: null,
       tokenId: null,

@@ -97,6 +97,7 @@ describe('IndexedDBWalletDB.getOutputData', () => {
       const store = (outputHash: string, outputData: string) =>
         walletDB.storeWalletOutput({
           ...oldRecord(outputHash, outputData, 1_000),
+          amount: 1_000n,
           isSpent: false,
           txType: 'received',
         });

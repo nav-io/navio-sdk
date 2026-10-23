@@ -30,6 +30,7 @@ export {
 
 // IndexedDB Adapter (browser, no WASM)
 export { IndexedDBWalletDB } from './adapters/indexeddb-wallet-db';
+export type { IndexedDBWalletDBOptions } from './adapters/indexeddb-wallet-db';
 
 // RFQ / Atomic-Swap Trading
 export * from './trading.types';

@@ -31,7 +31,7 @@
 import { KeyManager } from './key-manager';
 import type { HDChain, SubAddressIdentifier } from './key-manager.types';
 import * as blsctModule from '@nav-io/navio-blsct';
-import type { IDatabaseAdapter, DatabaseAdapterOptions } from './database-adapter';
+import type { IDatabaseAdapter, DatabaseAdapterOptions, RowObject } from './database-adapter';
 import { createDatabaseAdapter } from './database-adapter';
 import type { SyncState, StoreOutputParams, TxType, CreatedCollectionRecord, SubAddressEntry, StandingOrderRow } from './wallet-db.interface';
 export type { SyncState, WalletOutput, WalletMetadata, StoreOutputParams, IWalletDB, TxType, CreatedCollectionRecord, SubAddressEntry } from './wallet-db.interface';
@@ -39,6 +39,59 @@ export type { SyncState, WalletOutput, WalletMetadata, StoreOutputParams, IWalle
 // WalletOutput is re-exported from wallet-db.interface.ts
 import type { WalletOutput } from './wallet-db.interface';
 import { isStakedCommitmentOutputHex } from './staking';
+import { NAV_TOKEN_ID_FORMS, decodeAmount, encodeAmount } from './storage-codec';
+
+/**
+ * SQL condition selecting NAV outputs: no token id, or the NAV token id in
+ * any stored spelling. The one filter every NAV query uses.
+ */
+const NAV_TOKEN_FILTER_SQL =
+  `(token_id IS NULL OR lower(token_id) IN (${NAV_TOKEN_ID_FORMS.map((form) => `'${form}'`).join(', ')}))`;
+
+/** Token filter for a query on wallet_outputs: NAV for null, else a bound token id. */
+function tokenFilter(tokenId: string | null): { sql: string; params: string[] } {
+  return tokenId === null
+    ? { sql: NAV_TOKEN_FILTER_SQL, params: [] }
+    : { sql: 'token_id = ?', params: [tokenId] };
+}
+
+/** Columns read into a WalletOutput. */
+const WALLET_OUTPUT_COLUMNS = `output_hash, tx_hash, output_index, block_height, amount, gamma, memo, token_id,
+             blinding_key, ephemeral_key, spending_key, is_spent, spent_tx_hash, spent_block_height,
+             tx_type, timestamp, is_staked_commitment`;
+
+/** Map a wallet_outputs row (WALLET_OUTPUT_COLUMNS) to a WalletOutput. */
+function rowToWalletOutput(row: RowObject): WalletOutput {
+  return {
+    outputHash: row.output_hash as string,
+    txHash: row.tx_hash as string,
+    outputIndex: row.output_index as number,
+    blockHeight: row.block_height as number,
+    amount: decodeAmount(row.amount),
+    gamma: (row.gamma as string) || '0',
+    memo: row.memo as string | null,
+    tokenId: row.token_id as string | null,
+    blindingKey: row.blinding_key as string,
+    ephemeralKey: (row.ephemeral_key as string | null) ?? null,
+    spendingKey: row.spending_key as string,
+    isSpent: (row.is_spent as number) === 1,
+    spentTxHash: row.spent_tx_hash as string | null,
+    spentBlockHeight: row.spent_block_height as number | null,
+    txType: ((row.tx_type as string) || 'received') as TxType,
+    timestamp: (row.timestamp as number) || 0,
+    isStakedCommitment: (row.is_staked_commitment as number) === 1,
+  };
+}
+
+/** Parse stored tx keys JSON; corrupt rows read as absent (null), on every backend. */
+function parseTxKeys(txHash: string, keysData: unknown): any | null {
+  try {
+    return JSON.parse(keysData as string);
+  } catch {
+    console.warn(`[WalletDB] Ignoring corrupt tx keys for ${txHash}`);
+    return null;
+  }
+}
 
 /**
  * Options for WalletDB
@@ -84,6 +137,12 @@ export class WalletDB {
   private dbPath: string = '';
   private keyManager: KeyManager | null = null;
   private opened = false;
+  /**
+   * Tail of the queue of transactional sections. The connection is shared,
+   * so a BEGIN issued while another section's transaction is open would fail
+   * (or fold the two together); sections run one at a time instead.
+   */
+  private transactionQueue: Promise<void> = Promise.resolve();
 
   /**
    * Create a new WalletDB instance
@@ -143,6 +202,63 @@ export class WalletDB {
    */
   getAdapterType(): string {
     return this.adapter?.constructor.name ?? 'none';
+  }
+
+  /**
+   * Run `body` inside BEGIN/COMMIT, rolling back if it throws. Sections are
+   * serialized on the shared connection: one waits for the previous to
+   * finish. `body` must not start another section (it would wait for itself).
+   */
+  private async inTransaction<T>(body: (adapter: IDatabaseAdapter) => Promise<T>): Promise<T> {
+    const run = async (): Promise<T> => {
+      if (!this.adapter) throw new Error('Database not open');
+      const adapter = this.adapter;
+      await adapter.run('BEGIN TRANSACTION');
+      try {
+        const result = await body(adapter);
+        await adapter.run('COMMIT');
+        return result;
+      } catch (error) {
+        try {
+          await adapter.run('ROLLBACK');
+        } catch {
+          // No transaction left to roll back (e.g. COMMIT already ended it)
+        }
+        throw error;
+      }
+    };
+    const result = this.transactionQueue.then(run);
+    this.transactionQueue = result.then(
+      () => undefined,
+      () => undefined
+    );
+    return result;
+  }
+
+  /**
+   * Run a query and collect every row. The statement is freed even when
+   * stepping throws: a better-sqlite3 statement left mid-iteration keeps the
+   * connection busy and every later write on it fails.
+   */
+  private async selectRows(sql: string, params?: unknown[]): Promise<RowObject[]> {
+    if (!this.adapter) throw new Error('Database not open');
+    const stmt = await this.adapter.prepare(sql);
+    try {
+      if (params) stmt.bind(params);
+      const rows: RowObject[] = [];
+      while (await stmt.step()) {
+        rows.push(await stmt.getAsObject());
+      }
+      return rows;
+    } finally {
+      await stmt.free();
+    }
+  }
+
+  /** The first row of a query, or null. */
+  private async selectFirst(sql: string, params?: unknown[]): Promise<RowObject | null> {
+    const rows = await this.selectRows(sql, params);
+    return rows.length > 0 ? rows[0] : null;
   }
 
   /**
@@ -334,7 +450,7 @@ export class WalletDB {
         kind TEXT NOT NULL,
         token_public_key TEXT NOT NULL,
         metadata TEXT NOT NULL,
-        total_supply INTEGER NOT NULL,
+        total_supply TEXT NOT NULL,
         tx_id TEXT NOT NULL,
         created_at INTEGER NOT NULL
       )
@@ -366,7 +482,7 @@ export class WalletDB {
         output_index INTEGER NOT NULL,
         block_height INTEGER NOT NULL,
         output_data TEXT NOT NULL,
-        amount INTEGER NOT NULL DEFAULT 0,
+        amount TEXT NOT NULL DEFAULT '0',
         gamma TEXT NOT NULL DEFAULT '0',
         memo TEXT,
         token_id TEXT,
@@ -425,11 +541,10 @@ export class WalletDB {
     // The column and its backfill commit together. Otherwise a crash between
     // them leaves the column in place, so the backfill never runs again and
     // old staked outputs stay spendable.
-    await this.adapter.run('BEGIN TRANSACTION');
-    try {
+    await this.inTransaction(async (adapter) => {
       let addedStakedCommitmentColumn = false;
       try {
-        await this.adapter.run(
+        await adapter.run(
           `ALTER TABLE wallet_outputs ADD COLUMN is_staked_commitment INTEGER NOT NULL DEFAULT 0`
         );
         addedStakedCommitmentColumn = true;
@@ -439,11 +554,24 @@ export class WalletDB {
       if (addedStakedCommitmentColumn) {
         await this.backfillStakedCommitments();
       }
-      await this.adapter.run('COMMIT');
-    } catch (error) {
-      await this.adapter.run('ROLLBACK');
-      throw error;
-    }
+    });
+
+    // Amounts used to be INTEGER columns: a u64 above 2^63 - 1 does not fit,
+    // and the JS numbers they were read into lost precision above 2^53. They
+    // are decimal TEXT now. Each rebuild commits with its data conversion, so
+    // an interrupted one leaves the old table in place and runs again.
+    await this.inTransaction(async (adapter) => {
+      const rebuilt = await this.retypeColumnAsText(
+        'wallet_outputs', 'amount', 'amount INTEGER NOT NULL DEFAULT 0', "amount TEXT NOT NULL DEFAULT '0'"
+      );
+      if (rebuilt) {
+        // Store the NAV token id as null, as sync writes it now.
+        await adapter.run(`UPDATE wallet_outputs SET token_id = NULL WHERE ${NAV_TOKEN_FILTER_SQL}`);
+      }
+    });
+    await this.inTransaction(() => this.retypeColumnAsText(
+      'created_collections', 'total_supply', 'total_supply INTEGER NOT NULL', 'total_supply TEXT NOT NULL'
+    ));
 
     // Create indexes for wallet_outputs
     await this.adapter.run(`
@@ -458,22 +586,80 @@ export class WalletDB {
   }
 
   /**
+   * Rebuild `table` with `column` declared TEXT instead of INTEGER, converting
+   * its values to decimal strings. Returns false (and does nothing) when the
+   * column is not declared INTEGER. Must run inside a transaction.
+   *
+   * Follows SQLite's generalized ALTER TABLE procedure: the new table is
+   * declared from the stored CREATE statement with only `fromDecl` replaced,
+   * so columns added by earlier migrations survive, and the table's indexes
+   * are recreated.
+   */
+  private async retypeColumnAsText(
+    table: string,
+    column: string,
+    fromDecl: string,
+    toDecl: string
+  ): Promise<boolean> {
+    if (!this.adapter) throw new Error('Database not open');
+    const info = await this.selectRows(`PRAGMA table_info(${table})`);
+    const target = info.find((col) => col.name === column);
+    if (!target || String(target.type).toUpperCase() !== 'INTEGER') {
+      return false;
+    }
+
+    const schema = await this.selectRows(
+      'SELECT type, sql FROM sqlite_master WHERE tbl_name = ? AND sql IS NOT NULL',
+      [table]
+    );
+    const createSql = schema.find((row) => row.type === 'table')?.sql as string | undefined;
+    const tableName = /^CREATE TABLE\s+(IF NOT EXISTS\s+)?["`[]?\w+["`\]]?/i;
+    if (!createSql || !createSql.includes(fromDecl) || !tableName.test(createSql)) {
+      throw new Error(`Cannot migrate ${table}.${column}: unexpected table definition`);
+    }
+    const tempTable = `${table}_migrating`;
+    const newCreateSql = createSql
+      .replace(fromDecl, toDecl)
+      .replace(tableName, `CREATE TABLE ${tempTable}`);
+
+    // Exact for integers. A REAL (an amount that had already overflowed)
+    // keeps its integral part.
+    const columns = info.map((col) => String(col.name));
+    const values = columns.map((name) => name !== column ? name : `
+      CASE typeof(${column})
+        WHEN 'integer' THEN CAST(${column} AS TEXT)
+        WHEN 'real' THEN printf('%.0f', ${column})
+        WHEN 'text' THEN ${column}
+        ELSE '0'
+      END`);
+
+    await this.adapter.run(`DROP TABLE IF EXISTS ${tempTable}`);
+    await this.adapter.run(newCreateSql);
+    await this.adapter.run(
+      `INSERT INTO ${tempTable} (${columns.join(', ')}) SELECT ${values.join(', ')} FROM ${table}`
+    );
+    await this.adapter.run(`DROP TABLE ${table}`);
+    await this.adapter.run(`ALTER TABLE ${tempTable} RENAME TO ${table}`);
+    for (const row of schema) {
+      if (row.type === 'index') {
+        await this.adapter.run(String(row.sql));
+      }
+    }
+    return true;
+  }
+
+  /**
    * Flag the staked commitments among outputs stored before the
    * is_staked_commitment column existed, from their serialized output.
    */
   private async backfillStakedCommitments(): Promise<void> {
     if (!this.adapter) throw new Error('Database not open');
-    const select = await this.adapter.prepare(
+    const rows = await this.selectRows(
       `SELECT output_hash, output_data FROM wallet_outputs WHERE output_data != ''`
     );
-    const staked: string[] = [];
-    while (await select.step()) {
-      const row = await select.getAsObject();
-      if (isStakedCommitmentOutputHex(row.output_data as string)) {
-        staked.push(row.output_hash as string);
-      }
-    }
-    await select.free();
+    const staked = rows
+      .filter((row) => isStakedCommitmentOutputHex(row.output_data as string))
+      .map((row) => row.output_hash as string);
     for (const outputHash of staked) {
       await this.adapter.run(
         'UPDATE wallet_outputs SET is_staked_commitment = 1 WHERE output_hash = ?',
@@ -566,15 +752,12 @@ export class WalletDB {
         keyManager.loadKey(secretKey, publicKey);
 
         // Load metadata
-        const stmt = await this.adapter.prepare('SELECT create_time FROM key_metadata WHERE key_id = ?');
-        stmt.bind([row[0]]);
-        if (await stmt.step()) {
-          const metadataRow = await stmt.getAsObject();
+        const metadataRow = await this.selectFirst('SELECT create_time FROM key_metadata WHERE key_id = ?', [row[0]]);
+        if (metadataRow) {
           keyManager.loadKeyMetadata(this.hexToBytes(row[0] as string), {
             nCreateTime: metadataRow.create_time as number,
           });
         }
-        await stmt.free();
       }
     }
 
@@ -663,12 +846,9 @@ export class WalletDB {
     keyManager.newSubAddressPool(-1);
     keyManager.newSubAddressPool(-2);
 
-    // Drop outputs/sync data left by a different wallet, then save
-    await this.discardForeignWalletData(keyManager);
-    await this.saveWallet(keyManager);
-
-    // Save wallet metadata
-    await this.saveWalletMetadata({
+    // Drop outputs/sync data left by a different wallet, then save the
+    // wallet and its metadata, all in one transaction
+    await this.replaceWallet(keyManager, {
       creationHeight: creationHeight ?? 0,
       creationTime: Date.now(),
       restoredFromSeed: false,
@@ -700,12 +880,9 @@ export class WalletDB {
     keyManager.newSubAddressPool(-1);
     keyManager.newSubAddressPool(-2);
 
-    // Drop outputs/sync data left by a different wallet, then save
-    await this.discardForeignWalletData(keyManager);
-    await this.saveWallet(keyManager);
-
-    // Save wallet metadata with restore height
-    await this.saveWalletMetadata({
+    // Drop outputs/sync data left by a different wallet, then save the
+    // wallet and its metadata, all in one transaction
+    await this.replaceWallet(keyManager, {
       creationHeight: creationHeight ?? 0,
       creationTime: Date.now(),
       restoredFromSeed: true,
@@ -734,9 +911,9 @@ export class WalletDB {
       throw new Error('Failed to import audit key');
     }
 
-    await this.discardForeignWalletData(keyManager);
-    await this.saveWallet(keyManager);
-    await this.saveWalletMetadata({
+    // Drop outputs/sync data left by a different wallet, then save the
+    // wallet and its metadata, all in one transaction
+    await this.replaceWallet(keyManager, {
       creationHeight: creationHeight ?? 0,
       creationTime: Date.now(),
       restoredFromSeed: true,
@@ -767,12 +944,9 @@ export class WalletDB {
     keyManager.newSubAddressPool(-1);
     keyManager.newSubAddressPool(-2);
 
-    // Drop outputs/sync data left by a different wallet, then save
-    await this.discardForeignWalletData(keyManager);
-    await this.saveWallet(keyManager);
-
-    // Save wallet metadata with restore height
-    await this.saveWalletMetadata({
+    // Drop outputs/sync data left by a different wallet, then save the
+    // wallet and its metadata, all in one transaction
+    await this.replaceWallet(keyManager, {
       creationHeight: creationHeight ?? 0,
       creationTime: Date.now(),
       restoredFromSeed: true,
@@ -794,14 +968,40 @@ export class WalletDB {
       throw new Error('Database not open');
     }
 
-    const stmt = await this.adapter.prepare(`
-      INSERT OR REPLACE INTO wallet_metadata (id, creation_height, creation_time, restored_from_seed, version)
-      VALUES (0, ?, ?, ?, 1)
-    `);
-    await stmt.run([metadata.creationHeight, metadata.creationTime, metadata.restoredFromSeed ? 1 : 0]);
-    await stmt.free();
+    await this.writeWalletMetadata(metadata);
 
     // Persist to disk
+    await this.persistToDisk();
+  }
+
+  private async writeWalletMetadata(metadata: {
+    creationHeight: number;
+    creationTime: number;
+    restoredFromSeed: boolean;
+  }): Promise<void> {
+    if (!this.adapter) throw new Error('Database not open');
+    await this.adapter.run(
+      `INSERT OR REPLACE INTO wallet_metadata (id, creation_height, creation_time, restored_from_seed, version)
+       VALUES (0, ?, ?, ?, 1)`,
+      [metadata.creationHeight, metadata.creationTime, metadata.restoredFromSeed ? 1 : 0]
+    );
+  }
+
+  /**
+   * Write a newly created or restored wallet: drop data a different wallet
+   * left behind, save the keys and the metadata. One transaction, so a crash
+   * cannot leave the old wallet's outputs gone but the new keys unsaved (or
+   * the new keys saved next to the old wallet's outputs).
+   */
+  private async replaceWallet(
+    keyManager: KeyManager,
+    metadata: { creationHeight: number; creationTime: number; restoredFromSeed: boolean }
+  ): Promise<void> {
+    await this.inTransaction(async () => {
+      await this.discardForeignWalletData(keyManager);
+      await this.writeWallet(keyManager);
+      await this.writeWalletMetadata(metadata);
+    });
     await this.persistToDisk();
   }
 
@@ -846,8 +1046,11 @@ export class WalletDB {
   /**
    * Migrate to a different adapter type.
    * 
-   * Exports the current database and imports into a new adapter.
-   * 
+   * Exports the current database and imports into a new adapter. With the
+   * better-sqlite3 adapter, a file path receives the database (owner-only
+   * permissions) and later writes persist there; an existing file is never
+   * overwritten. ':memory:' keeps the copy in memory.
+   *
    * @param newPath - Path for the new database
    * @param options - Options for the new adapter
    * @returns A new WalletDB instance
@@ -957,108 +1160,103 @@ export class WalletDB {
       throw new Error('No KeyManager instance to save');
     }
 
-    // Start transaction
-    await this.adapter.run('BEGIN TRANSACTION');
+    await this.inTransaction(() => this.writeWallet(km));
+    await this.persistToDisk();
+  }
 
-    try {
-      // Clear existing data (for simplicity, we'll replace everything)
-      // In production, you might want to do incremental updates
-      await this.adapter.run('DELETE FROM keys');
-      await this.adapter.run('DELETE FROM out_keys');
-      await this.adapter.run('DELETE FROM crypted_keys');
-      await this.adapter.run('DELETE FROM crypted_out_keys');
-      await this.adapter.run('DELETE FROM view_key');
-      await this.adapter.run('DELETE FROM spend_key');
-      await this.adapter.run('DELETE FROM hd_chain');
-      await this.adapter.run('DELETE FROM master_seed');
-      await this.adapter.run('DELETE FROM sub_addresses');
-      await this.adapter.run('DELETE FROM sub_addresses_str');
-      await this.adapter.run('DELETE FROM sub_address_pool');
-      await this.adapter.run('DELETE FROM sub_address_counter');
-      await this.adapter.run('DELETE FROM key_metadata');
-      await this.adapter.run('DELETE FROM encryption_metadata');
+  /** Replace the stored keys with `km`'s. Must run inside a transaction. */
+  private async writeWallet(km: KeyManager): Promise<void> {
+    if (!this.adapter) throw new Error('Database not open');
+    const adapter = this.adapter;
 
-      // Save HD chain
-      const hdChain = km.getHDChain();
-      if (hdChain) {
-        const stmt = await this.adapter.prepare(
-          `INSERT INTO hd_chain (version, seed_id, spend_id, view_id, token_id, blinding_id)
-           VALUES (?, ?, ?, ?, ?, ?)`
-        );
-        await stmt.run([
-          hdChain.version,
-          this.bytesToHex(hdChain.seedId),
-          this.bytesToHex(hdChain.spendId),
-          this.bytesToHex(hdChain.viewId),
-          this.bytesToHex(hdChain.tokenId),
-          this.bytesToHex(hdChain.blindingId),
-        ]);
-        await stmt.free();
-      }
+    // Clear existing data (for simplicity, we'll replace everything)
+    // In production, you might want to do incremental updates
+    await adapter.run('DELETE FROM keys');
+    await adapter.run('DELETE FROM out_keys');
+    await adapter.run('DELETE FROM crypted_keys');
+    await adapter.run('DELETE FROM crypted_out_keys');
+    await adapter.run('DELETE FROM view_key');
+    await adapter.run('DELETE FROM spend_key');
+    await adapter.run('DELETE FROM hd_chain');
+    await adapter.run('DELETE FROM master_seed');
+    await adapter.run('DELETE FROM sub_addresses');
+    await adapter.run('DELETE FROM sub_addresses_str');
+    await adapter.run('DELETE FROM sub_address_pool');
+    await adapter.run('DELETE FROM sub_address_counter');
+    await adapter.run('DELETE FROM key_metadata');
+    await adapter.run('DELETE FROM encryption_metadata');
 
-      // Save the seed for recovery when reopening wallet: encrypted for an
-      // encrypted wallet, otherwise the mnemonic (stored directly because
-      // Scalar.deserialize/serialize may not roundtrip correctly).
-      // None for a view-only wallet.
-      const seed = km.getSeedForStorage();
-      if (seed) {
-        const seedStmt = await this.adapter.prepare(
-          'INSERT INTO master_seed (id, mnemonic, seed_hex, encrypted_seed) VALUES (0, ?, ?, ?)'
-        );
-        await seedStmt.run([
-          'mnemonic' in seed ? seed.mnemonic : null,
-          'seedHex' in seed ? seed.seedHex : null,
-          'encryptedSeed' in seed ? seed.encryptedSeed : null,
-        ]);
-        await seedStmt.free();
-      }
-
-      const encryptionParams = km.getEncryptionParams();
-      if (encryptionParams) {
-        await this.adapter.run(
-          `INSERT INTO encryption_metadata (id, is_encrypted, salt, verification_hash, encryption_version)
-           VALUES (0, 1, ?, ?, 1)`,
-          [encryptionParams.salt, encryptionParams.verificationHash]
-        );
-      }
-
-      // Save view key
-      try {
-        const viewKey = km.getPrivateViewKey();
-        const viewPublicKey = this.getPublicKeyFromViewKey(viewKey);
-        const stmt = await this.adapter.prepare('INSERT INTO view_key (public_key, secret_key) VALUES (?, ?)');
-        await stmt.run([this.serializePublicKey(viewPublicKey), this.serializeViewKey(viewKey)]);
-        await stmt.free();
-      } catch {
-        // View key not available
-      }
-
-      // Save spend key
-      try {
-        const spendPublicKey = km.getPublicSpendingKey();
-        const stmt = await this.adapter.prepare('INSERT INTO spend_key (public_key) VALUES (?)');
-        await stmt.run([this.serializePublicKey(spendPublicKey)]);
-        await stmt.free();
-      } catch {
-        // Spend key not available
-      }
-
-      // Save sub-address mappings (hashId -> account/address) so sub-addresses
-      // past the default pools survive a reload.
-      await this.insertSubAddressRows(km.getSubAddressEntries());
-
-      // Note: Keys, output keys and encrypted keys are reconstructed from the
-      // seed / view key on load.
-
-      // Commit transaction
-      await this.adapter.run('COMMIT');
-
-      // Persist to disk
-      await this.persistToDisk();
-    } catch (error) {
-      await this.adapter.run('ROLLBACK');
-      throw error;
+    // Save HD chain
+    const hdChain = km.getHDChain();
+    if (hdChain) {
+      const stmt = await adapter.prepare(
+        `INSERT INTO hd_chain (version, seed_id, spend_id, view_id, token_id, blinding_id)
+         VALUES (?, ?, ?, ?, ?, ?)`
+      );
+      await stmt.run([
+        hdChain.version,
+        this.bytesToHex(hdChain.seedId),
+        this.bytesToHex(hdChain.spendId),
+        this.bytesToHex(hdChain.viewId),
+        this.bytesToHex(hdChain.tokenId),
+        this.bytesToHex(hdChain.blindingId),
+      ]);
+      await stmt.free();
     }
+
+    // Save the seed for recovery when reopening wallet: encrypted for an
+    // encrypted wallet, otherwise the mnemonic (stored directly because
+    // Scalar.deserialize/serialize may not roundtrip correctly).
+    // None for a view-only wallet.
+    const seed = km.getSeedForStorage();
+    if (seed) {
+      const seedStmt = await adapter.prepare(
+        'INSERT INTO master_seed (id, mnemonic, seed_hex, encrypted_seed) VALUES (0, ?, ?, ?)'
+      );
+      await seedStmt.run([
+        'mnemonic' in seed ? seed.mnemonic : null,
+        'seedHex' in seed ? seed.seedHex : null,
+        'encryptedSeed' in seed ? seed.encryptedSeed : null,
+      ]);
+      await seedStmt.free();
+    }
+
+    const encryptionParams = km.getEncryptionParams();
+    if (encryptionParams) {
+      await adapter.run(
+        `INSERT INTO encryption_metadata (id, is_encrypted, salt, verification_hash, encryption_version)
+         VALUES (0, 1, ?, ?, 1)`,
+        [encryptionParams.salt, encryptionParams.verificationHash]
+      );
+    }
+
+    // Save view key
+    try {
+      const viewKey = km.getPrivateViewKey();
+      const viewPublicKey = this.getPublicKeyFromViewKey(viewKey);
+      const stmt = await adapter.prepare('INSERT INTO view_key (public_key, secret_key) VALUES (?, ?)');
+      await stmt.run([this.serializePublicKey(viewPublicKey), this.serializeViewKey(viewKey)]);
+      await stmt.free();
+    } catch {
+      // View key not available
+    }
+
+    // Save spend key
+    try {
+      const spendPublicKey = km.getPublicSpendingKey();
+      const stmt = await adapter.prepare('INSERT INTO spend_key (public_key) VALUES (?)');
+      await stmt.run([this.serializePublicKey(spendPublicKey)]);
+      await stmt.free();
+    } catch {
+      // Spend key not available
+    }
+
+    // Save sub-address mappings (hashId -> account/address) so sub-addresses
+    // past the default pools survive a reload.
+    await this.insertSubAddressRows(km.getSubAddressEntries());
+
+    // Note: Keys, output keys and encrypted keys are reconstructed from the
+    // seed / view key on load.
   }
 
   async saveSubAddresses(entries: SubAddressEntry[]): Promise<void> {
@@ -1094,6 +1292,7 @@ export class WalletDB {
    * in the new wallet's balance and get selected as inputs, and the spend
    * then fails with "does not map to a known sub-address in this wallet".
    * Restoring the same seed again keeps everything (no re-sync needed).
+   * Must run inside a transaction (see replaceWallet).
    */
   private async discardForeignWalletData(incoming: KeyManager): Promise<void> {
     if (!this.adapter) {
@@ -1186,7 +1385,7 @@ export class WalletDB {
       record.kind,
       record.tokenPublicKey,
       JSON.stringify(record.metadata),
-      record.totalSupply,
+      encodeAmount(record.totalSupply, 'totalSupply'),
       record.txId,
       record.createdAt,
     ]);
@@ -1259,7 +1458,7 @@ export class WalletDB {
         kind: row[1] as 'token' | 'nft',
         tokenPublicKey: row[2] as string,
         metadata,
-        totalSupply: row[4] as number,
+        totalSupply: decodeAmount(row[4]),
         txId: row[5] as string,
         createdAt: row[6] as number,
       };
@@ -1312,15 +1511,8 @@ export class WalletDB {
 
   async getBlockHash(height: number): Promise<string | null> {
     if (!this.adapter) throw new Error('Database not open');
-    const stmt = await this.adapter.prepare('SELECT hash FROM block_hashes WHERE height = ?');
-    stmt.bind([height]);
-    if (await stmt.step()) {
-      const row = await stmt.getAsObject();
-      await stmt.free();
-      return row.hash as string;
-    }
-    await stmt.free();
-    return null;
+    const row = await this.selectFirst('SELECT hash FROM block_hashes WHERE height = ?', [height]);
+    return row ? (row.hash as string) : null;
   }
 
   async saveBlockHash(height: number, hash: string): Promise<void> {
@@ -1355,27 +1547,20 @@ export class WalletDB {
 
   async getTxKeys(txHash: string): Promise<any | null> {
     if (!this.adapter) throw new Error('Database not open');
-    const stmt = await this.adapter.prepare('SELECT keys_data FROM tx_keys WHERE tx_hash = ?');
-    stmt.bind([txHash]);
-    if (await stmt.step()) {
-      const row = await stmt.getAsObject();
-      await stmt.free();
-      return JSON.parse(row.keys_data as string);
-    }
-    await stmt.free();
-    return null;
+    const row = await this.selectFirst('SELECT keys_data FROM tx_keys WHERE tx_hash = ?', [txHash]);
+    return row ? parseTxKeys(txHash, row.keys_data) : null;
   }
 
   async getTxKeysByHeight(height: number): Promise<{ txHash: string; keys: any }[]> {
     if (!this.adapter) throw new Error('Database not open');
-    const stmt = await this.adapter.prepare('SELECT tx_hash, keys_data FROM tx_keys WHERE block_height = ?');
-    stmt.bind([height]);
+    const rows = await this.selectRows('SELECT tx_hash, keys_data FROM tx_keys WHERE block_height = ?', [height]);
     const results: { txHash: string; keys: any }[] = [];
-    while (await stmt.step()) {
-      const row = await stmt.getAsObject();
-      results.push({ txHash: row.tx_hash as string, keys: JSON.parse(row.keys_data as string) });
+    for (const row of rows) {
+      const keys = parseTxKeys(row.tx_hash as string, row.keys_data);
+      if (keys !== null) {
+        results.push({ txHash: row.tx_hash as string, keys });
+      }
     }
-    await stmt.free();
     return results;
   }
 
@@ -1398,87 +1583,84 @@ export class WalletDB {
 
   async getOutputBlindingKey(outputHash: string): Promise<string | null> {
     if (!this.adapter) throw new Error('Database not open');
-    const stmt = await this.adapter.prepare(
-      'SELECT blinding_key FROM output_blinding_keys WHERE output_hash = ?'
+    const row = await this.selectFirst(
+      'SELECT blinding_key FROM output_blinding_keys WHERE output_hash = ?',
+      [outputHash]
     );
-    stmt.bind([outputHash]);
-    let value: string | null = null;
-    if (await stmt.step()) {
-      const row = await stmt.getAsObject();
-      value = (row.blinding_key as string) ?? null;
-    }
-    await stmt.free();
-    return value;
+    return (row?.blinding_key as string | undefined) ?? null;
   }
 
   async getOutputData(outputHash: string): Promise<string | null> {
     if (!this.adapter) throw new Error('Database not open');
-    const stmt = await this.adapter.prepare(
-      'SELECT output_data FROM wallet_outputs WHERE output_hash = ?'
-    );
-    stmt.bind([outputHash]);
-    let value: string | null = null;
-    if (await stmt.step()) {
-      const row = await stmt.getAsObject();
-      value = (row.output_data as string) || null;
-    }
-    await stmt.free();
-    return value;
+    const row = await this.selectFirst('SELECT output_data FROM wallet_outputs WHERE output_hash = ?', [outputHash]);
+    return (row?.output_data as string | undefined) || null;
   }
 
   async storeWalletOutput(p: StoreOutputParams): Promise<void> {
     if (!this.adapter) throw new Error('Database not open');
-    const stmt = await this.adapter.prepare(
-      `INSERT OR REPLACE INTO wallet_outputs
+    // Upsert, not INSERT OR REPLACE: re-processing a block must not reset a
+    // spent output to unspent, nor its creation time. Once a row is spent its
+    // spent state is kept; unspending is revertBlocksFrom's job.
+    await this.adapter.run(
+      `INSERT INTO wallet_outputs
        (output_hash, tx_hash, output_index, block_height, output_data, amount, gamma, memo, token_id,
         blinding_key, ephemeral_key, spending_key, is_spent, spent_tx_hash, spent_block_height, created_at,
         tx_type, timestamp, is_staked_commitment)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(output_hash) DO UPDATE SET
+         tx_hash = excluded.tx_hash,
+         output_index = excluded.output_index,
+         block_height = excluded.block_height,
+         output_data = excluded.output_data,
+         amount = excluded.amount,
+         gamma = excluded.gamma,
+         memo = excluded.memo,
+         token_id = excluded.token_id,
+         blinding_key = excluded.blinding_key,
+         ephemeral_key = excluded.ephemeral_key,
+         spending_key = excluded.spending_key,
+         tx_type = excluded.tx_type,
+         timestamp = excluded.timestamp,
+         is_staked_commitment = excluded.is_staked_commitment,
+         spent_tx_hash = CASE WHEN wallet_outputs.is_spent = 1
+           THEN wallet_outputs.spent_tx_hash ELSE excluded.spent_tx_hash END,
+         spent_block_height = CASE WHEN wallet_outputs.is_spent = 1
+           THEN wallet_outputs.spent_block_height ELSE excluded.spent_block_height END,
+         is_spent = CASE WHEN wallet_outputs.is_spent = 1 THEN 1 ELSE excluded.is_spent END`,
+      [
+        p.outputHash, p.txHash, p.outputIndex, p.blockHeight, p.outputData,
+        encodeAmount(p.amount), p.gamma, p.memo, p.tokenId, p.blindingKey, p.ephemeralKey ?? null, p.spendingKey,
+        p.isSpent ? 1 : 0, p.spentTxHash, p.spentBlockHeight, Date.now(),
+        p.txType, p.timestamp, p.isStakedCommitment ? 1 : 0,
+      ]
     );
-    await stmt.run([
-      p.outputHash, p.txHash, p.outputIndex, p.blockHeight, p.outputData,
-      p.amount, p.gamma, p.memo, p.tokenId, p.blindingKey, p.ephemeralKey ?? null, p.spendingKey,
-      p.isSpent ? 1 : 0, p.spentTxHash, p.spentBlockHeight, Date.now(),
-      p.txType, p.timestamp, p.isStakedCommitment ? 1 : 0,
-    ]);
-    await stmt.free();
   }
 
   async isOutputUnspent(outputHash: string): Promise<boolean> {
     if (!this.adapter) throw new Error('Database not open');
-    const stmt = await this.adapter.prepare(
-      'SELECT output_hash FROM wallet_outputs WHERE output_hash = ? AND is_spent = 0'
+    const row = await this.selectFirst(
+      'SELECT output_hash FROM wallet_outputs WHERE output_hash = ? AND is_spent = 0',
+      [outputHash]
     );
-    stmt.bind([outputHash]);
-    const found = await stmt.step();
-    await stmt.free();
-    return found;
+    return row !== null;
   }
 
   async isOutputSpentInMempool(outputHash: string): Promise<boolean> {
     if (!this.adapter) throw new Error('Database not open');
-    const stmt = await this.adapter.prepare(
-      'SELECT output_hash FROM wallet_outputs WHERE output_hash = ? AND is_spent = 1 AND spent_block_height = 0'
+    const row = await this.selectFirst(
+      'SELECT output_hash FROM wallet_outputs WHERE output_hash = ? AND is_spent = 1 AND spent_block_height = 0',
+      [outputHash]
     );
-    stmt.bind([outputHash]);
-    const found = await stmt.step();
-    await stmt.free();
-    return found;
+    return row !== null;
   }
 
   async getMempoolSpentTxHash(outputHash: string): Promise<string | null> {
     if (!this.adapter) throw new Error('Database not open');
-    const stmt = await this.adapter.prepare(
-      'SELECT spent_tx_hash FROM wallet_outputs WHERE output_hash = ? AND is_spent = 1 AND spent_block_height = 0'
+    const row = await this.selectFirst(
+      'SELECT spent_tx_hash FROM wallet_outputs WHERE output_hash = ? AND is_spent = 1 AND spent_block_height = 0',
+      [outputHash]
     );
-    stmt.bind([outputHash]);
-    if (await stmt.step()) {
-      const row = await stmt.getAsObject();
-      await stmt.free();
-      return (row.spent_tx_hash as string) || null;
-    }
-    await stmt.free();
-    return null;
+    return (row?.spent_tx_hash as string | undefined) || null;
   }
 
   async markOutputSpent(outputHash: string, spentTxHash: string, spentBlockHeight: number): Promise<void> {
@@ -1511,43 +1693,34 @@ export class WalletDB {
       throw new Error(`Invalid revert height: ${fromHeight}`);
     }
 
-    await this.adapter.run('BEGIN TRANSACTION');
-    try {
+    await this.inTransaction(async (adapter) => {
       await this.saveSyncState(state);
-      await this.adapter.run('DELETE FROM tx_keys WHERE block_height >= ?', [fromHeight]);
-      await this.adapter.run('DELETE FROM wallet_outputs WHERE block_height >= ?', [fromHeight]);
-      await this.adapter.run(
+      await adapter.run('DELETE FROM tx_keys WHERE block_height >= ?', [fromHeight]);
+      await adapter.run('DELETE FROM wallet_outputs WHERE block_height >= ?', [fromHeight]);
+      await adapter.run(
         `UPDATE wallet_outputs SET is_spent = 0, spent_tx_hash = NULL, spent_block_height = NULL
          WHERE spent_block_height >= ?`,
         [fromHeight]
       );
-      await this.adapter.run('DELETE FROM block_hashes WHERE height >= ?', [fromHeight]);
-      await this.adapter.run('COMMIT');
-    } catch (error) {
-      await this.adapter.run('ROLLBACK');
-      throw error;
-    }
+      await adapter.run('DELETE FROM block_hashes WHERE height >= ?', [fromHeight]);
+    });
   }
 
   async getPendingSpentAmount(tokenId: string | null = null): Promise<bigint> {
     if (!this.adapter) throw new Error('Database not open');
 
-    let query = `SELECT SUM(amount) as total FROM wallet_outputs WHERE is_spent = 1 AND spent_block_height = 0`;
-    if (tokenId === null) {
-      query += " AND (token_id IS NULL OR token_id = '0000000000000000000000000000000000000000000000000000000000000000')";
-    } else {
-      query += ' AND token_id = ?';
-    }
+    // Summed in JS: SQL SUM over u64 amounts overflows (and the column is TEXT).
+    const filter = tokenFilter(tokenId);
+    return this.sumAmounts(
+      `SELECT amount FROM wallet_outputs WHERE is_spent = 1 AND spent_block_height = 0 AND ${filter.sql}`,
+      filter.params
+    );
+  }
 
-    const stmt = await this.adapter.prepare(query);
-    if (tokenId !== null) stmt.bind([tokenId]);
-    if (await stmt.step()) {
-      const row = await stmt.getAsObject();
-      await stmt.free();
-      return BigInt(row.total as number || 0);
-    }
-    await stmt.free();
-    return 0n;
+  /** Sum the amount column of a query's rows exactly. */
+  private async sumAmounts(sql: string, params: unknown[]): Promise<bigint> {
+    const rows = await this.selectRows(sql, params);
+    return rows.reduce((total, row) => total + decodeAmount(row.amount), 0n);
   }
 
   async deleteUnconfirmedOutputsByTxHash(txHash: string): Promise<void> {
@@ -1628,30 +1801,14 @@ export class WalletDB {
       throw new Error('Database not initialized');
     }
 
-    // Spendable balance: staked commitments are locked for staking.
-    let query =
-      'SELECT SUM(amount) as total FROM wallet_outputs WHERE is_spent = 0 AND is_staked_commitment = 0';
-
-    if (tokenId === null) {
-      // NAV balance - outputs with no token_id or the default token id in
-      // either spelling (bare zero hash, or TokenId.serialize()'s zero hash
-      // + ffff… no-subid marker, written by older mempool processing)
-      query += " AND (token_id IS NULL OR token_id = '0000000000000000000000000000000000000000000000000000000000000000'"
-        + " OR token_id = '0000000000000000000000000000000000000000000000000000000000000000ffffffffffffffff')";
-    } else {
-      query += ' AND token_id = ?';
-    }
-
-    const stmt = await this.adapter.prepare(query);
-    if (tokenId !== null) stmt.bind([tokenId]);
-    const found = await stmt.step();
-    const total = found ? (await stmt.getAsObject()).total : null;
-    await stmt.free();
-    if (total === null || total === undefined) {
-      return 0n;
-    }
-
-    return BigInt(total as number);
+    // Spendable balance: staked commitments are locked for staking. NAV is
+    // any of the stored spellings of its token id (see NAV_TOKEN_FILTER_SQL).
+    // Summed in JS: SQL SUM over u64 amounts overflows (and the column is TEXT).
+    const filter = tokenFilter(tokenId);
+    return this.sumAmounts(
+      `SELECT amount FROM wallet_outputs WHERE is_spent = 0 AND is_staked_commitment = 0 AND ${filter.sql}`,
+      filter.params
+    );
   }
 
   /**
@@ -1664,52 +1821,15 @@ export class WalletDB {
       throw new Error('Database not initialized');
     }
 
-    let query = `
-      SELECT output_hash, tx_hash, output_index, block_height, amount, gamma, memo, token_id, 
-             blinding_key, ephemeral_key, spending_key, is_spent, spent_tx_hash, spent_block_height,
-             tx_type, timestamp, is_staked_commitment
-      FROM wallet_outputs 
-      WHERE is_spent = 0 AND is_staked_commitment = 0
-    `;
-
-    if (tokenId === null) {
-      // NAV - outputs with no token_id or default token_id
-      query += " AND (token_id IS NULL OR token_id = '0000000000000000000000000000000000000000000000000000000000000000')";
-    } else {
-      query += ' AND token_id = ?';
-    }
-
-    query += ' ORDER BY block_height ASC';
-
-    const stmt = await this.adapter.prepare(query);
-    if (tokenId !== null) stmt.bind([tokenId]);
-
-    const outputs: WalletOutput[] = [];
-    while (await stmt.step()) {
-      const row = await stmt.getAsObject();
-      outputs.push({
-        outputHash: row.output_hash as string,
-        txHash: row.tx_hash as string,
-        outputIndex: row.output_index as number,
-        blockHeight: row.block_height as number,
-        amount: BigInt(row.amount as number),
-        gamma: (row.gamma as string) || '0',
-        memo: row.memo as string | null,
-        tokenId: row.token_id as string | null,
-        blindingKey: row.blinding_key as string,
-        ephemeralKey: (row.ephemeral_key as string | null) ?? null,
-        spendingKey: row.spending_key as string,
-        isSpent: (row.is_spent as number) === 1,
-        spentTxHash: row.spent_tx_hash as string | null,
-        spentBlockHeight: row.spent_block_height as number | null,
-        txType: ((row.tx_type as string) || 'received') as TxType,
-        timestamp: (row.timestamp as number) || 0,
-        isStakedCommitment: (row.is_staked_commitment as number) === 1,
-      });
-    }
-    await stmt.free();
-
-    return outputs;
+    const filter = tokenFilter(tokenId);
+    const rows = await this.selectRows(
+      `SELECT ${WALLET_OUTPUT_COLUMNS}
+       FROM wallet_outputs
+       WHERE is_spent = 0 AND is_staked_commitment = 0 AND ${filter.sql}
+       ORDER BY block_height ASC`,
+      filter.params
+    );
+    return rows.map(rowToWalletOutput);
   }
 
   /**
@@ -1721,40 +1841,10 @@ export class WalletDB {
       throw new Error('Database not initialized');
     }
 
-    const stmt = await this.adapter.prepare(`
-      SELECT output_hash, tx_hash, output_index, block_height, amount, gamma, memo, token_id, 
-             blinding_key, ephemeral_key, spending_key, is_spent, spent_tx_hash, spent_block_height,
-             tx_type, timestamp, is_staked_commitment
-      FROM wallet_outputs 
-      ORDER BY block_height ASC
-    `);
-
-    const outputs: WalletOutput[] = [];
-    while (await stmt.step()) {
-      const row = await stmt.getAsObject();
-      outputs.push({
-        outputHash: row.output_hash as string,
-        txHash: row.tx_hash as string,
-        outputIndex: row.output_index as number,
-        blockHeight: row.block_height as number,
-        amount: BigInt(row.amount as number),
-        gamma: (row.gamma as string) || '0',
-        memo: row.memo as string | null,
-        tokenId: row.token_id as string | null,
-        blindingKey: row.blinding_key as string,
-        ephemeralKey: (row.ephemeral_key as string | null) ?? null,
-        spendingKey: row.spending_key as string,
-        isSpent: (row.is_spent as number) === 1,
-        spentTxHash: row.spent_tx_hash as string | null,
-        spentBlockHeight: row.spent_block_height as number | null,
-        txType: ((row.tx_type as string) || 'received') as TxType,
-        timestamp: (row.timestamp as number) || 0,
-        isStakedCommitment: (row.is_staked_commitment as number) === 1,
-      });
-    }
-    await stmt.free();
-
-    return outputs;
+    const rows = await this.selectRows(
+      `SELECT ${WALLET_OUTPUT_COLUMNS} FROM wallet_outputs ORDER BY block_height ASC`
+    );
+    return rows.map(rowToWalletOutput);
   }
 
   // ============================================================================
@@ -1770,14 +1860,8 @@ export class WalletDB {
       return false;
     }
 
-    const stmt = await this.adapter.prepare('SELECT is_encrypted FROM encryption_metadata WHERE id = 0');
-    if (await stmt.step()) {
-      const row = await stmt.getAsObject();
-      await stmt.free();
-      return (row.is_encrypted as number) === 1;
-    }
-    await stmt.free();
-    return false;
+    const row = await this.selectFirst('SELECT is_encrypted FROM encryption_metadata WHERE id = 0');
+    return row !== null && (row.is_encrypted as number) === 1;
   }
 
   /**
@@ -1806,21 +1890,15 @@ export class WalletDB {
       throw new Error('Database not initialized');
     }
 
-    const stmt = await this.adapter.prepare(`
-      SELECT salt, verification_hash FROM encryption_metadata WHERE id = 0 AND is_encrypted = 1
-    `);
-
-    if (await stmt.step()) {
-      const row = await stmt.getAsObject();
-      await stmt.free();
-      if (row.salt && row.verification_hash) {
-        return {
-          salt: row.salt as string,
-          verificationHash: row.verification_hash as string,
-        };
-      }
+    const row = await this.selectFirst(
+      'SELECT salt, verification_hash FROM encryption_metadata WHERE id = 0 AND is_encrypted = 1'
+    );
+    if (row && row.salt && row.verification_hash) {
+      return {
+        salt: row.salt as string,
+        verificationHash: row.verification_hash as string,
+      };
     }
-    await stmt.free();
     return null;
   }
 
@@ -1851,21 +1929,13 @@ export class WalletDB {
       throw new Error('Database not initialized');
     }
 
-    const stmt = await this.adapter.prepare(`
-      SELECT public_key, encrypted_secret FROM crypted_keys WHERE key_id = ?
-    `);
-    stmt.bind([keyId]);
-
-    if (await stmt.step()) {
-      const row = await stmt.getAsObject();
-      await stmt.free();
-      return {
-        publicKey: row.public_key as string,
-        encryptedSecret: row.encrypted_secret as string,
-      };
-    }
-    await stmt.free();
-    return null;
+    const row = await this.selectFirst(
+      'SELECT public_key, encrypted_secret FROM crypted_keys WHERE key_id = ?',
+      [keyId]
+    );
+    return row
+      ? { publicKey: row.public_key as string, encryptedSecret: row.encrypted_secret as string }
+      : null;
   }
 
   /**
@@ -1877,20 +1947,12 @@ export class WalletDB {
       throw new Error('Database not initialized');
     }
 
-    const stmt = await this.adapter.prepare('SELECT key_id, public_key, encrypted_secret FROM crypted_keys');
-    const keys: Array<{ keyId: string; publicKey: string; encryptedSecret: string }> = [];
-
-    while (await stmt.step()) {
-      const row = await stmt.getAsObject();
-      keys.push({
-        keyId: row.key_id as string,
-        publicKey: row.public_key as string,
-        encryptedSecret: row.encrypted_secret as string,
-      });
-    }
-    await stmt.free();
-
-    return keys;
+    const rows = await this.selectRows('SELECT key_id, public_key, encrypted_secret FROM crypted_keys');
+    return rows.map((row) => ({
+      keyId: row.key_id as string,
+      publicKey: row.public_key as string,
+      encryptedSecret: row.encrypted_secret as string,
+    }));
   }
 
   /**
@@ -1920,21 +1982,13 @@ export class WalletDB {
       throw new Error('Database not initialized');
     }
 
-    const stmt = await this.adapter.prepare(`
-      SELECT public_key, encrypted_secret FROM crypted_out_keys WHERE out_id = ?
-    `);
-    stmt.bind([outId]);
-
-    if (await stmt.step()) {
-      const row = await stmt.getAsObject();
-      await stmt.free();
-      return {
-        publicKey: row.public_key as string,
-        encryptedSecret: row.encrypted_secret as string,
-      };
-    }
-    await stmt.free();
-    return null;
+    const row = await this.selectFirst(
+      'SELECT public_key, encrypted_secret FROM crypted_out_keys WHERE out_id = ?',
+      [outId]
+    );
+    return row
+      ? { publicKey: row.public_key as string, encryptedSecret: row.encrypted_secret as string }
+      : null;
   }
 
   /**
@@ -1946,20 +2000,12 @@ export class WalletDB {
       throw new Error('Database not initialized');
     }
 
-    const stmt = await this.adapter.prepare('SELECT out_id, public_key, encrypted_secret FROM crypted_out_keys');
-    const keys: Array<{ outId: string; publicKey: string; encryptedSecret: string }> = [];
-
-    while (await stmt.step()) {
-      const row = await stmt.getAsObject();
-      keys.push({
-        outId: row.out_id as string,
-        publicKey: row.public_key as string,
-        encryptedSecret: row.encrypted_secret as string,
-      });
-    }
-    await stmt.free();
-
-    return keys;
+    const rows = await this.selectRows('SELECT out_id, public_key, encrypted_secret FROM crypted_out_keys');
+    return rows.map((row) => ({
+      outId: row.out_id as string,
+      publicKey: row.public_key as string,
+      encryptedSecret: row.encrypted_secret as string,
+    }));
   }
 
   /**

@@ -3134,7 +3134,7 @@ export class NavioClient {
         kind,
         tokenPublicKey,
         metadata,
-        totalSupply,
+        totalSupply: BigInt(totalSupply),
         txId,
         createdAt: Math.floor(Date.now() / 1000),
       });

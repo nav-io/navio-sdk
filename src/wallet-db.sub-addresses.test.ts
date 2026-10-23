@@ -14,7 +14,7 @@ function sampleOutput(outputHash: string): StoreOutputParams {
     outputIndex: 0,
     blockHeight: 10,
     outputData: '',
-    amount: 1_000_000,
+    amount: 1_000_000n,
     gamma: '01',
     memo: null,
     tokenId: null,

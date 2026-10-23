@@ -17,6 +17,47 @@ import type {
   DatabaseAdapterOptions,
 } from '../database-adapter';
 
+/** Paths that name an in-memory (or SQLite temporary) database, not a file. */
+function isMemoryPath(path: string): boolean {
+  return path === ':memory:' || path === '';
+}
+
+/**
+ * A copy of a serialized database that SQLite can open in memory.
+ *
+ * A database serialized from a WAL-mode file keeps WAL in its header (bytes
+ * 18 and 19 = 2), and an in-memory database cannot open such an image
+ * (SQLITE_CANTOPEN). Mark the copy as rollback-journal (1) instead; the page
+ * content is unaffected.
+ */
+function toInMemoryImage(data: Uint8Array): Buffer {
+  const image = Buffer.from(data);
+  if (image.length >= 20 && image[18] === 2 && image[19] === 2) {
+    image[18] = 1;
+    image[19] = 1;
+  }
+  return image;
+}
+
+/**
+ * Write imported database bytes to a new file, readable by the owner only.
+ *
+ * Refuses to replace an existing database (or a leftover -wal / -shm file,
+ * which SQLite would replay over the import).
+ */
+function writeNewDatabaseFile(path: string, data: Uint8Array): void {
+  const fs = require('fs');
+  for (const candidate of [path, `${path}-wal`, `${path}-shm`]) {
+    if (fs.existsSync(candidate)) {
+      throw new Error(`Refusing to import over existing file: ${candidate}`);
+    }
+  }
+  // 'wx' fails if the file appeared since the check; the mode applies to the
+  // new file (before umask, which can only narrow it), chmod makes it exact.
+  fs.writeFileSync(path, Buffer.from(data), { mode: 0o600, flag: 'wx' });
+  fs.chmodSync(path, 0o600);
+}
+
 /**
  * Prepared statement wrapper for better-sqlite3
  */
@@ -118,28 +159,17 @@ export class NodeAdapter implements IDatabaseAdapter {
     }
 
     this.path = path;
+    const fs = require('fs');
+    const createsFile = !isMemoryPath(path) && !data && !fs.existsSync(path);
 
-    if (data) {
-      // Create database from buffer
-      // better-sqlite3 can open from file, so we need to write to temp file first
-      // or use the memory option with serialization
-      const fs = require('fs');
-      const os = require('os');
-      const pathModule = require('path');
-
-      // Write to temp file
-      const tempPath = pathModule.join(os.tmpdir(), `navio-import-${Date.now()}.db`);
-      fs.writeFileSync(tempPath, Buffer.from(data));
-
-      // Open from temp file
-      this.db = new this.Database(tempPath);
-
-      // Delete temp file
-      try {
-        fs.unlinkSync(tempPath);
-      } catch {
-        // Ignore cleanup errors
-      }
+    if (data && isMemoryPath(path)) {
+      // Deserialize straight into memory. The bytes may be a decrypted
+      // wallet, so they never touch the disk.
+      this.db = new this.Database(toInMemoryImage(data));
+    } else if (data) {
+      // Import into the file at `path`, so later writes persist there.
+      writeNewDatabaseFile(path, data);
+      this.db = new this.Database(path);
     } else if (path === ':memory:') {
       this.db = new this.Database(':memory:');
     } else {
@@ -148,8 +178,16 @@ export class NodeAdapter implements IDatabaseAdapter {
     }
 
     // Enable WAL mode for better concurrent access
-    if (path !== ':memory:') {
+    if (!isMemoryPath(path)) {
       this.db.pragma('journal_mode = WAL');
+    }
+
+    if (createsFile) {
+      // A new wallet file holds keys: owner only. SQLite gives -wal / -shm
+      // files it creates later the same permissions as the database.
+      for (const file of [path, `${path}-wal`, `${path}-shm`]) {
+        if (fs.existsSync(file)) fs.chmodSync(file, 0o600);
+      }
     }
 
     if (this.debug) {

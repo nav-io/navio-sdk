@@ -83,7 +83,8 @@ export interface StoreOutputParams {
   outputIndex: number;
   blockHeight: number;
   outputData: string;
-  amount: number;
+  /** Output amount, in the token's smallest unit (u64). */
+  amount: bigint;
   gamma: string;
   memo: string | null;
   tokenId: string | null;
@@ -114,8 +115,8 @@ export interface CreatedCollectionRecord {
   tokenPublicKey: string;
   /** Metadata the collection was created with. */
   metadata: Record<string, string>;
-  /** Maximum total supply recorded at creation. */
-  totalSupply: number;
+  /** Maximum total supply recorded at creation (u64). */
+  totalSupply: bigint;
   /** Transaction id of the create-collection transaction. */
   txId: string;
   /** Unix timestamp (seconds) when the creation was broadcast. */
@@ -212,11 +213,19 @@ export interface IWalletDB {
 
   // -- transaction keys -------------------------------------------------
   saveTxKeys(txHash: string, height: number, keysData: string): Promise<void>;
+  /** Stored keys for a transaction, or null when none (or only corrupt JSON) is stored. */
   getTxKeys(txHash: string): Promise<any | null>;
+  /** Stored keys of the transactions at a height; rows with corrupt JSON are skipped. */
   getTxKeysByHeight(height: number): Promise<{ txHash: string; keys: any }[]>;
   deleteTxKeysByHeight(height: number): Promise<void>;
 
   // -- wallet output mutations (used by sync) ---------------------------
+  /**
+   * Insert an output, or update it when the output hash is already stored.
+   * An update keeps the stored spent state (`isSpent`, `spentTxHash`,
+   * `spentBlockHeight`) once the output is marked spent, and the original
+   * creation time, so re-processing a block cannot resurrect a spent output.
+   */
   storeWalletOutput(params: StoreOutputParams): Promise<void>;
   isOutputUnspent(outputHash: string): Promise<boolean>;
   isOutputSpentInMempool(outputHash: string): Promise<boolean>;

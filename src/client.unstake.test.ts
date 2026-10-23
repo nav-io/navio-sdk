@@ -125,7 +125,7 @@ describe('NavioClient.unstake', () => {
       txHash,
       blockHeight: 10,
       outputData: storeOutputData ? staked.serializedHex : '',
-      amount: Number(scanned.amount),
+      amount: scanned.amount,
     });
     return staked.outputHash;
   }

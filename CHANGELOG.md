@@ -23,8 +23,48 @@ Format follows [Keep a Changelog](https://keepachangelog.com/); versions follow 
   is kept, so no save loses the seed. SQLite gains an `encrypted_seed` column
   and turns on `secure_delete`, so the replaced plaintext does not linger in
   free pages.
+- **Imported databases no longer go through the temp directory, and land
+  where they were asked to.** `NodeAdapter.open(path, data)` wrote the bytes
+  to a file in `os.tmpdir()`, opened that and deleted it, ignoring `path`. So
+  `WalletDB.migrate(path)` returned a database whose writes all went to an
+  unlinked temp file and were lost, and `loadEncrypted()` / `loadFromBytes()`
+  put the decrypted wallet in plaintext in the shared temp directory. In-memory
+  imports are now deserialized in memory; a file import writes `path` with
+  owner-only (0600) permissions, refusing to overwrite an existing file. New
+  database files are created owner-only too.
 
 ### Changed
+
+- **Breaking: amounts are `bigint` throughout the storage API.**
+  `StoreOutputParams.amount` and `CreatedCollectionRecord.totalSupply` were
+  `number`, so amounts above 2^53 lost precision, and SQLite's `SUM` could
+  overflow. They are `bigint` now, like `WalletOutput.amount` and the
+  balances, and passing a `number` throws a `TypeError`. Both backends store
+  amounts as decimal strings and sum them exactly. Existing databases are
+  converted when opened: SQLite rebuilds `wallet_outputs` and
+  `created_collections` with `TEXT` amount columns (one transaction per
+  table); IndexedDB upgrades to version 8. Amounts that had already
+  overflowed keep what was left of them. Custom `IWalletDB` implementations
+  and callers of `storeWalletOutput()` / `saveCreatedCollection()` must pass
+  `bigint`.
+- `storeWalletOutput()` (both backends) updates an output that is already
+  stored instead of replacing it: an output already marked spent stays spent,
+  with its spending transaction and height, and the original creation time is
+  kept. Re-processing a block reset spent outputs to unspent.
+- Creating or restoring a wallet over a different one drops the old wallet's
+  outputs, collections, orders, blinding keys and sync progress, and saves
+  the new wallet and its metadata, in a single transaction (both backends). A
+  failure halfway could leave the old data gone and the new wallet unsaved.
+- SQLite transactions (`saveWallet()`, `revertBlocksFrom()`, wallet creation
+  and restore, schema migrations) are serialized on the shared connection;
+  overlapping calls failed with `cannot start a transaction within a
+  transaction`.
+- `IndexedDBWalletDB` closes its connection when another tab upgrades or
+  deletes the database (later calls fail with a clear error), and `open()`
+  rejects after `blockedTimeoutMs` (new constructor option, default 10 s)
+  when an older connection blocks the upgrade, instead of hanging.
+  `IndexedDBWalletDB.deleteDatabase()` rejects when another connection keeps
+  the deletion blocked; it used to report success.
 
 - `getMnemonic()`, `getMasterSeedHex()` and `getMasterSeedKey()` throw while
   an encrypted wallet is locked. Unlock before showing a backup phrase.
@@ -34,6 +74,23 @@ Format follows [Keep a Changelog](https://keepachangelog.com/); versions follow 
   an unencrypted wallet is saved over an encrypted one.
 - `KeyManager.setEncryptionParams()` clears private keys a plaintext seed had
   derived into memory, since the wallet it describes starts locked.
+
+### Fixed
+
+- SQLite `getUnspentOutputs()` and `getPendingSpentAmount()` did not count
+  NAV outputs stored with the serialized NAV token id (zero hash + `ffff…`),
+  which `getBalance()` did. All three now use one filter, and the upgrade
+  stores those outputs with `token_id` NULL.
+- `getTxKeys()` / `getTxKeysByHeight()` treat a corrupt stored entry as
+  missing on both backends (SQLite threw, IndexedDB's `getTxKeys` did not).
+  A SQLite read that threw mid-query no longer leaves its statement open,
+  which made every later write fail with "connection is busy".
+- `IndexedDBWalletDB.saveWallet()` deletes the HD chain, view key and spend
+  key records the saved wallet does not have, as SQLite does, and aborts the
+  save if building it throws instead of committing part of it. Range deletes
+  (`deleteTxKeysByHeight()`, `deleteOutputsByHeight()`,
+  `deleteBlockHashesBefore()`) reject when their transaction aborts; they
+  hung.
 
 ## [0.4.0] - 2026-10-17
 
