@@ -24,10 +24,17 @@ import { parseOutputHex, parseTransaction } from './p2p-block-parser';
 import { recoverStakeDelegation, type StakeDelegation } from './staking';
 import {
   BlindingKeyAllocator,
+  MAX_GENERATION_SEARCH,
+  MAX_OUTPUT_SEARCH,
   blindingPublicKeyHex,
   canonicalAnchorOutid,
   searchBlindingKey,
 } from './blinding-key';
+import {
+  openOutputBlindingKey,
+  sealOutputBlindingKey,
+  sealPlaintextOutputBlindingKeys,
+} from './output-blinding-key-store';
 import * as blsctModule from '@nav-io/navio-blsct';
 import { BlsctChain, setChain } from '@nav-io/navio-blsct';
 import { sha256 } from '@noble/hashes/sha256';
@@ -464,6 +471,11 @@ export interface RecoveredBlindingKey {
    * broadcast, so recovery searches every input.
    */
   anchorOutid?: string;
+  /**
+   * The build generation that matched, when derived. `null` means the output
+   * was built with the generation-less derivation of navio-sdk 0.4 and earlier.
+   */
+  generation?: number | null;
 }
 
 /**
@@ -1008,6 +1020,8 @@ export class NavioClient {
   private keyManager: KeyManager | null = null;
   private config: NavioClientConfig;
   private initialized = false;
+  /** Whether sealStoredBlindingKeys has run while the wallet was encrypted. */
+  private blindingKeysSealed = false;
 
   // Legacy: keep electrumClient reference for backwards compatibility
   private electrumClient: ElectrumClient | null = null;
@@ -2251,7 +2265,7 @@ export class NavioClient {
     const delegation = restake > 0n ? await this.sharedStakeDelegation(spent) : null;
 
     const inputs = spent.map(output => ({ output, tokenId: TokenId.default() }));
-    const blindingKeys = this.makeBlindingKeyAllocator(inputs, options.randomBlindingKeys);
+    const blindingKeys = await this.makeBlindingKeyAllocator(inputs, options.randomBlindingKeys);
     const stakeAddress = this.getStakeSubAddress();
     const buildOutputs = (fee: bigint): InstanceType<typeof UnsignedOutput>[] => {
       if (amount <= fee) {
@@ -2566,7 +2580,9 @@ export class NavioClient {
           memo,
           assetChangeAmount,
           includeNavChange ? 1n : 0n,
-          this.makeBlindingKeyAllocator(candidateInputs, randomBlindingKeys),
+          // Only sized, never broadcast: random keys build the same size
+          // without claiming a generation per estimation round.
+          BlindingKeyAllocator.random(),
         );
         const estimatedFee = this.estimateSignedUnsignedTransactionFee(candidateInputs, candidateOutputs);
 
@@ -2606,7 +2622,7 @@ export class NavioClient {
       ];
       // Coin selection has settled, so the first input — which the derivation
       // binds to — is now fixed.
-      const blindingKeys = this.makeBlindingKeyAllocator(selectedInputs, randomBlindingKeys);
+      const blindingKeys = await this.makeBlindingKeyAllocator(selectedInputs, randomBlindingKeys);
       const outputs = this.buildUnsignedSendOutputs(
         destSubAddr,
         blsctTokenId,
@@ -2696,7 +2712,7 @@ export class NavioClient {
 
     // Coin selection is done, so the first input the signed transaction will
     // carry is settled and the blinding keys can be bound to it.
-    const blindingKeys = this.makeBlindingKeyAllocator(inputs, randomBlindingKeys);
+    const blindingKeys = await this.makeBlindingKeyAllocator(inputs, randomBlindingKeys);
 
     // Build the dest + change outputs for a given fee via the manual
     // UnsignedTransaction path. NOTE: we do *not* use build_ctx here — that
@@ -2874,7 +2890,7 @@ export class NavioClient {
 
     // Coin selection is done, so the first input is settled and the blinding
     // keys can be bound to it.
-    const blindingKeys = this.makeBlindingKeyAllocator(inputs, randomBlindingKeys);
+    const blindingKeys = await this.makeBlindingKeyAllocator(inputs, randomBlindingKeys);
 
     // Build the recipient + change outputs for a candidate fee. Uses the manual
     // UnsignedTransaction path (not build_ctx): the tx then contains exactly the
@@ -3581,10 +3597,17 @@ export class NavioClient {
    * Because Navio merges every non-coinbase transaction in a block into one,
    * an output's on-chain index is not the index its sender assigned, so the
    * derivation is searched over the first {@link MAX_OUTPUT_SEARCH} counters
-   * rather than trusting `vout`.
+   * rather than trusting `vout`, and over the first
+   * {@link MAX_GENERATION_SEARCH} build generations of each, then the
+   * generation-less derivation of navio-sdk 0.4 and earlier.
    *
-   * Only works for outputs created by a wallet running this SDK version or
-   * later: earlier outputs used a random scalar that was discarded.
+   * Only works for outputs created by navio-sdk 0.2.0 or later (or a
+   * navio-core wallet with recoverable blinding keys): earlier outputs used a
+   * random scalar that was discarded.
+   *
+   * An encrypted wallet keeps the stored scalars encrypted; this also
+   * encrypts any it still stores in plaintext (see
+   * {@link sealStoredBlindingKeys}).
    *
    * @param ref - The output to recover
    * @returns The private scalar, the public point, and how it was obtained
@@ -3608,7 +3631,12 @@ export class NavioClient {
 
     // Fast path: the scalar this wallet stored when it built the output.
     if (this.walletDB) {
-      const stored = await this.walletDB.getOutputBlindingKey(context.outputHash);
+      await this.sealStoredBlindingKeysOnce();
+      const record = await this.walletDB.getOutputBlindingKey(context.outputHash);
+      // Null when the record does not decrypt: sealed under an earlier
+      // password. The derivation below finds the scalar anyway, and the
+      // record is rewritten under the current one.
+      const stored = record ? await openOutputBlindingKey(this.keyManager, record) : null;
       if (stored) {
         const scalar = Scalar.deserialize(stored);
         if (blindingPublicKeyHex(scalar) === context.blindingPublicKey) {
@@ -3643,19 +3671,34 @@ export class NavioClient {
 
     const match = searchBlindingKey(seed, candidates, context.blindingPublicKey);
     if (match) {
+      const blindingKey = match.scalar.serialize().padStart(64, '0');
+      if (this.walletDB) {
+        // Restore the fast path (after a seed-only restore, or a password
+        // change that left the stored record undecryptable). Best effort.
+        try {
+          await this.walletDB.saveOutputBlindingKey(
+            context.outputHash,
+            await sealOutputBlindingKey(this.keyManager, blindingKey),
+          );
+        } catch {
+          // The derivation stays the source of truth.
+        }
+      }
       return {
-        blindingKey: match.scalar.serialize().padStart(64, '0'),
+        blindingKey,
         publicKey: context.blindingPublicKey,
         source: 'derived',
         counter: match.counter,
         anchorOutid: match.outid,
+        generation: match.generation,
       };
     }
 
     throw new Error(
       `Could not recover the blinding key for ${ref.txid}:${ref.vout}. The output was not created ` +
-      'by this wallet, or it was created before deterministic blinding keys existed (recovery ' +
-      'applies only to outputs created by navio-sdk 0.2.0 or later).'
+      'by this wallet, or it was given a random key, which cannot be recovered: outputs built ' +
+      `before navio-sdk 0.2.0, with randomBlindingKeys, past the first ${MAX_OUTPUT_SEARCH} outputs ` +
+      `of their transaction, or after ${MAX_GENERATION_SEARCH} builds on the same inputs.`
     );
   }
 
@@ -4359,7 +4402,7 @@ export class NavioClient {
     // of the containing transaction, so these outputs stay recoverable from
     // the seed alone. The scalars are also persisted below, keyed by output
     // hash — which aggregation does not change — as the fast path.
-    blindingKeys = this.makeBlindingKeyAllocator(makeInputs());
+    blindingKeys = await this.makeBlindingKeyAllocator(makeInputs());
 
     // Fee fixpoint. Taker halves pay 0; maker halves must clear the consensus
     // minimum for their own signed size plus the taker allowance.
@@ -4741,7 +4784,7 @@ export class NavioClient {
     const { walletDB } = await this.ensureSpendReady();
     const { selected, totalIn } = await this.selectFundingUtxos(walletDB, selectedUtxos, fundedAmount);
     const inputs = selected.map((utxo) => ({ output: utxo, tokenId: TokenId.default() }));
-    const blindingKeys = this.makeBlindingKeyAllocator(inputs, useRandomBlindingKeys);
+    const blindingKeys = await this.makeBlindingKeyAllocator(inputs, useRandomBlindingKeys);
 
     // Output order is preserved through signing and consensus executes output
     // predicates in order, so callers may rely on it (e.g. a create-collection
@@ -4899,18 +4942,28 @@ export class NavioClient {
    * selected inputs, so this must be called only once coin selection has
    * settled — the anchor depends on the whole input set, not on their order.
    *
+   * Each call claims a fresh build generation for that anchor, persisted
+   * before any key is derived, so a rebuild over the same inputs (a resend
+   * after a failed or abandoned send) never reuses a blinding scalar. Call it
+   * once per transaction actually built, not per fee-estimation round: fee
+   * rounds of one build share its generation, since only one is broadcast.
+   *
+   * Falls back to random, unrecoverable keys when the generation cannot be
+   * persisted or the anchor's generations are used up — never to a derived
+   * key that might repeat or that recovery could not find.
+   *
    * @param inputs - The selected inputs (all of them this wallet's own)
    * @param useRandom - Caller opted out of recoverable keys
    */
-  private makeBlindingKeyAllocator(
+  private async makeBlindingKeyAllocator(
     inputs: Array<{ output: WalletOutput }>,
     useRandom?: boolean,
-  ): BlindingKeyAllocator {
+  ): Promise<BlindingKeyAllocator> {
     const deterministic = useRandom === undefined
       ? this.config.deterministicBlindingKeys !== false
       : !useRandom;
 
-    if (!deterministic || inputs.length === 0 || !this.keyManager) {
+    if (!deterministic || inputs.length === 0 || !this.keyManager || !this.walletDB) {
       return BlindingKeyAllocator.random();
     }
 
@@ -4924,7 +4977,26 @@ export class NavioClient {
       return BlindingKeyAllocator.random();
     }
 
-    return new BlindingKeyAllocator(seed, inputs.map((input) => input.output.outputHash));
+    const anchor = canonicalAnchorOutid(inputs.map((input) => input.output.outputHash));
+    if (anchor === null) {
+      return BlindingKeyAllocator.random();
+    }
+
+    let generation: number;
+    try {
+      generation = await this.walletDB.reserveBlindingGeneration(anchor);
+    } catch {
+      // Without a persisted bump the next build could claim the same
+      // generation, which is the reuse this exists to prevent.
+      return BlindingKeyAllocator.random();
+    }
+    if (generation >= MAX_GENERATION_SEARCH) {
+      // Recovery never searches this far, so a derived key would only look
+      // recoverable.
+      return BlindingKeyAllocator.random();
+    }
+
+    return new BlindingKeyAllocator(seed, [anchor], generation);
   }
 
   /**
@@ -4933,6 +5005,7 @@ export class NavioClient {
    * Outputs are matched to scalars by their public blinding point rather than
    * by position: the signed transaction carries an extra fee output, and this
    * way the mapping does not depend on where the native builder puts it.
+   * An encrypted wallet stores them encrypted with the wallet key.
    *
    * Failure is non-fatal — the transaction is already broadcast, and the seed
    * derivation recovers the same scalars without this table.
@@ -4942,7 +5015,8 @@ export class NavioClient {
     rawTx: string,
     blindingKeys: BlindingKeyAllocator,
   ): Promise<void> {
-    if (!blindingKeys.isDeterministic) {
+    const keyManager = this.keyManager;
+    if (!blindingKeys.isDeterministic || !keyManager) {
       return;
     }
     try {
@@ -4950,6 +5024,7 @@ export class NavioClient {
       if (assigned.size === 0) {
         return;
       }
+      await this.sealStoredBlindingKeysOnce();
       const parsed = parseTransaction(Buffer.from(rawTx, 'hex'));
       for (const output of parsed.outputs) {
         // ephemeralKey, not the field named blindingKey — see
@@ -4958,11 +5033,53 @@ export class NavioClient {
         if (!publicHex) continue;
         const scalarHex = assigned.get(publicHex);
         if (scalarHex) {
-          await walletDB.saveOutputBlindingKey(output.outputHash, scalarHex);
+          await walletDB.saveOutputBlindingKey(
+            output.outputHash,
+            await sealOutputBlindingKey(keyManager, scalarHex),
+          );
         }
       }
     } catch {
       // Best effort: the derivation is the source of truth.
+    }
+  }
+
+  /**
+   * Encrypt the output blinding scalars an encrypted wallet still stores in
+   * plaintext: rows written before the wallet was encrypted, or by navio-sdk
+   * 0.4 and earlier, which never encrypted them.
+   *
+   * Call it after `getKeyManager().unlock()` or `setPassword()`. The client
+   * also runs it on its own the first time it touches the table while the
+   * wallet is encrypted and unlocked, but calling it right away keeps the
+   * plaintext on disk for as short a time as possible. Does nothing for an
+   * unencrypted or locked wallet; safe to call repeatedly.
+   *
+   * @returns How many rows were encrypted
+   */
+  async sealStoredBlindingKeys(): Promise<number> {
+    if (!this.walletDB || !this.keyManager) {
+      throw new Error('Client not initialized');
+    }
+    const sealed = await sealPlaintextOutputBlindingKeys(this.walletDB, this.keyManager);
+    if (this.keyManager.isEncrypted() && this.keyManager.isUnlocked()) {
+      this.blindingKeysSealed = true;
+    }
+    return sealed;
+  }
+
+  /**
+   * {@link sealStoredBlindingKeys}, at most once per client while the wallet
+   * is encrypted and unlocked, and never failing the caller.
+   */
+  private async sealStoredBlindingKeysOnce(): Promise<void> {
+    if (this.blindingKeysSealed || !this.keyManager?.isEncrypted() || !this.keyManager.isUnlocked()) {
+      return;
+    }
+    try {
+      await this.sealStoredBlindingKeys();
+    } catch {
+      // Retried on the next call; plaintext rows stay readable meanwhile.
     }
   }
 

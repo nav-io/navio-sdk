@@ -16,6 +16,7 @@ import type { IWalletDB, SyncState, TxType } from './wallet-db.interface';
 import * as blsctModule from '@nav-io/navio-blsct';
 import { sha256 } from '@noble/hashes/sha256';
 import { canonicalAnchorOutid, searchBlindingKey } from './blinding-key';
+import { sealOutputBlindingKey } from './output-blinding-key-store';
 import { parseOutputHex, parseTransaction, type ParsedOutput } from './p2p-block-parser';
 import { isStakedCommitmentOutput, isStakedCommitmentOutputHex } from './staking';
 
@@ -1120,9 +1121,10 @@ export class TransactionKeysSync {
 
       const match = searchBlindingKey(this.keyManager.getMasterSeedKey(), candidateOutids, ephemeralKey);
       if (match) {
+        // Encrypted with the wallet key when the wallet is encrypted.
         await this.walletDB.saveOutputBlindingKey(
           outputHash,
-          match.scalar.serialize().padStart(64, '0'),
+          await sealOutputBlindingKey(this.keyManager, match.scalar.serialize().padStart(64, '0')),
         );
       }
     } catch {

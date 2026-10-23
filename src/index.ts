@@ -11,6 +11,7 @@ export * from './wallet-db.interface';
 export * from './electrum';
 export * from './tx-keys-sync';
 export * from './blinding-key';
+export * from './output-blinding-key-store';
 export type { StakeDelegation } from './staking';
 export * from './crypto';
 

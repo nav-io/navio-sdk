@@ -398,6 +398,16 @@ export class WalletDB {
       )
     `);
 
+    // The next build generation per blinding-key anchor (see
+    // reserveBlindingGeneration). Not secret, and never cleared: a forgotten
+    // generation is one that gets handed out again.
+    await this.adapter.run(`
+      CREATE TABLE IF NOT EXISTS blinding_generations (
+        anchor_outid TEXT PRIMARY KEY,
+        next_generation INTEGER NOT NULL
+      )
+    `);
+
     try {
       await this.adapter.run(`ALTER TABLE master_seed ADD COLUMN encrypted_seed TEXT`);
     } catch {
@@ -1409,6 +1419,41 @@ export class WalletDB {
     }
     await stmt.free();
     return value;
+  }
+
+  async getAllOutputBlindingKeys(): Promise<Array<{ outputHash: string; blindingKey: string }>> {
+    if (!this.adapter) throw new Error('Database not open');
+    const stmt = await this.adapter.prepare(
+      'SELECT output_hash, blinding_key FROM output_blinding_keys'
+    );
+    const rows: Array<{ outputHash: string; blindingKey: string }> = [];
+    while (await stmt.step()) {
+      const row = await stmt.getAsObject();
+      rows.push({ outputHash: row.output_hash as string, blindingKey: row.blinding_key as string });
+    }
+    await stmt.free();
+    return rows;
+  }
+
+  async reserveBlindingGeneration(anchorOutid: string): Promise<number> {
+    if (!this.adapter) throw new Error('Database not open');
+    // One statement reads, bumps and returns the counter, so two claims that
+    // interleave between awaits can never see the same value.
+    const stmt = await this.adapter.prepare(
+      `INSERT INTO blinding_generations (anchor_outid, next_generation) VALUES (?, 1)
+       ON CONFLICT(anchor_outid) DO UPDATE SET next_generation = next_generation + 1
+       RETURNING next_generation`
+    );
+    stmt.bind([anchorOutid.toLowerCase()]);
+    let next: number | null = null;
+    if (await stmt.step()) {
+      next = Number((await stmt.getAsObject()).next_generation);
+    }
+    await stmt.free();
+    if (next === null || !Number.isInteger(next) || next < 1) {
+      throw new Error('Could not reserve a blinding-key generation');
+    }
+    return next - 1;
   }
 
   async getOutputData(outputHash: string): Promise<string | null> {

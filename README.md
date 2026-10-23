@@ -602,7 +602,25 @@ derivation is anchored on the lexicographically smallest outid among the inputs
 the sender contributed, because navio-core shuffles `vin` before broadcast and
 block aggregation splices in other senders' inputs. Recovery tries that
 canonical anchor first and then falls back to every input, each against the
-first 16 ordinals, verifying every candidate against the chain.
+first 16 ordinals of the first 32 build generations and then against the
+generation-less derivation of navio-sdk 0.4 and earlier, verifying every
+candidate against the chain.
+
+The derivation matches navio-core's (`src/blsct/wallet/blinding_key.h`), so
+outputs built by either are recoverable by the other:
+
+```
+k = sha256("navio-blsct-blinding/v1" ‖ seed(32, BE) ‖ outid(32, internal order)
+           ‖ ordinal(u32 BE) ‖ generation(u32 BE)) mod r
+```
+
+The **generation** is a per-anchor counter the wallet database bumps, and
+persists, every time a transaction is built on that anchor. Without it, a
+rebuild over the same inputs — a resend after a failed or abandoned send —
+would reuse `k` for a different amount, and two range proofs sharing `k` leak
+both amounts. Once an anchor has been built on 32 times, further builds on it
+get random, unrecoverable keys. The counter lives in the wallet database, so do
+not run two wallets restored from one seed and spend from both.
 
 ```typescript
 const { blindingKey, publicKey, source, counter } = await client.recoverBlindingKey({
@@ -618,9 +636,25 @@ const { blindingKey, publicKey, source, counter } = await client.recoverBlinding
 | `source`      | `'stored'` (from this wallet's database) or `'derived'` (from the seed). |
 | `counter`     | The sender-assigned counter that matched, when derived.                  |
 | `anchorOutid` | The input outid the derivation was anchored on, when derived.            |
+| `generation`  | The build generation that matched, when derived; `null` for navio-sdk ≤0.4. |
 
 Throws when the wallet is locked, when the transaction cannot be fetched, or
 when the output was not created by this wallet.
+
+##### `sealStoredBlindingKeys(): Promise<number>`
+
+Encrypt the stored blinding scalars an encrypted wallet still keeps in
+plaintext — rows written before `setPassword()`, or by navio-sdk 0.4 and
+earlier — and return how many were encrypted. An encrypted wallet stores new
+scalars encrypted with the wallet key; this converts the old ones. The client
+also does it on its own the first time it touches the table while unlocked, but
+calling it right after `unlock()` keeps plaintext on disk for less time. Does
+nothing for an unencrypted or locked wallet.
+
+```typescript
+await client.getKeyManager().unlock(password);
+await client.sealStoredBlindingKeys();
+```
 
 ##### `signOutput(options: SignOutputOptions): Promise<SignOutputResult>`
 
@@ -1417,7 +1451,8 @@ console.log(source); // 'stored' (this wallet's database) or 'derived' (from the
 Three things worth knowing:
 
 - **Only outputs created by navio-sdk 0.2.0 or later can be recovered.**
-  Earlier ones used a random scalar that was thrown away.
+  Earlier ones used a random scalar that was thrown away. So did outputs past
+  the first 16 of a transaction, and builds past the 32nd on the same inputs.
 - `blindingKey` in the result is the **public** point `k * G`, which is on
   chain as the output's `blsctData.ephemeralKey`. It is deliberately not the
   field navio-core calls `blsctData.blindingKey` — that one is
@@ -1657,6 +1692,7 @@ The wallet database includes the following tables:
 | `sub_addresses`        | Sub-address mappings                                    |
 | `wallet_outputs`       | Wallet UTXOs with amounts                               |
 | `output_blinding_keys` | Private blinding scalars of outputs this wallet created |
+| `blinding_generations` | Next blinding-key build generation per anchor input     |
 | `wallet_metadata`      | Wallet creation info                                    |
 | `encryption_metadata`  | Encryption parameters (salt, verification hash)         |
 | `tx_keys`              | Transaction keys (optional)                             |
@@ -1674,11 +1710,33 @@ public getters hand to callers, and a secret must not ride along by accident.
 Existing databases gain this table when they are next opened; nothing is
 rewritten, and a wallet with no rows here falls back to deriving from the seed.
 
+An encrypted wallet stores the scalar encrypted with the wallet key, as
+`enc1:` followed by hex; an unencrypted wallet stores the 64-hex scalar. Reading
+an encrypted row needs the wallet unlocked. Plaintext rows of an encrypted
+wallet are encrypted by `sealStoredBlindingKeys()`. After `changePassword()`,
+rows encrypted under the old password no longer decrypt; `recoverBlindingKey`
+then derives the scalar from the seed and rewrites the row.
+
 ```sql
 CREATE TABLE output_blinding_keys (
   output_hash TEXT PRIMARY KEY,
-  blinding_key TEXT NOT NULL,   -- the private scalar, 64 hex chars
+  blinding_key TEXT NOT NULL,   -- the scalar (64 hex) or 'enc1:' + encrypted hex
   created_at INTEGER NOT NULL
+);
+```
+
+### blinding_generations Schema
+
+The next build generation per blinding-key anchor (the canonical input outid,
+display hex). Claimed and bumped in one statement before every build that
+derives keys, so no two builds on one anchor share a generation. Not secret,
+and never cleared. IndexedDB keeps the same data in the `blindingGenerations`
+store (database version 6).
+
+```sql
+CREATE TABLE blinding_generations (
+  anchor_outid TEXT PRIMARY KEY,
+  next_generation INTEGER NOT NULL
 );
 ```
 

@@ -23,6 +23,30 @@ Format follows [Keep a Changelog](https://keepachangelog.com/); versions follow 
   is kept, so no save loses the seed. SQLite gains an `encrypted_seed` column
   and turns on `secure_delete`, so the replaced plaintext does not linger in
   free pages.
+- **Rebuilding a transaction no longer reuses its blinding keys.** The
+  deterministic blinding scalar was a pure function of (seed, anchor input,
+  ordinal), so a second build over the same inputs — a resend after a failed
+  or abandoned send — derived the same scalar for a different amount, and two
+  range proofs sharing it leak both amounts. The derivation now matches
+  navio-core's (PR #472): a 95-byte pre-image ending in a big-endian build
+  *generation*, and the wallet database claims and persists a fresh
+  generation per anchor before every build (`IWalletDB.reserveBlindingGeneration`;
+  SQLite gains a `blinding_generations` table, IndexedDB a
+  `blindingGenerations` store and version 6). Fee-estimation rounds of one
+  build share its generation; token-send estimation now uses random keys and
+  claims none. When a generation cannot be persisted, or an anchor has used
+  all 32, the build uses random, unrecoverable keys rather than a derived key
+  that could repeat. Recovery searches generations 0–31 of the new layout,
+  then the 91-byte layout of navio-sdk 0.4 and earlier, so outputs built by
+  either SDK version or by navio-core remain recoverable.
+- **An encrypted wallet's output blinding scalars are stored encrypted.**
+  `saveOutputBlindingKey` rows held the private scalar in plaintext. An
+  encrypted wallet now stores them encrypted with the wallet key (`enc1:` +
+  hex; new `KeyManager.encryptSecret()` / `decryptSecret()`), and reading one
+  needs the wallet unlocked. Plaintext rows written earlier are encrypted by
+  the new `NavioClient.sealStoredBlindingKeys()`, which the client also runs
+  the first time it touches the table while unlocked. Unencrypted wallets keep
+  plaintext. Sync is unaffected while locked: the backfill already skips.
 
 ### Changed
 
@@ -34,6 +58,21 @@ Format follows [Keep a Changelog](https://keepachangelog.com/); versions follow 
   an unencrypted wallet is saved over an encrypted one.
 - `KeyManager.setEncryptionParams()` clears private keys a plaintext seed had
   derived into memory, since the wallet it describes starts locked.
+- Blinding-key API: `deriveBlindingKey()`, `deriveBlindingScalarHex()` and
+  `buildBlindingMaterial()` take a required `generation`;
+  `BLINDING_MATERIAL_SIZE` is 95; `new BlindingKeyAllocator()` throws without
+  a reserved generation when it would derive keys. The old layout is available
+  for recovery as `deriveLegacyBlindingKey()` / `deriveLegacyBlindingScalarHex()`
+  / `buildLegacyBlindingMaterial()`. `searchBlindingKey()` and
+  `recoverBlindingKey()` report the matching `generation` (`null` for the old
+  layout). New export `MAX_GENERATION_SEARCH` (32).
+- `IWalletDB` gains `reserveBlindingGeneration()` and
+  `getAllOutputBlindingKeys()`, which other implementations of the interface
+  must add; `saveOutputBlindingKey` / `getOutputBlindingKey` now carry an
+  opaque record (see `sealOutputBlindingKey` / `openOutputBlindingKey`).
+- After `changePassword()`, stored blinding scalars encrypted under the old
+  password no longer decrypt; `recoverBlindingKey()` re-derives them from the
+  seed and rewrites the row.
 
 ## [0.4.0] - 2026-10-17
 
