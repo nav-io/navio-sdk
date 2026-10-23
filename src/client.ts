@@ -13,6 +13,7 @@ import { WalletDB, WalletDBOptions } from './wallet-db';
 import { ElectrumClient, ElectrumOptions } from './electrum';
 import { TransactionKeysSync, SyncOptions, BackgroundSyncOptions } from './tx-keys-sync';
 import { KeyManager } from './key-manager';
+import type { MnemonicDerivation } from './key-manager.types';
 import { parseBirthdayMnemonic } from './crypto/birthday-mnemonic';
 import { randomBytes } from './crypto/encryption';
 import type { IWalletDB, WalletOutput, StandingOrderRow } from './wallet-db.interface';
@@ -932,8 +933,28 @@ export interface NavioClientConfig {
    * Restore wallet from mnemonic phrase: 24 BIP39 words, or 26 words for a
    * Navio birthday mnemonic whose two extra words encode the wallet creation
    * time (the scan then starts at that week instead of from genesis).
+   *
+   * The wallet is the one navio-core and navio-electrum restore from the same
+   * phrase. A wallet created by navio-sdk 0.4.0 or earlier needs
+   * `mnemonicDerivation: 'legacy'`.
    */
   restoreFromMnemonic?: string;
+
+  /**
+   * How `restoreFromMnemonic` derives the wallet's keys (default `'core'`).
+   * Set `'legacy'` to restore a wallet created by navio-sdk 0.4.0 or
+   * earlier. Wallets already in the database keep the derivation they were
+   * stored with. See {@link MnemonicDerivation}.
+   */
+  mnemonicDerivation?: MnemonicDerivation;
+
+  /**
+   * BIP39 passphrase for `restoreFromMnemonic`, or for the wallet
+   * `createWalletIfNotExists` creates (which must use an ASCII passphrase).
+   * `'core'` derivation only. The wallet stores it with its mnemonic, so it
+   * is not needed again on reload.
+   */
+  mnemonicPassphrase?: string;
 
   /**
    * Restore a watch-only wallet from a BLSCT audit key.
@@ -1209,7 +1230,11 @@ export class NavioClient {
       }
       this.keyManager = await this.walletDB.restoreWalletFromMnemonic(
         this.config.restoreFromMnemonic,
-        restoreHeight
+        restoreHeight,
+        {
+          derivation: this.config.mnemonicDerivation,
+          passphrase: this.config.mnemonicPassphrase,
+        }
       );
 
       // Set KeyManager for sync manager (enables output detection)
@@ -1254,7 +1279,9 @@ export class NavioClient {
           creationHeight = Math.max(0, chainTip - NavioClient.CREATION_HEIGHT_MARGIN);
         }
 
-        this.keyManager = await this.walletDB.createWallet(creationHeight);
+        this.keyManager = await this.walletDB.createWallet(creationHeight, {
+          passphrase: this.config.mnemonicPassphrase,
+        });
         this.syncManager.setKeyManager(this.keyManager);
 
         // Connect to backend (an explicit creationHeight skipped the

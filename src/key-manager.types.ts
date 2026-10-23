@@ -59,6 +59,34 @@ export interface HDChain {
 export type SeedType = 'IMPORT_MASTER_KEY' | 'IMPORT_VIEW_KEY';
 
 /**
+ * How a mnemonic becomes the wallet's master key.
+ *
+ * - `'core'`: navio-core's derivation (KeyMan::SetupMnemonicFromEntropy),
+ *   also used by navio-electrum. The master key is EIP-2333
+ *   `derive_master_SK` of the 32-byte mnemonic entropy, or, with a
+ *   passphrase, of the 64-byte BIP39 seed. 24-word mnemonics (or 26-word
+ *   Navio birthday mnemonics) only.
+ * - `'legacy'`: what navio-sdk 0.4.0 and earlier did. The master key is the
+ *   mnemonic entropy read directly as a scalar. Accepts 12–24 words, no
+ *   passphrase. The same mnemonic restores a different wallet in navio-core.
+ */
+export type MnemonicDerivation = 'core' | 'legacy';
+
+/**
+ * Options for turning a mnemonic into a wallet.
+ */
+export interface MnemonicOptions {
+  /** Derivation to use (default `'core'`) */
+  derivation?: MnemonicDerivation;
+  /**
+   * BIP39 passphrase (`'core'` derivation only). As in navio-core it is
+   * used as raw UTF-8 without NFKD normalization; new wallets must use an
+   * ASCII passphrase.
+   */
+  passphrase?: string;
+}
+
+/**
  * Key storage interface for persistent storage
  */
 export interface KeyStorage {

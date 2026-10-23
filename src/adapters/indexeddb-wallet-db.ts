@@ -14,7 +14,7 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
 import { KeyManager } from '../key-manager';
-import type { HDChain, SubAddressIdentifier } from '../key-manager.types';
+import type { HDChain, SubAddressIdentifier, MnemonicOptions } from '../key-manager.types';
 import * as blsctModule from '@nav-io/navio-blsct';
 import { isStakedCommitmentOutputHex } from '../staking';
 import type {
@@ -249,7 +249,11 @@ export class IndexedDBWalletDB implements IWalletDB {
         km.loadEncryptedSeed(seedRec.encryptedSeed);
         walletFound = true;
       } else if (seedRec.mnemonic) {
-        km.setHDSeedFromMnemonic(seedRec.mnemonic);
+        // No derivation: written by navio-sdk 0.4.0 or earlier
+        km.setHDSeedFromMnemonic(seedRec.mnemonic, {
+          derivation: seedRec.derivation ?? 'legacy',
+          passphrase: seedRec.passphrase,
+        });
         walletFound = true;
       } else if (seedRec.seedHex) {
         km.loadMasterSeed(seedRec.seedHex);
@@ -332,9 +336,12 @@ export class IndexedDBWalletDB implements IWalletDB {
     return km;
   }
 
-  async createWallet(creationHeight?: number): Promise<KeyManager> {
+  async createWallet(
+    creationHeight?: number,
+    options: Pick<MnemonicOptions, 'passphrase'> = {}
+  ): Promise<KeyManager> {
     const km = new KeyManager();
-    km.generateNewMnemonic();
+    km.generateNewMnemonic(256, { passphrase: options.passphrase });
     km.newSubAddressPool(0);
     km.newSubAddressPool(-1);
     km.newSubAddressPool(-2);
@@ -397,9 +404,13 @@ export class IndexedDBWalletDB implements IWalletDB {
     return km;
   }
 
-  async restoreWalletFromMnemonic(mnemonic: string, creationHeight?: number): Promise<KeyManager> {
+  async restoreWalletFromMnemonic(
+    mnemonic: string,
+    creationHeight?: number,
+    options: MnemonicOptions = {}
+  ): Promise<KeyManager> {
     const km = new KeyManager();
-    km.setHDSeedFromMnemonic(mnemonic);
+    km.setHDSeedFromMnemonic(mnemonic, options);
     km.newSubAddressPool(0);
     km.newSubAddressPool(-1);
     km.newSubAddressPool(-2);
@@ -447,7 +458,8 @@ export class IndexedDBWalletDB implements IWalletDB {
       });
     }
 
-    // Seed: encrypted for an encrypted wallet, otherwise the mnemonic.
+    // Seed: encrypted for an encrypted wallet, otherwise the mnemonic with
+    // its derivation and passphrase.
     // put() replaces the whole record, so no plaintext field survives.
     const seed = km.getSeedForStorage();
     if (seed) {

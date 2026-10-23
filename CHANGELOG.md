@@ -23,6 +23,47 @@ Format follows [Keep a Changelog](https://keepachangelog.com/); versions follow 
   is kept, so no save loses the seed. SQLite gains an `encrypted_seed` column
   and turns on `secure_delete`, so the replaced plaintext does not linger in
   free pages.
+- **`lock()` during a pending `unlock()` now wins.** `unlock()` awaited
+  Argon2 and then set the encryption key, so a `lock()` in between was
+  silently undone and the wallet ended up unlocked. `unlock()` now commits
+  nothing until it is done and then throws `Wallet was locked during unlock`
+  if `lock()` ran meanwhile, leaving the wallet locked. `changePassword()`
+  does the same (`Wallet was locked during changePassword`) and keeps the old
+  password; it also no longer leaves keys half re-encrypted when it fails.
+
+### Fixed
+
+- **Mnemonics derive the same wallet as navio-core and navio-electrum.**
+  navio-sdk read the mnemonic entropy directly as the master key, while
+  navio-core (`KeyMan::SetupMnemonicFromEntropy`) and navio-electrum derive it
+  with EIP-2333 `derive_master_SK`, so the same phrase restored a different
+  wallet in each. New wallets and restores now use navio-core's derivation
+  (`derivation: 'core'`, the default), checked against keys from navio-core
+  and navio-electrum. Wallets created by 0.4.0 or earlier keep their keys:
+  storage without a recorded derivation loads as `'legacy'`, and restoring
+  such a phrase takes `derivation: 'legacy'`.
+- Setting a password failed to round-trip private keys whose hex starts with
+  a zero nibble: `Scalar.serialize()` drops leading zeros, and the odd-length
+  hex was mis-encoded before encryption, so the key decrypted to a different
+  value. Keys are now encrypted as 32 bytes. The cache id of an output's
+  spending key (`getSpendingKeyForOutputWithCacheBySubAddress`) used the same
+  short encoding and now uses 32 bytes too.
+
+### Added
+
+- `MnemonicDerivation` (`'core' | 'legacy'`) and `MnemonicOptions`
+  (`{ derivation?, passphrase? }`), taken by
+  `KeyManager.setHDSeedFromMnemonic()`, `mnemonicToScalar()`,
+  `generateNewMnemonic()` and `restoreWalletFromMnemonic()` on both storage
+  backends; `createWallet()` takes `{ passphrase? }`. `NavioClient` takes
+  `mnemonicDerivation` and `mnemonicPassphrase`.
+- Optional BIP39 passphrase (`'core'` only), as navio-core's
+  `mnemonic_passphrase`: used as raw UTF-8 without NFKD, and ASCII-only for a
+  new wallet.
+- `KeyManager.getMnemonicDerivation()`.
+- SQLite `master_seed` gains `mnemonic_derivation` and `mnemonic_passphrase`
+  columns; the IndexedDB `mnemonic` record gains `derivation` and
+  `passphrase`. The encrypted seed carries both too.
 
 ### Changed
 
@@ -34,6 +75,17 @@ Format follows [Keep a Changelog](https://keepachangelog.com/); versions follow 
   an unencrypted wallet is saved over an encrypted one.
 - `KeyManager.setEncryptionParams()` clears private keys a plaintext seed had
   derived into memory, since the wallet it describes starts locked.
+- **Breaking:** a mnemonic now derives a different wallet than in 0.4.0 unless
+  `derivation: 'legacy'` is passed. Stored wallets are unaffected; restoring
+  a 0.4.0 phrase (`restoreFromMnemonic`, `restoreWalletFromMnemonic()`,
+  `setHDSeedFromMnemonic()`, `mnemonicToScalar()`) needs `'legacy'`.
+- The `'core'` derivation accepts only 24-word phrases (or 26 with the
+  birthday words), like navio-core: `generateNewMnemonic()` with a strength
+  below 256, or a shorter phrase, throws unless `derivation: 'legacy'`.
+- `getSeedForStorage()` returns `{ mnemonic, derivation, passphrase? }` for a
+  mnemonic wallet. `KeyManager.setHDSeed()` clears any stored mnemonic.
+- `seedToMnemonic()`, and `getMnemonic()` on a wallet imported from a raw
+  seed, return a phrase that restores the seed only with `'legacy'`.
 
 ## [0.4.0] - 2026-10-17
 

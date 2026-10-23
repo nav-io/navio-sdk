@@ -29,7 +29,7 @@
  */
 
 import { KeyManager } from './key-manager';
-import type { HDChain, SubAddressIdentifier } from './key-manager.types';
+import type { HDChain, SubAddressIdentifier, MnemonicDerivation, MnemonicOptions } from './key-manager.types';
 import * as blsctModule from '@nav-io/navio-blsct';
 import type { IDatabaseAdapter, DatabaseAdapterOptions } from './database-adapter';
 import { createDatabaseAdapter } from './database-adapter';
@@ -219,12 +219,16 @@ export class WalletDB {
     // Master seed table (stores the mnemonic for recovery)
     // We store the mnemonic directly because Scalar.deserialize/serialize may not roundtrip correctly.
     // An encrypted wallet stores only encrypted_seed (KeyManager.getEncryptedSeed).
+    // mnemonic_derivation is NULL for rows written before derivations were
+    // versioned, which load as 'legacy'.
     await this.adapter.run(`
       CREATE TABLE IF NOT EXISTS master_seed (
         id INTEGER PRIMARY KEY,
         seed_hex TEXT,
         mnemonic TEXT,
-        encrypted_seed TEXT
+        encrypted_seed TEXT,
+        mnemonic_derivation TEXT,
+        mnemonic_passphrase TEXT
       )
     `);
 
@@ -403,6 +407,16 @@ export class WalletDB {
     } catch {
       // Column already exists – ignore
     }
+    try {
+      await this.adapter.run(`ALTER TABLE master_seed ADD COLUMN mnemonic_derivation TEXT`);
+    } catch {
+      // Column already exists – ignore
+    }
+    try {
+      await this.adapter.run(`ALTER TABLE master_seed ADD COLUMN mnemonic_passphrase TEXT`);
+    } catch {
+      // Column already exists – ignore
+    }
 
     // Migrate existing databases: add tx_type and timestamp columns if missing
     try {
@@ -514,19 +528,25 @@ export class WalletDB {
     // Load mnemonic for recovery
     // First try to load mnemonic (new format), then fall back to seed_hex (old format)
     const masterSeedResult = await this.adapter.exec(
-      'SELECT mnemonic, seed_hex, encrypted_seed FROM master_seed WHERE id = 0'
+      'SELECT mnemonic, seed_hex, encrypted_seed, mnemonic_derivation, mnemonic_passphrase FROM master_seed WHERE id = 0'
     );
     if (masterSeedResult.length > 0 && masterSeedResult[0].values.length > 0) {
       const mnemonic = masterSeedResult[0].values[0][0] as string | null;
       const seedHex = masterSeedResult[0].values[0][1] as string | null;
       const encryptedSeed = masterSeedResult[0].values[0][2] as string | null;
+      const derivation = masterSeedResult[0].values[0][3] as MnemonicDerivation | null;
+      const passphrase = masterSeedResult[0].values[0][4] as string | null;
 
       if (encryptedSeed) {
         // Decrypted on unlock()
         keyManager.loadEncryptedSeed(encryptedSeed);
         walletFound = true;
       } else if (mnemonic) {
-        keyManager.setHDSeedFromMnemonic(mnemonic);
+        // No derivation: written by navio-sdk 0.4.0 or earlier
+        keyManager.setHDSeedFromMnemonic(mnemonic, {
+          derivation: derivation ?? 'legacy',
+          passphrase: passphrase ?? undefined,
+        });
         walletFound = true;
       } else if (seedHex) {
         // Legacy: load from seed hex (may not roundtrip correctly)
@@ -643,11 +663,16 @@ export class WalletDB {
   }
 
   /**
-   * Create a new wallet
+   * Create a new wallet from a fresh 24-word mnemonic, with navio-core's
+   * derivation
    * @param creationHeight - Optional block height when wallet was created (for sync optimization)
+   * @param options - Optional BIP39 passphrase (ASCII)
    * @returns The new KeyManager instance
    */
-  async createWallet(creationHeight?: number): Promise<KeyManager> {
+  async createWallet(
+    creationHeight?: number,
+    options: Pick<MnemonicOptions, 'passphrase'> = {}
+  ): Promise<KeyManager> {
     if (!this.opened || !this.adapter) {
       throw new Error('Database not open. Call open() first.');
     }
@@ -656,7 +681,7 @@ export class WalletDB {
 
     // Generate new mnemonic and set as HD seed
     // This ensures we have a mnemonic to store for recovery
-    keyManager.generateNewMnemonic();
+    keyManager.generateNewMnemonic(256, { passphrase: options.passphrase });
 
     // Initialize sub-address pools
     keyManager.newSubAddressPool(0);
@@ -748,11 +773,19 @@ export class WalletDB {
 
   /**
    * Restore wallet from mnemonic phrase
-   * @param mnemonic - The BIP39 mnemonic phrase (12-24 words)
+   * @param mnemonic - The BIP39 mnemonic phrase: 24 words (or 26 with the
+   *   Navio birthday words); 12-24 words with `derivation: 'legacy'`
    * @param creationHeight - Optional block height to start scanning from (for faster restore)
+   * @param options - Derivation (default `'core'`, as navio-core and
+   *   navio-electrum; `'legacy'` for a wallet created by navio-sdk 0.4.0 or
+   *   earlier) and BIP39 passphrase
    * @returns The restored KeyManager instance
    */
-  async restoreWalletFromMnemonic(mnemonic: string, creationHeight?: number): Promise<KeyManager> {
+  async restoreWalletFromMnemonic(
+    mnemonic: string,
+    creationHeight?: number,
+    options: MnemonicOptions = {}
+  ): Promise<KeyManager> {
     if (!this.opened || !this.adapter) {
       throw new Error('Database not open. Call open() first.');
     }
@@ -760,7 +793,7 @@ export class WalletDB {
     const keyManager = new KeyManager();
 
     // Set seed from mnemonic
-    keyManager.setHDSeedFromMnemonic(mnemonic);
+    keyManager.setHDSeedFromMnemonic(mnemonic, options);
 
     // Initialize sub-address pools
     keyManager.newSubAddressPool(0);
@@ -1003,12 +1036,15 @@ export class WalletDB {
       const seed = km.getSeedForStorage();
       if (seed) {
         const seedStmt = await this.adapter.prepare(
-          'INSERT INTO master_seed (id, mnemonic, seed_hex, encrypted_seed) VALUES (0, ?, ?, ?)'
+          `INSERT INTO master_seed (id, mnemonic, seed_hex, encrypted_seed, mnemonic_derivation, mnemonic_passphrase)
+           VALUES (0, ?, ?, ?, ?, ?)`
         );
         await seedStmt.run([
           'mnemonic' in seed ? seed.mnemonic : null,
           'seedHex' in seed ? seed.seedHex : null,
           'encryptedSeed' in seed ? seed.encryptedSeed : null,
+          'mnemonic' in seed ? seed.derivation : null,
+          'mnemonic' in seed ? seed.passphrase ?? null : null,
         ]);
         await seedStmt.free();
       }

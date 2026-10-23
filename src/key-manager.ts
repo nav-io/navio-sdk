@@ -10,6 +10,7 @@ import { ripemd160 } from '@noble/hashes/ripemd160';
 import * as bip39 from '@scure/bip39';
 import { wordlist as englishWordlist } from '@scure/bip39/wordlists/english.js';
 import { parseBirthdayMnemonic } from './crypto/birthday-mnemonic';
+import { bip39SeedRaw, deriveMasterSK, isAsciiPassphrase } from './crypto/eip2333';
 // Import from navio-blsct using ESM
 import * as blsctModule from '@nav-io/navio-blsct';
 const Scalar = blsctModule.Scalar;
@@ -42,6 +43,8 @@ import type {
   HDChain,
   SubAddressIdentifier,
   SeedType,
+  MnemonicDerivation,
+  MnemonicOptions,
   CTxOut,
   CTxDestination,
   AmountRecoveryResult,
@@ -90,6 +93,9 @@ export class KeyManager {
   private spendPublicKey: PublicKeyType | null = null;
   private masterSeed: ScalarType | null = null;
   private storedMnemonic: string | null = null; // Store original mnemonic (avoids Scalar roundtrip issues)
+  // How storedMnemonic derives masterSeed, and its BIP39 passphrase if any
+  private mnemonicDerivation: MnemonicDerivation | null = null;
+  private mnemonicPassphrase: string | null = null;
   private spendKeyId: Uint8Array | null = null;
   private viewKeyId: Uint8Array | null = null;
   private tokenKeyId: Uint8Array | null = null;
@@ -126,6 +132,9 @@ export class KeyManager {
   // Set once an encrypted wallet has been unlocked; lets lock() drop the
   // plaintext seed, and is what storage persists in place of the mnemonic.
   private cryptedSeed: Uint8Array | null = null;
+  // Bumped by lock(), so an unlock() or changePassword() still awaiting
+  // Argon2 when lock() runs does not unlock the wallet again afterwards.
+  private lockEpoch = 0;
 
   /**
    * Check if HD is enabled (has a seed)
@@ -198,8 +207,12 @@ export class KeyManager {
    * Unlock an encrypted wallet with the password
    * This derives the encryption key and caches it for decrypting private keys
    * 
+   * A `lock()` while this is still running wins: the wallet stays locked and
+   * the call throws `Wallet was locked during unlock`.
+   *
    * @param password - The wallet password
    * @returns True if the password is correct and wallet is unlocked
+   * @throws When `lock()` was called before the unlock completed
    */
   async unlock(password: string): Promise<boolean> {
     if (!this.encrypted) {
@@ -209,29 +222,48 @@ export class KeyManager {
     if (!this.encryptionSalt || !this.passwordVerificationHash) {
       throw new Error('Wallet encryption state is corrupted');
     }
+    const salt = this.encryptionSalt;
+    const epoch = this.lockEpoch;
 
     // Verify password
-    const isValid = await verifyPassword(password, this.encryptionSalt, this.passwordVerificationHash);
+    const isValid = await verifyPassword(password, salt, this.passwordVerificationHash);
     if (!isValid) {
       return false;
     }
 
-    // Derive and cache encryption key
-    const encryptionKey = await deriveKey(password, this.encryptionSalt);
+    // Derive the encryption key, and decrypt the seed lock() dropped (or that
+    // was loaded encrypted) and the private keys. Nothing is committed until
+    // all of it is done, so a lock() in between leaves the wallet locked.
+    const encryptionKey = await deriveKey(password, salt);
+    const seed = this.cryptedSeed ? await this.decryptSeed(encryptionKey) : null;
+    const keys = await this.decryptKeys(encryptionKey);
+    this.assertNotLockedSince(epoch, 'unlock');
 
-    if (this.cryptedSeed) {
-      // Restore the seed lock() dropped (or that was loaded encrypted)
-      await this.decryptSeed(encryptionKey);
+    if (seed) {
+      this.masterSeed = seed.seed;
+      this.storedMnemonic = seed.mnemonic;
+      this.mnemonicDerivation = seed.derivation;
+      this.mnemonicPassphrase = seed.passphrase;
     }
     this.encryptionKey = encryptionKey;
+    for (const [keyIdHex, secretKey] of keys) {
+      if (!this.keys.has(keyIdHex)) {
+        this.keys.set(keyIdHex, secretKey);
+      }
+    }
+    this.addSeedKeys();
+
     if (!this.cryptedSeed) {
       // Wallets encrypted before the seed was: encrypt it now, so the next
       // save stops storing it in plaintext and lock() can drop it.
-      await this.encryptSeed();
+      this.cryptedSeed = await this.encryptSeedWith(encryptionKey, salt);
+      if (this.lockEpoch !== epoch) {
+        // lock() ran before there was an encrypted copy, so it kept the
+        // seed: lock again now that it can be dropped
+        this.lock();
+        this.assertNotLockedSince(epoch, 'unlock');
+      }
     }
-
-    // Decrypt keys that are needed in memory (view key for scanning)
-    await this.decryptEssentialKeys();
 
     return true;
   }
@@ -253,6 +285,10 @@ export class KeyManager {
       return; // Not encrypted, nothing to lock
     }
 
+    // Make an unlock() or changePassword() in flight fail instead of
+    // unlocking the wallet again when it completes
+    this.lockEpoch++;
+
     // Clear cached encryption key
     this.encryptionKey = null;
 
@@ -268,6 +304,7 @@ export class KeyManager {
     if (this.cryptedSeed) {
       this.masterSeed = null;
       this.storedMnemonic = null;
+      this.mnemonicPassphrase = null;
     }
 
     // Note: View key is kept in memory for scanning (read-only operations)
@@ -279,7 +316,8 @@ export class KeyManager {
    * @param oldPassword - The current password
    * @param newPassword - The new password
    * @returns True if password was changed successfully
-   * @throws Error if wallet is not encrypted or old password is incorrect
+   * @throws Error if wallet is not encrypted, or when `lock()` was called
+   *   before the change completed (the old password then still applies)
    */
   async changePassword(oldPassword: string, newPassword: string): Promise<boolean> {
     if (!this.encrypted) {
@@ -291,6 +329,7 @@ export class KeyManager {
     if (!unlocked) {
       return false;
     }
+    const epoch = this.lockEpoch;
 
     // Generate new salt
     const newSalt = randomBytes(SALT_LENGTH);
@@ -298,16 +337,23 @@ export class KeyManager {
     // Derive new encryption key
     const newKey = await deriveKey(newPassword, newSalt);
 
-    // Re-encrypt all keys with new key
-    await this.reEncryptAllKeys(newKey, newSalt);
+    // Re-encrypt all keys and the seed (unlock() above restored it) with the
+    // new key. Nothing is committed until all of it is done, so a lock() in
+    // between leaves the wallet locked under the old password.
+    const { cryptedKeys, cryptedOutKeys } = await this.reEncryptAllKeys(newKey, newSalt);
+    const cryptedSeed = await this.encryptSeedWith(newKey, newSalt);
+    const verificationHash = await createPasswordVerification(newPassword, newSalt);
+    this.assertNotLockedSince(epoch, 'changePassword');
 
     // Update encryption parameters
+    this.cryptedKeys = cryptedKeys;
+    this.cryptedOutKeys = cryptedOutKeys;
+    if (cryptedSeed) {
+      this.cryptedSeed = cryptedSeed;
+    }
     this.encryptionSalt = newSalt;
     this.encryptionKey = newKey;
-    this.passwordVerificationHash = await createPasswordVerification(newPassword, newSalt);
-
-    // Re-encrypt the seed (unlock() above restored it) with the new key
-    await this.encryptSeed();
+    this.passwordVerificationHash = verificationHash;
 
     return true;
   }
@@ -363,6 +409,8 @@ export class KeyManager {
     this.cryptedSeed = this.hexToBytes(encryptedSeedHex);
     this.masterSeed = null;
     this.storedMnemonic = null;
+    this.mnemonicDerivation = null;
+    this.mnemonicPassphrase = null;
   }
 
   /**
@@ -371,15 +419,37 @@ export class KeyManager {
    * otherwise. An encrypted wallet that predates seed encryption and has not
    * been unlocked since has only its plaintext seed, which is returned so a
    * save does not lose it; the next unlock encrypts it.
+   *
+   * A mnemonic record carries its derivation and BIP39 passphrase, without
+   * which it does not restore the same wallet. Inside the encrypted seed they
+   * are encrypted too.
    * @returns The record, or null when the wallet has no seed (view-only)
    */
-  getSeedForStorage(): { encryptedSeed: string } | { mnemonic: string } | { seedHex: string } | null {
+  getSeedForStorage():
+    | { encryptedSeed: string }
+    | { mnemonic: string; derivation: MnemonicDerivation; passphrase?: string }
+    | { seedHex: string }
+    | null {
     const encryptedSeed = this.getEncryptedSeed();
     if (encryptedSeed) {
       return { encryptedSeed };
     }
+    return this.plainSeedRecord();
+  }
+
+  /**
+   * The in-memory seed as a storage record (see {@link getSeedForStorage}).
+   */
+  private plainSeedRecord():
+    | { mnemonic: string; derivation: MnemonicDerivation; passphrase?: string }
+    | { seedHex: string }
+    | null {
     if (this.storedMnemonic) {
-      return { mnemonic: this.storedMnemonic };
+      return {
+        mnemonic: this.storedMnemonic,
+        derivation: this.mnemonicDerivation ?? 'legacy',
+        ...(this.mnemonicPassphrase ? { passphrase: this.mnemonicPassphrase } : {}),
+      };
     }
     if (this.masterSeed) {
       return { seedHex: this.masterSeed.serialize().padStart(64, '0') };
@@ -395,33 +465,60 @@ export class KeyManager {
     if (!this.encryptionKey || !this.encryptionSalt) {
       return;
     }
-    const record = this.storedMnemonic
-      ? { mnemonic: this.storedMnemonic }
-      : this.masterSeed
-        ? { seedHex: this.masterSeed.serialize().padStart(64, '0') }
-        : null;
-    if (!record) {
-      return;
+    const cryptedSeed = await this.encryptSeedWith(this.encryptionKey, this.encryptionSalt);
+    if (cryptedSeed) {
+      this.cryptedSeed = cryptedSeed;
     }
-    const plaintext = new TextEncoder().encode(JSON.stringify(record));
-    const encrypted = await encryptWithKey(plaintext, this.encryptionKey, this.encryptionSalt);
-    this.cryptedSeed = this.serializeEncryptedToBytes(encrypted);
   }
 
   /**
-   * Decrypt cryptedSeed back into masterSeed / storedMnemonic.
+   * Encrypt the in-memory seed record (mnemonic with its derivation and
+   * passphrase, or seed hex) with the given key.
+   * @returns The encrypted record, or null without a seed
+   */
+  private async encryptSeedWith(
+    encryptionKey: Awaited<ReturnType<typeof deriveKey>>,
+    salt: Uint8Array
+  ): Promise<Uint8Array | null> {
+    const record = this.plainSeedRecord();
+    if (!record) {
+      return null;
+    }
+    const plaintext = new TextEncoder().encode(JSON.stringify(record));
+    const encrypted = await encryptWithKey(plaintext, encryptionKey, salt);
+    return this.serializeEncryptedToBytes(encrypted);
+  }
+
+  /**
+   * Decrypt cryptedSeed. Does not change the wallet: unlock() commits the
+   * result.
+   *
+   * A record without a derivation was written before derivations were
+   * versioned, and derives with `'legacy'`.
    * @throws When the seed does not decrypt or does not match the HD chain
    */
-  private async decryptSeed(encryptionKey: Awaited<ReturnType<typeof deriveKey>>): Promise<void> {
+  private async decryptSeed(encryptionKey: Awaited<ReturnType<typeof deriveKey>>): Promise<{
+    seed: ScalarType;
+    mnemonic: string | null;
+    derivation: MnemonicDerivation | null;
+    passphrase: string | null;
+  }> {
     const encrypted = this.deserializeEncryptedFromBytes(this.cryptedSeed!);
     const plaintext = await decryptWithKey(encrypted, encryptionKey);
     const record = JSON.parse(new TextDecoder().decode(plaintext)) as {
       mnemonic?: string;
+      derivation?: MnemonicDerivation;
+      passphrase?: string;
       seedHex?: string;
     };
     let seed: ScalarType;
+    let derivation: MnemonicDerivation | null = null;
     if (record.mnemonic) {
-      seed = KeyManager.mnemonicToScalar(record.mnemonic);
+      derivation = record.derivation ?? 'legacy';
+      seed = KeyManager.mnemonicToScalar(record.mnemonic, {
+        derivation,
+        passphrase: record.passphrase,
+      });
     } else if (record.seedHex) {
       seed = Scalar.deserialize(record.seedHex);
     } else {
@@ -433,8 +530,12 @@ export class KeyManager {
     ) {
       throw new Error('Encrypted seed does not match this wallet');
     }
-    this.masterSeed = seed;
-    this.storedMnemonic = record.mnemonic ?? null;
+    return {
+      seed,
+      mnemonic: record.mnemonic ?? null,
+      derivation,
+      passphrase: record.passphrase || null,
+    };
   }
 
   /**
@@ -447,6 +548,16 @@ export class KeyManager {
   private assertUnlocked(): void {
     if (!this.isUnlocked()) {
       throw new Error('Wallet is locked');
+    }
+  }
+
+  /**
+   * Throw if lock() ran since `epoch` was read, so an operation that awaited
+   * in between does not undo it.
+   */
+  private assertNotLockedSince(epoch: number, operation: string): void {
+    if (this.lockEpoch !== epoch) {
+      throw new Error(`Wallet was locked during ${operation}`);
     }
   }
 
@@ -479,7 +590,7 @@ export class KeyManager {
 
     // Encrypt regular keys
     for (const [keyIdHex, secretKey] of this.keys) {
-      const keyBytes = this.hexToBytes(secretKey.serialize());
+      const keyBytes = this.getScalarBytes(secretKey);
       const encrypted = await encryptWithKey(keyBytes, this.encryptionKey, this.encryptionSalt);
       const publicKey = PublicKey.fromScalar(secretKey);
       this.cryptedKeys.set(keyIdHex, {
@@ -490,7 +601,7 @@ export class KeyManager {
 
     // Encrypt output keys
     for (const [outIdHex, secretKey] of this.outKeys) {
-      const keyBytes = this.hexToBytes(secretKey.serialize());
+      const keyBytes = this.getScalarBytes(secretKey);
       const encrypted = await encryptWithKey(keyBytes, this.encryptionKey, this.encryptionSalt);
       const publicKey = PublicKey.fromScalar(secretKey);
       this.cryptedOutKeys.set(outIdHex, {
@@ -508,28 +619,31 @@ export class KeyManager {
   }
 
   /**
-   * Decrypt essential keys needed for wallet operations
-   * Called after successful unlock
+   * Decrypt the private keys in cryptedKeys. Does not change the wallet:
+   * unlock() commits the result.
+   * @returns keyId (hex) -> secret key, without keys that fail to decrypt
    */
-  private async decryptEssentialKeys(): Promise<void> {
-    // Decrypt keys from cryptedKeys back into keys map
-    if (this.encryptionKey) {
-      for (const [keyIdHex, cryptedData] of this.cryptedKeys) {
-        if (!this.keys.has(keyIdHex)) {
-          try {
-            const encrypted = this.deserializeEncryptedFromBytes(cryptedData.encryptedSecret);
-            const decrypted = await decryptWithKey(encrypted, this.encryptionKey);
-            const secretKey = Scalar.deserialize(this.bytesToHex(decrypted));
-            this.keys.set(keyIdHex, secretKey);
-          } catch {
-            // Skip keys that fail to decrypt
-          }
-        }
+  private async decryptKeys(
+    encryptionKey: Awaited<ReturnType<typeof deriveKey>>
+  ): Promise<Map<string, ScalarType>> {
+    const keys = new Map<string, ScalarType>();
+    for (const [keyIdHex, cryptedData] of this.cryptedKeys) {
+      try {
+        const encrypted = this.deserializeEncryptedFromBytes(cryptedData.encryptedSecret);
+        const decrypted = await decryptWithKey(encrypted, encryptionKey);
+        keys.set(keyIdHex, Scalar.deserialize(this.bytesToHex(decrypted)));
+      } catch {
+        // Skip keys that fail to decrypt
       }
     }
+    return keys;
+  }
 
-    // Re-derive master keys from seed if available (handles wallets
-    // where keys were never stored in cryptedKeys)
+  /**
+   * Re-derive the master keys from the seed, if available (handles wallets
+   * where keys were never stored in cryptedKeys)
+   */
+  private addSeedKeys(): void {
     const masterSeed = this.unlockedSeed();
     if (masterSeed) {
       const childKey = new ChildKey(masterSeed);
@@ -546,43 +660,45 @@ export class KeyManager {
   }
 
   /**
-   * Re-encrypt all keys with a new key (for password change)
+   * Re-encrypt all keys with a new key (for password change). Does not
+   * change the wallet: changePassword() commits the result.
+   * @returns The re-encrypted cryptedKeys and cryptedOutKeys
    */
   private async reEncryptAllKeys(
     newKey: Awaited<ReturnType<typeof deriveKey>>,
     newSalt: Uint8Array
-  ): Promise<void> {
-    if (!this.encryptionKey) {
+  ): Promise<{
+    cryptedKeys: Map<string, { publicKey: PublicKeyType; encryptedSecret: Uint8Array }>;
+    cryptedOutKeys: Map<string, { publicKey: PublicKeyType; encryptedSecret: Uint8Array }>;
+  }> {
+    const oldKey = this.encryptionKey;
+    if (!oldKey) {
       throw new Error('Wallet must be unlocked to change password');
     }
 
-    // Re-encrypt regular keys
-    for (const [keyIdHex, cryptedData] of this.cryptedKeys) {
-      // Decrypt with old key
-      const encrypted = this.deserializeEncryptedFromBytes(cryptedData.encryptedSecret);
-      const decrypted = await decryptWithKey(encrypted, this.encryptionKey);
-      
-      // Re-encrypt with new key
-      const reEncrypted = await encryptWithKey(decrypted, newKey, newSalt);
-      this.cryptedKeys.set(keyIdHex, {
-        publicKey: cryptedData.publicKey,
-        encryptedSecret: this.serializeEncryptedToBytes(reEncrypted),
-      });
-    }
+    const reEncrypt = async (
+      crypted: Map<string, { publicKey: PublicKeyType; encryptedSecret: Uint8Array }>
+    ) => {
+      const result = new Map<string, { publicKey: PublicKeyType; encryptedSecret: Uint8Array }>();
+      for (const [idHex, cryptedData] of crypted) {
+        // Decrypt with old key
+        const encrypted = this.deserializeEncryptedFromBytes(cryptedData.encryptedSecret);
+        const decrypted = await decryptWithKey(encrypted, oldKey);
 
-    // Re-encrypt output keys
-    for (const [outIdHex, cryptedData] of this.cryptedOutKeys) {
-      // Decrypt with old key
-      const encrypted = this.deserializeEncryptedFromBytes(cryptedData.encryptedSecret);
-      const decrypted = await decryptWithKey(encrypted, this.encryptionKey);
-      
-      // Re-encrypt with new key
-      const reEncrypted = await encryptWithKey(decrypted, newKey, newSalt);
-      this.cryptedOutKeys.set(outIdHex, {
-        publicKey: cryptedData.publicKey,
-        encryptedSecret: this.serializeEncryptedToBytes(reEncrypted),
-      });
-    }
+        // Re-encrypt with new key
+        const reEncrypted = await encryptWithKey(decrypted, newKey, newSalt);
+        result.set(idHex, {
+          publicKey: cryptedData.publicKey,
+          encryptedSecret: this.serializeEncryptedToBytes(reEncrypted),
+        });
+      }
+      return result;
+    };
+
+    return {
+      cryptedKeys: await reEncrypt(this.cryptedKeys),
+      cryptedOutKeys: await reEncrypt(this.cryptedOutKeys),
+    };
   }
 
   /**
@@ -622,8 +738,12 @@ export class KeyManager {
    * @param seed - The master seed Scalar
    */
   setHDSeed(seed: ScalarType): void {
-    // Store master seed
+    // Store master seed. A seed set directly has no mnemonic;
+    // setHDSeedFromMnemonic sets these after calling this.
     this.masterSeed = seed;
+    this.storedMnemonic = null;
+    this.mnemonicDerivation = null;
+    this.mnemonicPassphrase = null;
 
     // Derive keys following the same path as navio-core using navio-blsct API
     // FromSeedToChildKey: ChildKey(seed) with index 130
@@ -811,7 +931,10 @@ export class KeyManager {
 
   /**
    * Convert a seed (Scalar) to a mnemonic phrase
-   * Note: This converts the 32-byte scalar to mnemonic using it as entropy
+   * Note: This converts the 32-byte scalar to mnemonic using it as entropy.
+   * That is the inverse of the `'legacy'` derivation only: the phrase
+   * restores this seed with `derivation: 'legacy'`. The `'core'` derivation
+   * hashes the entropy, so a master key has no `'core'` mnemonic.
    * @param seed - The seed Scalar
    * @returns A 24-word mnemonic phrase
    */
@@ -819,59 +942,126 @@ export class KeyManager {
     // Get the 32-byte seed value as entropy
     const seedHex = seed.serialize().padStart(64, '0');
     const seedBytes = hexToUint8Array(seedHex);
-    
+
     if (seedBytes.length !== 32) {
       throw new Error(`Invalid seed length: ${seedBytes.length}, expected 32 bytes`);
     }
-    
+
     return bip39.entropyToMnemonic(seedBytes, englishWordlist);
   }
 
   /**
-   * Convert a mnemonic phrase to a Scalar seed
-   * For direct entropy-based conversion (mnemonic as entropy, not BIP39 derivation)
+   * Convert a mnemonic phrase to the wallet's master seed (Scalar)
+   *
+   * With the default `'core'` derivation this is navio-core's
+   * KeyMan::SetupMnemonicFromEntropy: EIP-2333 `derive_master_SK` of the
+   * 32-byte entropy, or, with a passphrase, of the BIP39 seed of the 24-word
+   * sentence. It needs a 24-word mnemonic. With `'legacy'` the entropy is
+   * read directly as the scalar, as navio-sdk 0.4.0 and earlier did.
+   *
+   * A 26-word Navio birthday mnemonic derives from its 24-word base, so the
+   * wallet is identical to a plain 24-word restore.
+   *
    * @param mnemonic - The mnemonic phrase
+   * @param options - Derivation (default `'core'`) and BIP39 passphrase
    * @returns A Scalar seed
+   * @throws On an invalid phrase, a `'core'` phrase that is not 24 (or 26)
+   *   words, or a passphrase with `'legacy'`
    */
-  static mnemonicToScalar(mnemonic: string): ScalarType {
+  static mnemonicToScalar(mnemonic: string, options: MnemonicOptions = {}): ScalarType {
+    const derivation = options.derivation ?? 'core';
+    const passphrase = options.passphrase ?? '';
+    if (derivation !== 'core' && derivation !== 'legacy') {
+      throw new Error(`Unknown mnemonic derivation: ${derivation}`);
+    }
     if (!KeyManager.validateMnemonic(mnemonic)) {
       throw new Error('Invalid mnemonic phrase');
     }
 
     // Convert mnemonic back to entropy (32 bytes for a 24-word mnemonic).
-    // 26-word Navio birthday mnemonics derive from their 24-word base, so
-    // the wallet is identical to a plain BIP39 restore.
+    // 26-word Navio birthday mnemonics derive from their 24-word base.
     const entropy = parseBirthdayMnemonic(mnemonic).entropy;
-    const entropyHex = uint8ArrayToHex(entropy);
 
-    return Scalar.deserialize(entropyHex);
+    if (derivation === 'legacy') {
+      if (passphrase) {
+        throw new Error("A mnemonic passphrase requires derivation 'core'");
+      }
+      return Scalar.deserialize(uint8ArrayToHex(entropy));
+    }
+
+    if (entropy.length !== 32) {
+      throw new Error(
+        "Derivation 'core' needs a 24-word mnemonic (or 26 with the birthday words); " +
+          "use derivation 'legacy' for a shorter one created by navio-sdk 0.4.0 or earlier"
+      );
+    }
+    // navio-core stretches the 24-word sentence (never the birthday words)
+    const ikm = passphrase
+      ? bip39SeedRaw(bip39.entropyToMnemonic(entropy, englishWordlist), passphrase)
+      : entropy;
+    return Scalar.deserialize(uint8ArrayToHex(deriveMasterSK(ikm)));
   }
 
   /**
    * Generate a new mnemonic and set it as the HD seed
-   * @param strength - Entropy strength in bits (default: 256 for 24 words)
+   *
+   * The wallet uses navio-core's derivation, so navio-core and
+   * navio-electrum restore the same wallet from the phrase.
+   *
+   * @param strength - Entropy strength in bits (default: 256 for 24 words).
+   *   Only 256 works with the `'core'` derivation.
+   * @param options - Derivation (default `'core'`) and BIP39 passphrase. A
+   *   new wallet's passphrase must be ASCII, as navio-core requires.
    * @returns The mnemonic phrase that can be used to recover this wallet
    */
-  generateNewMnemonic(strength: 128 | 160 | 192 | 224 | 256 = 256): string {
+  generateNewMnemonic(
+    strength: 128 | 160 | 192 | 224 | 256 = 256,
+    options: MnemonicOptions = {}
+  ): string {
+    if (options.passphrase && !isAsciiPassphrase(options.passphrase)) {
+      throw new Error('The mnemonic passphrase must be ASCII when creating a new wallet');
+    }
     const mnemonic = KeyManager.generateMnemonic(strength);
-    this.setHDSeedFromMnemonic(mnemonic);
+    this.setHDSeedFromMnemonic(mnemonic, options);
     return this.getMnemonic();
   }
 
   /**
    * Set the HD seed from a mnemonic phrase
-   * Uses direct entropy conversion (mnemonic words encode the seed directly)
+   *
+   * Restores the wallet navio-core and navio-electrum restore from the same
+   * phrase (and passphrase). A wallet created by navio-sdk 0.4.0 or earlier
+   * needs `derivation: 'legacy'`. See {@link mnemonicToScalar}.
+   *
    * @param mnemonic - The mnemonic phrase
+   * @param options - Derivation (default `'core'`) and BIP39 passphrase
    */
-  setHDSeedFromMnemonic(mnemonic: string): void {
-    const seed = KeyManager.mnemonicToScalar(mnemonic);
+  setHDSeedFromMnemonic(mnemonic: string, options: MnemonicOptions = {}): void {
+    const seed = KeyManager.mnemonicToScalar(mnemonic, options);
     this.setHDSeed(seed);
     // Store the original mnemonic to avoid Scalar serialization roundtrip issues
     this.storedMnemonic = mnemonic;
+    this.mnemonicDerivation = options.derivation ?? 'core';
+    this.mnemonicPassphrase = options.passphrase || null;
+  }
+
+  /**
+   * How the wallet's mnemonic derives its keys.
+   * @returns The derivation, or null for a wallet without a mnemonic (one
+   *   imported from a seed or audit key) and for an encrypted wallet loaded
+   *   from storage that has not been unlocked yet
+   */
+  getMnemonicDerivation(): MnemonicDerivation | null {
+    return this.mnemonicDerivation;
   }
 
   /**
    * Get the mnemonic phrase for the current seed
+   *
+   * A wallet imported from a raw seed has no mnemonic; for it this returns
+   * {@link seedToMnemonic} of the seed, which restores the wallet only with
+   * `derivation: 'legacy'`.
+   *
    * @returns The mnemonic phrase for the current master seed
    * @throws When the wallet is locked
    */
@@ -884,8 +1074,10 @@ export class KeyManager {
     if (!this.masterSeed) {
       throw new Error('No master seed available');
     }
-    // Fallback: derive mnemonic from Scalar (may be incorrect due to modular reduction)
-    console.warn('[KeyManager] getMnemonic - no stored mnemonic, deriving from Scalar (may be incorrect)');
+    // Fallback: the seed's entropy encoding, valid only for the legacy derivation
+    console.warn(
+      "[KeyManager] getMnemonic - no stored mnemonic; the phrase derived from the seed restores it only with derivation 'legacy'"
+    );
     return KeyManager.seedToMnemonic(this.masterSeed);
   }
 
@@ -2565,7 +2757,8 @@ export class KeyManager {
    * Get bytes from Scalar
    */
   private getScalarBytes(scalar: ScalarType): Uint8Array {
-    return hexToUint8Array(scalar.serialize());
+    // serialize() drops leading zero nibbles; pad back to 32 bytes
+    return hexToUint8Array(scalar.serialize().padStart(64, '0'));
   }
 
   /**
