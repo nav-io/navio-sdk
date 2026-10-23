@@ -3,6 +3,38 @@
 All notable changes to navio-sdk are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/); versions follow [SemVer](https://semver.org/).
 
+## [Unreleased]
+
+### Security
+
+- **Locking a wallet now drops its seed.** `KeyManager.lock()` left the
+  master seed and mnemonic in memory, and `getMnemonic()`,
+  `getMasterSeedHex()` and `getMasterSeedKey()` returned them without the
+  password, as did the `getSpendingKey()` and `getMasterTokenKey()` fallbacks
+  that re-derive from the seed. `lock()` now drops the seed, those methods
+  throw `Wallet is locked` while locked, and `unlock()` decrypts the seed
+  again. The view key stays in memory, so sync keeps working while locked.
+- **An encrypted wallet's seed is stored encrypted.** `WalletDB` and
+  `IndexedDBWalletDB` stored the mnemonic in plaintext even when the wallet
+  had a password. They now store it encrypted with the wallet password
+  (`KeyManager.getEncryptedSeed()` / `loadEncryptedSeed()` /
+  `getSeedForStorage()`). A wallet saved by an earlier version is migrated on
+  its first `unlock()` and the next `saveWallet()`; until then its plaintext
+  is kept, so no save loses the seed. SQLite gains an `encrypted_seed` column
+  and turns on `secure_delete`, so the replaced plaintext does not linger in
+  free pages.
+
+### Changed
+
+- `getMnemonic()`, `getMasterSeedHex()` and `getMasterSeedKey()` throw while
+  an encrypted wallet is locked. Unlock before showing a backup phrase.
+- `WalletDB.saveWallet()` / `loadWallet()` (SQLite) now save and restore the
+  encryption metadata, as `IndexedDBWalletDB` already did, so an encrypted
+  wallet reloads encrypted and locked. Both backends drop the metadata when
+  an unencrypted wallet is saved over an encrypted one.
+- `KeyManager.setEncryptionParams()` clears private keys a plaintext seed had
+  derived into memory, since the wallet it describes starts locked.
+
 ## [0.4.0] - 2026-10-17
 
 ### Added

@@ -122,6 +122,10 @@ export class KeyManager {
   private encryptionSalt: Uint8Array | null = null;
   private passwordVerificationHash: Uint8Array | null = null;
   private encryptionKey: Awaited<ReturnType<typeof deriveKey>> | null = null;
+  // The master seed (mnemonic or seed hex) encrypted with the wallet password.
+  // Set once an encrypted wallet has been unlocked; lets lock() drop the
+  // plaintext seed, and is what storage persists in place of the mnemonic.
+  private cryptedSeed: Uint8Array | null = null;
 
   /**
    * Check if HD is enabled (has a seed)
@@ -183,6 +187,9 @@ export class KeyManager {
     // Encrypt all existing keys
     await this.encryptAllKeys();
 
+    // Encrypt the seed so lock() can drop the plaintext
+    await this.encryptSeed();
+
     // Mark as encrypted
     this.encrypted = true;
   }
@@ -210,7 +217,18 @@ export class KeyManager {
     }
 
     // Derive and cache encryption key
-    this.encryptionKey = await deriveKey(password, this.encryptionSalt);
+    const encryptionKey = await deriveKey(password, this.encryptionSalt);
+
+    if (this.cryptedSeed) {
+      // Restore the seed lock() dropped (or that was loaded encrypted)
+      await this.decryptSeed(encryptionKey);
+    }
+    this.encryptionKey = encryptionKey;
+    if (!this.cryptedSeed) {
+      // Wallets encrypted before the seed was: encrypt it now, so the next
+      // save stops storing it in plaintext and lock() can drop it.
+      await this.encryptSeed();
+    }
 
     // Decrypt keys that are needed in memory (view key for scanning)
     await this.decryptEssentialKeys();
@@ -219,8 +237,16 @@ export class KeyManager {
   }
 
   /**
-   * Lock the wallet, clearing the cached encryption key and unencrypted keys
-   * After locking, private keys cannot be accessed without unlocking again
+   * Lock the wallet, clearing the cached encryption key, the unencrypted keys
+   * and the master seed / mnemonic. After locking, private keys and the seed
+   * cannot be accessed without unlocking again: `getMnemonic()`,
+   * `getMasterSeedHex()` and `getMasterSeedKey()` throw.
+   *
+   * The view key and public keys stay in memory, so scanning and sync keep
+   * working while locked.
+   *
+   * JavaScript cannot overwrite memory: this drops the references, and the
+   * garbage collector reclaims the values at some later point.
    */
   lock(): void {
     if (!this.encrypted) {
@@ -234,6 +260,15 @@ export class KeyManager {
     // These are stored encrypted in cryptedKeys/cryptedOutKeys
     this.keys.clear();
     this.outKeys.clear();
+
+    // Drop the seed; unlock() restores it from cryptedSeed. Without an
+    // encrypted copy (a wallet loaded from storage that predates seed
+    // encryption and was never unlocked) the plaintext is the only copy, so
+    // it stays, but the getters still refuse it while locked.
+    if (this.cryptedSeed) {
+      this.masterSeed = null;
+      this.storedMnemonic = null;
+    }
 
     // Note: View key is kept in memory for scanning (read-only operations)
   }
@@ -271,6 +306,9 @@ export class KeyManager {
     this.encryptionKey = newKey;
     this.passwordVerificationHash = await createPasswordVerification(newPassword, newSalt);
 
+    // Re-encrypt the seed (unlock() above restored it) with the new key
+    await this.encryptSeed();
+
     return true;
   }
 
@@ -298,6 +336,118 @@ export class KeyManager {
     this.encryptionSalt = this.hexToBytes(salt);
     this.passwordVerificationHash = this.hexToBytes(verificationHash);
     this.encrypted = true;
+    // A wallet loaded from storage starts locked: drop any private keys a
+    // plaintext seed loaded earlier derived into memory.
+    if (!this.encryptionKey) {
+      this.keys.clear();
+      this.outKeys.clear();
+    }
+  }
+
+  /**
+   * The master seed encrypted with the wallet password, for storage.
+   * @returns Hex of the encrypted seed, or null when the wallet is not
+   *   encrypted, has no seed, or predates seed encryption and has not been
+   *   unlocked since
+   */
+  getEncryptedSeed(): string | null {
+    return this.encrypted && this.cryptedSeed ? this.bytesToHex(this.cryptedSeed) : null;
+  }
+
+  /**
+   * Load the encrypted master seed from storage. The seed itself is decrypted
+   * on `unlock()`.
+   * @param encryptedSeedHex - Hex from {@link getEncryptedSeed}
+   */
+  loadEncryptedSeed(encryptedSeedHex: string): void {
+    this.cryptedSeed = this.hexToBytes(encryptedSeedHex);
+    this.masterSeed = null;
+    this.storedMnemonic = null;
+  }
+
+  /**
+   * The seed record storage adapters persist: the encrypted seed for an
+   * encrypted wallet, the mnemonic (or, for legacy wallets, the seed hex)
+   * otherwise. An encrypted wallet that predates seed encryption and has not
+   * been unlocked since has only its plaintext seed, which is returned so a
+   * save does not lose it; the next unlock encrypts it.
+   * @returns The record, or null when the wallet has no seed (view-only)
+   */
+  getSeedForStorage(): { encryptedSeed: string } | { mnemonic: string } | { seedHex: string } | null {
+    const encryptedSeed = this.getEncryptedSeed();
+    if (encryptedSeed) {
+      return { encryptedSeed };
+    }
+    if (this.storedMnemonic) {
+      return { mnemonic: this.storedMnemonic };
+    }
+    if (this.masterSeed) {
+      return { seedHex: this.masterSeed.serialize().padStart(64, '0') };
+    }
+    return null;
+  }
+
+  /**
+   * Encrypt the in-memory seed into cryptedSeed. No-op without a seed or
+   * encryption key.
+   */
+  private async encryptSeed(): Promise<void> {
+    if (!this.encryptionKey || !this.encryptionSalt) {
+      return;
+    }
+    const record = this.storedMnemonic
+      ? { mnemonic: this.storedMnemonic }
+      : this.masterSeed
+        ? { seedHex: this.masterSeed.serialize().padStart(64, '0') }
+        : null;
+    if (!record) {
+      return;
+    }
+    const plaintext = new TextEncoder().encode(JSON.stringify(record));
+    const encrypted = await encryptWithKey(plaintext, this.encryptionKey, this.encryptionSalt);
+    this.cryptedSeed = this.serializeEncryptedToBytes(encrypted);
+  }
+
+  /**
+   * Decrypt cryptedSeed back into masterSeed / storedMnemonic.
+   * @throws When the seed does not decrypt or does not match the HD chain
+   */
+  private async decryptSeed(encryptionKey: Awaited<ReturnType<typeof deriveKey>>): Promise<void> {
+    const encrypted = this.deserializeEncryptedFromBytes(this.cryptedSeed!);
+    const plaintext = await decryptWithKey(encrypted, encryptionKey);
+    const record = JSON.parse(new TextDecoder().decode(plaintext)) as {
+      mnemonic?: string;
+      seedHex?: string;
+    };
+    let seed: ScalarType;
+    if (record.mnemonic) {
+      seed = KeyManager.mnemonicToScalar(record.mnemonic);
+    } else if (record.seedHex) {
+      seed = Scalar.deserialize(record.seedHex);
+    } else {
+      throw new Error('Encrypted seed is corrupted');
+    }
+    if (
+      this.seedId &&
+      this.bytesToHex(this.hash160(this.getPublicKeyFromScalar(seed))) !== this.bytesToHex(this.seedId)
+    ) {
+      throw new Error('Encrypted seed does not match this wallet');
+    }
+    this.masterSeed = seed;
+    this.storedMnemonic = record.mnemonic ?? null;
+  }
+
+  /**
+   * The master seed, or null while the wallet is locked or has no seed.
+   */
+  private unlockedSeed(): ScalarType | null {
+    return this.isUnlocked() ? this.masterSeed : null;
+  }
+
+  private assertUnlocked(): void {
+    if (!this.isUnlocked()) {
+      throw new Error('Wallet is locked');
+    }
   }
 
   /**
@@ -353,8 +503,8 @@ export class KeyManager {
     this.keys.clear();
     this.outKeys.clear();
 
-    // Note: We keep the view key in memory for scanning, even when encrypted
-    // The master seed is NOT stored encrypted - it should be backed up separately
+    // Note: We keep the view key in memory for scanning, even when encrypted.
+    // The master seed is encrypted separately (encryptSeed).
   }
 
   /**
@@ -380,15 +530,16 @@ export class KeyManager {
 
     // Re-derive master keys from seed if available (handles wallets
     // where keys were never stored in cryptedKeys)
-    if (this.masterSeed) {
-      const childKey = new ChildKey(this.masterSeed);
+    const masterSeed = this.unlockedSeed();
+    if (masterSeed) {
+      const childKey = new ChildKey(masterSeed);
       const txKey = childKey.toTxKey();
       const spendKey = Scalar.deserialize(txKey.toSpendingKey().serialize());
       const blindingKey = childKey.toBlindingKey();
       const tokenKey = childKey.toTokenKey();
 
       this.addKeyPubKeyInner(spendKey, PublicKey.fromScalar(spendKey));
-      this.addKeyPubKeyInner(this.masterSeed, PublicKey.fromScalar(this.masterSeed));
+      this.addKeyPubKeyInner(masterSeed, PublicKey.fromScalar(masterSeed));
       this.addKeyPubKeyInner(tokenKey, PublicKey.fromScalar(tokenKey));
       this.addKeyPubKeyInner(blindingKey, PublicKey.fromScalar(blindingKey));
     }
@@ -598,11 +749,13 @@ export class KeyManager {
   /**
    * Get the master seed key
    * @returns The master seed Scalar
+   * @throws When the wallet is locked
    */
   getMasterSeedKey(): ScalarType {
     if (!this.isHDEnabled()) {
       throw new Error('HD is not enabled');
     }
+    this.assertUnlocked();
     if (!this.masterSeed) {
       throw new Error('Master seed key not available');
     }
@@ -720,8 +873,10 @@ export class KeyManager {
   /**
    * Get the mnemonic phrase for the current seed
    * @returns The mnemonic phrase for the current master seed
+   * @throws When the wallet is locked
    */
   getMnemonic(): string {
+    this.assertUnlocked();
     // Return stored mnemonic if available (avoids Scalar serialization roundtrip issues)
     if (this.storedMnemonic) {
       return this.storedMnemonic;
@@ -737,8 +892,10 @@ export class KeyManager {
   /**
    * Get the master seed as a hex string
    * @returns The master seed as a 64-character hex string (32 bytes)
+   * @throws When the wallet is locked
    */
   getMasterSeedHex(): string {
+    this.assertUnlocked();
     if (!this.masterSeed) {
       throw new Error('No master seed available');
     }
@@ -1621,8 +1778,9 @@ export class KeyManager {
 
     // Fallback: re-derive from master seed (handles encrypted wallets where
     // the key was never stored in cryptedKeys due to earlier bug)
-    if (this.masterSeed) {
-      const childKey = new ChildKey(this.masterSeed);
+    const masterSeed = this.unlockedSeed();
+    if (masterSeed) {
+      const childKey = new ChildKey(masterSeed);
       const txKey = childKey.toTxKey();
       const spendKey = Scalar.deserialize(txKey.toSpendingKey().serialize());
       const spendPublicKey = PublicKey.fromScalar(spendKey);
@@ -1976,8 +2134,9 @@ export class KeyManager {
       return key;
     }
 
-    if (this.masterSeed) {
-      const childKey = new ChildKey(this.masterSeed);
+    const masterSeed = this.unlockedSeed();
+    if (masterSeed) {
+      const childKey = new ChildKey(masterSeed);
       const tokenKey = childKey.toTokenKey();
       this.addKeyPubKeyInner(tokenKey, PublicKey.fromScalar(tokenKey));
       return tokenKey;

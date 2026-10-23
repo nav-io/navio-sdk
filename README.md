@@ -875,10 +875,11 @@ const isUnlocked = keyManager.isUnlocked();
 // Set a password (encrypts the wallet)
 await keyManager.setPassword('my-secure-password');
 
-// Lock the wallet (clears cached encryption key)
+// Lock the wallet (clears the cached encryption key, private keys and seed)
 keyManager.lock();
+keyManager.getMnemonic(); // throws 'Wallet is locked'
 
-// Unlock the wallet
+// Unlock the wallet (decrypts the seed again)
 const success = await keyManager.unlock('my-secure-password');
 if (!success) {
   console.log('Wrong password');
@@ -891,9 +892,22 @@ const changed = await keyManager.changePassword('old-password', 'new-password');
 const params = keyManager.getEncryptionParams();
 // { salt: 'hex...', verificationHash: 'hex...' }
 
-// Restore encryption state from database
+// Restore encryption state from database (the wallet starts locked)
 keyManager.setEncryptionParams(params.salt, params.verificationHash);
 ```
+
+While an encrypted wallet is locked, `getMnemonic()`, `getMasterSeedHex()`,
+`getMasterSeedKey()`, `getSpendingKey()` and `getMasterTokenKey()` throw, and
+the seed is not held in memory. The view key and public keys stay loaded, so
+sync, balances and receive addresses keep working. JavaScript cannot overwrite
+memory, so `lock()` drops the references and leaves the values for the garbage
+collector to reclaim.
+
+`WalletDB` and `IndexedDBWalletDB` store an encrypted wallet's seed encrypted
+with the password (never the plaintext mnemonic), together with its encryption
+metadata, and `loadWallet()` returns it locked. A wallet saved by 0.4.0 or
+earlier still has its mnemonic stored in plaintext: it is encrypted on the
+first `unlock()`, and the next `saveWallet()` replaces the plaintext.
 
 ---
 

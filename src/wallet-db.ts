@@ -118,6 +118,14 @@ export class WalletDB {
     // Open the database
     await this.adapter.open(path, data);
 
+    // Zero deleted content, so a plaintext mnemonic replaced by its encrypted
+    // form does not linger in free pages of the saved file.
+    try {
+      await this.adapter.run('PRAGMA secure_delete = ON');
+    } catch {
+      // Not supported by this backend – ignore
+    }
+
     // Create schema
     await this.createSchema();
     this.opened = true;
@@ -209,13 +217,14 @@ export class WalletDB {
     `);
 
     // Master seed table (stores the mnemonic for recovery)
-    // Note: This should be encrypted when wallet encryption is enabled
-    // We store the mnemonic directly because Scalar.deserialize/serialize may not roundtrip correctly
+    // We store the mnemonic directly because Scalar.deserialize/serialize may not roundtrip correctly.
+    // An encrypted wallet stores only encrypted_seed (KeyManager.getEncryptedSeed).
     await this.adapter.run(`
       CREATE TABLE IF NOT EXISTS master_seed (
         id INTEGER PRIMARY KEY,
         seed_hex TEXT,
-        mnemonic TEXT
+        mnemonic TEXT,
+        encrypted_seed TEXT
       )
     `);
 
@@ -389,6 +398,12 @@ export class WalletDB {
       )
     `);
 
+    try {
+      await this.adapter.run(`ALTER TABLE master_seed ADD COLUMN encrypted_seed TEXT`);
+    } catch {
+      // Column already exists – ignore
+    }
+
     // Migrate existing databases: add tx_type and timestamp columns if missing
     try {
       await this.adapter.run(`ALTER TABLE wallet_outputs ADD COLUMN tx_type TEXT NOT NULL DEFAULT 'received'`);
@@ -499,13 +514,18 @@ export class WalletDB {
     // Load mnemonic for recovery
     // First try to load mnemonic (new format), then fall back to seed_hex (old format)
     const masterSeedResult = await this.adapter.exec(
-      'SELECT mnemonic, seed_hex FROM master_seed WHERE id = 0'
+      'SELECT mnemonic, seed_hex, encrypted_seed FROM master_seed WHERE id = 0'
     );
     if (masterSeedResult.length > 0 && masterSeedResult[0].values.length > 0) {
       const mnemonic = masterSeedResult[0].values[0][0] as string | null;
       const seedHex = masterSeedResult[0].values[0][1] as string | null;
-      
-      if (mnemonic) {
+      const encryptedSeed = masterSeedResult[0].values[0][2] as string | null;
+
+      if (encryptedSeed) {
+        // Decrypted on unlock()
+        keyManager.loadEncryptedSeed(encryptedSeed);
+        walletFound = true;
+      } else if (mnemonic) {
         keyManager.setHDSeedFromMnemonic(mnemonic);
         walletFound = true;
       } else if (seedHex) {
@@ -610,6 +630,12 @@ export class WalletDB {
         };
         keyManager.loadSubAddress(hashId, id);
       }
+    }
+
+    // An encrypted wallet loads locked
+    const encryptionMetadata = await this.getEncryptionMetadata();
+    if (encryptionMetadata) {
+      keyManager.setEncryptionParams(encryptionMetadata.salt, encryptionMetadata.verificationHash);
     }
 
     this.keyManager = keyManager;
@@ -950,6 +976,7 @@ export class WalletDB {
       await this.adapter.run('DELETE FROM sub_address_pool');
       await this.adapter.run('DELETE FROM sub_address_counter');
       await this.adapter.run('DELETE FROM key_metadata');
+      await this.adapter.run('DELETE FROM encryption_metadata');
 
       // Save HD chain
       const hdChain = km.getHDChain();
@@ -969,17 +996,30 @@ export class WalletDB {
         await stmt.free();
       }
 
-      // Save mnemonic for recovery when reopening wallet
-      // We store the mnemonic directly because Scalar.deserialize/serialize may not roundtrip correctly
-      try {
-        const mnemonic = km.getMnemonic();
+      // Save the seed for recovery when reopening wallet: encrypted for an
+      // encrypted wallet, otherwise the mnemonic (stored directly because
+      // Scalar.deserialize/serialize may not roundtrip correctly).
+      // None for a view-only wallet.
+      const seed = km.getSeedForStorage();
+      if (seed) {
         const seedStmt = await this.adapter.prepare(
-          'INSERT INTO master_seed (id, mnemonic) VALUES (0, ?)'
+          'INSERT INTO master_seed (id, mnemonic, seed_hex, encrypted_seed) VALUES (0, ?, ?, ?)'
         );
-        await seedStmt.run([mnemonic]);
+        await seedStmt.run([
+          'mnemonic' in seed ? seed.mnemonic : null,
+          'seedHex' in seed ? seed.seedHex : null,
+          'encryptedSeed' in seed ? seed.encryptedSeed : null,
+        ]);
         await seedStmt.free();
-      } catch {
-        // Mnemonic not available (e.g., view-only wallet)
+      }
+
+      const encryptionParams = km.getEncryptionParams();
+      if (encryptionParams) {
+        await this.adapter.run(
+          `INSERT INTO encryption_metadata (id, is_encrypted, salt, verification_hash, encryption_version)
+           VALUES (0, 1, ?, ?, 1)`,
+          [encryptionParams.salt, encryptionParams.verificationHash]
+        );
       }
 
       // Save view key

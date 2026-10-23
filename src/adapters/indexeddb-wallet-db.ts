@@ -244,7 +244,11 @@ export class IndexedDBWalletDB implements IWalletDB {
 
     const seedRec = await this.get<any>('config', 'mnemonic');
     if (seedRec) {
-      if (seedRec.mnemonic) {
+      if (seedRec.encryptedSeed) {
+        // Decrypted on unlock()
+        km.loadEncryptedSeed(seedRec.encryptedSeed);
+        walletFound = true;
+      } else if (seedRec.mnemonic) {
         km.setHDSeedFromMnemonic(seedRec.mnemonic);
         walletFound = true;
       } else if (seedRec.seedHex) {
@@ -443,11 +447,28 @@ export class IndexedDBWalletDB implements IWalletDB {
       });
     }
 
-    // Mnemonic
-    try {
-      const mnemonic = km.getMnemonic();
-      tx.objectStore('config').put({ key: 'mnemonic', mnemonic });
-    } catch { /* not available */ }
+    // Seed: encrypted for an encrypted wallet, otherwise the mnemonic.
+    // put() replaces the whole record, so no plaintext field survives.
+    const seed = km.getSeedForStorage();
+    if (seed) {
+      tx.objectStore('config').put({ key: 'mnemonic', ...seed });
+    } else {
+      tx.objectStore('config').delete('mnemonic');
+    }
+
+    // Encryption metadata, in the same transaction as the seed it unlocks
+    const encryptionParams = km.getEncryptionParams();
+    if (encryptionParams) {
+      tx.objectStore('config').put({
+        key: 'encryptionMetadata',
+        isEncrypted: true,
+        salt: encryptionParams.salt,
+        verificationHash: encryptionParams.verificationHash,
+        version: 1,
+      });
+    } else {
+      tx.objectStore('config').delete('encryptionMetadata');
+    }
 
     // View key
     try {
@@ -475,13 +496,6 @@ export class IndexedDBWalletDB implements IWalletDB {
     }
 
     await idbTx(tx);
-
-    if (km.isEncrypted()) {
-      const params = km.getEncryptionParams();
-      if (params) {
-        await this.saveEncryptionMetadata(params.salt, params.verificationHash);
-      }
-    }
   }
 
   async saveSubAddresses(entries: SubAddressEntry[]): Promise<void> {
