@@ -982,6 +982,11 @@ const rawData = walletDB.export();
 const db = await WalletDB.loadFromBytes(rawData);
 ```
 
+`loadEncrypted()` and `loadFromBytes()` open the database in memory: the
+decrypted bytes are never written to disk (earlier versions passed them
+through a file in the shared temp directory). Use `migrate(path)` on the
+result to persist it.
+
 #### Cross-Platform Database Storage
 
 The SDK provides efficient, cross-platform SQLite database storage with automatic adapter selection based on the runtime environment:
@@ -1042,9 +1047,41 @@ await memDb.createWallet();
 const persistentDb = await memDb.migrate('wallet.db');
 ```
 
+`migrate(path)` writes the database to `path` (readable by the owner only)
+and the returned `WalletDB` keeps writing there. It refuses to overwrite an
+existing file. New database files created by `open()` are owner-only too.
+
+**Amounts and transactions:**
+
+Amounts are `bigint` throughout the storage API (`StoreOutputParams.amount`,
+`WalletOutput.amount`, `CreatedCollectionRecord.totalSupply`, balances), and
+are stored as decimal strings, so every u64 value up to 2^64 - 1 is kept
+exactly and balances are summed without overflow. Passing a `number` amount
+throws a `TypeError`.
+
+`storeWalletOutput()` updates an output that is already stored instead of
+replacing it: an output already marked spent stays spent, and keeps its
+creation time, when a block is processed again. Creating or restoring a wallet
+over a different one drops the old wallet's data and saves the new one in a
+single transaction.
+
 **Browser Storage:**
 
 In browser environments, the SDK uses `sql.js` (SQLite compiled to WebAssembly) with IndexedDB for persistence. The database is automatically saved to IndexedDB when changes are made, ensuring data survives page reloads and browser restarts.
+
+`IndexedDBWalletDB` closes its connection when another tab upgrades or
+deletes the database; later calls then fail with
+`Database closed: another tab or window upgraded or deleted it`, and the
+wallet has to be reopened. If a connection that does not close (for example a
+tab still running an older SDK) blocks an upgrade, `open()` rejects after
+`blockedTimeoutMs` (default 10 s) instead of hanging, and
+`IndexedDBWalletDB.deleteDatabase(path, blockedTimeoutMs?)` rejects instead of
+reporting the deletion as done:
+
+```typescript
+const db = new IndexedDBWalletDB({ blockedTimeoutMs: 5_000 });
+await db.open('my-wallet'); // throws if another tab blocks the upgrade
+```
 
 #### Encryption Metadata
 
@@ -1691,7 +1728,7 @@ CREATE TABLE wallet_outputs (
   output_index INTEGER NOT NULL,
   block_height INTEGER NOT NULL,
   output_data TEXT NOT NULL,
-  amount INTEGER NOT NULL DEFAULT 0,
+  amount TEXT NOT NULL DEFAULT '0',  -- u64 as a decimal string (INTEGER before 0.5.0)
   memo TEXT,
   token_id TEXT,
   blinding_key TEXT,     -- blsctData.blindingKey: k * sk_destination
@@ -1703,6 +1740,11 @@ CREATE TABLE wallet_outputs (
   created_at INTEGER NOT NULL
 );
 ```
+
+Databases written before 0.5.0 declared `amount` (and
+`created_collections.total_supply`) `INTEGER`, which cannot hold a u64 above
+2^63 - 1. Opening one rebuilds those tables with `TEXT` columns, in one
+transaction per table, and stores NAV outputs with `token_id` NULL.
 
 ---
 

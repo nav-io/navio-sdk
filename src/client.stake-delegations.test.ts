@@ -95,7 +95,7 @@ describe('NavioClient.getStakeDelegations', () => {
       outputIndex: output.index,
       blockHeight: 10,
       outputData,
-      amount: STAKE,
+      amount: BigInt(STAKE),
       gamma: '0',
       memo: null,
       tokenId: null,

@@ -137,7 +137,7 @@ describe('TransactionKeysSync', () => {
       outputIndex: 0,
       blockHeight,
       outputData: '',
-      amount: 1_000_000,
+      amount: 1_000_000n,
       gamma: '01',
       memo: null,
       tokenId: null,
@@ -334,7 +334,7 @@ describe('TransactionKeysSync', () => {
         '',
       );
 
-      expect(recovered.amount).toBe(123_456);
+      expect(recovered.amount).toBe(123_456n);
       expect(recovered.tokenIdHex).toBe(ctxOut.getTokenId().serialize());
     });
   });

@@ -8,3 +8,4 @@
 
 export { NodeAdapter } from './node-adapter';
 export { IndexedDBWalletDB } from './indexeddb-wallet-db';
+export type { IndexedDBWalletDBOptions } from './indexeddb-wallet-db';

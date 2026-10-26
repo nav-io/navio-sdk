@@ -11,7 +11,7 @@ function output(outputHash: string, overrides: Partial<StoreOutputParams> = {}):
     outputIndex: 0,
     blockHeight: 10,
     outputData: '',
-    amount: 1_000,
+    amount: 1_000n,
     gamma: '0',
     memo: null,
     tokenId: null,
@@ -49,13 +49,13 @@ describe('NavioClient staked outputs', () => {
   });
 
   it('reports staked NAV apart from the spendable balance', async () => {
-    await walletDB.storeWalletOutput(output('01'.repeat(32), { amount: 100 }));
+    await walletDB.storeWalletOutput(output('01'.repeat(32), { amount: 100n }));
     await walletDB.storeWalletOutput(
-      output('02'.repeat(32), { amount: 5_000, isStakedCommitment: true })
+      output('02'.repeat(32), { amount: 5_000n, isStakedCommitment: true })
     );
     await walletDB.storeWalletOutput(
       output('03'.repeat(32), {
-        amount: 7_000,
+        amount: 7_000n,
         isStakedCommitment: true,
         isSpent: true,
         spentBlockHeight: 20,

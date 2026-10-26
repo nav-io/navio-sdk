@@ -19,7 +19,7 @@ function output(outputHash: string, overrides: Partial<StoreOutputParams> = {}):
     outputIndex: 0,
     blockHeight: 10,
     outputData: '',
-    amount: 1_000,
+    amount: 1_000n,
     gamma: '01',
     memo: null,
     tokenId: null,
@@ -48,10 +48,10 @@ describe('WalletDB output queries', () => {
   });
 
   it('binds the token id instead of splicing it into the SQL', async () => {
-    await walletDB.storeWalletOutput(output('01'.repeat(32), { tokenId: TOKEN_A, amount: 5 }));
-    await walletDB.storeWalletOutput(output('02'.repeat(32), { tokenId: TOKEN_B, amount: 7 }));
+    await walletDB.storeWalletOutput(output('01'.repeat(32), { tokenId: TOKEN_A, amount: 5n }));
+    await walletDB.storeWalletOutput(output('02'.repeat(32), { tokenId: TOKEN_B, amount: 7n }));
     await walletDB.storeWalletOutput(
-      output('03'.repeat(32), { tokenId: TOKEN_A, amount: 11, isSpent: true, spentBlockHeight: 0 })
+      output('03'.repeat(32), { tokenId: TOKEN_A, amount: 11n, isSpent: true, spentBlockHeight: 0 })
     );
 
     expect(await walletDB.getBalance(TOKEN_A)).toBe(5n);
@@ -66,9 +66,9 @@ describe('WalletDB output queries', () => {
   });
 
   it('keeps staked commitments out of the spendable balance and unspent outputs', async () => {
-    await walletDB.storeWalletOutput(output('04'.repeat(32), { amount: 100 }));
+    await walletDB.storeWalletOutput(output('04'.repeat(32), { amount: 100n }));
     await walletDB.storeWalletOutput(
-      output('05'.repeat(32), { amount: 1_000, isStakedCommitment: true })
+      output('05'.repeat(32), { amount: 1_000n, isStakedCommitment: true })
     );
 
     expect(await walletDB.getBalance()).toBe(100n);

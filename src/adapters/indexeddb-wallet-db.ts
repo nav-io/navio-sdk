@@ -17,6 +17,14 @@ import { KeyManager } from '../key-manager';
 import type { HDChain, SubAddressIdentifier } from '../key-manager.types';
 import * as blsctModule from '@nav-io/navio-blsct';
 import { isStakedCommitmentOutputHex } from '../staking';
+import {
+  WALLET_METADATA_KEY,
+  encodeAmount,
+  isNavTokenId,
+  parseTxKeys,
+  readStoredAmount,
+  walletMetadataRecord,
+} from '../storage-codec';
 import type {
   IWalletDB,
   SyncState,
@@ -30,14 +38,52 @@ import type {
 // v3: adds the standingOrders store
 // v4: adds the outputBlindingKeys store
 // v5: walletOutputs records carry isStakedCommitment (backfilled on upgrade)
-const IDB_VERSION = 5;
-const DEFAULT_TOKEN_ID = '0000000000000000000000000000000000000000000000000000000000000000';
+// v8: amounts (walletOutputs.amount, createdCollections.totalSupply) are
+//     decimal strings, and NAV outputs carry tokenId null (converted on upgrade)
+const IDB_VERSION = 8;
+
+/** How long open() and deleteDatabase() wait for other connections to close. */
+const DEFAULT_BLOCKED_TIMEOUT_MS = 10_000;
+
+/** Stores holding the wallet's keys, rewritten by saveWallet. */
+const WALLET_KEY_STORES = [
+  'config', 'keys', 'outKeys', 'cryptedKeys',
+  'cryptedOutKeys', 'subAddresses', 'keyMetadata',
+];
+
+/**
+ * Stores holding data detected with a wallet's keys, dropped when a different
+ * wallet is written into the database.
+ */
+const FOREIGN_WALLET_DATA_STORES = [
+  'walletOutputs', 'createdCollections', 'standingOrders',
+  // Another seed's blinding scalars are not ours and can never verify.
+  'outputBlindingKeys',
+  // Sync progress
+  'syncState', 'txKeys', 'blockHashes',
+];
+
+/**
+ * walletOutputs fields that hold an output's spent state. storeWalletOutput
+ * keeps them from the stored record once it is spent.
+ */
+const SPENT_STATE_FIELDS = ['isSpent', 'spentTxHash', 'spentBlockHeight'];
 
 function idbReq<T>(req: IDBRequest<T>): Promise<T> {
   return new Promise((resolve, reject) => {
     req.onsuccess = () => resolve(req.result);
     req.onerror = () => reject(req.error);
   });
+}
+
+/** Options for {@link IndexedDBWalletDB}. */
+export interface IndexedDBWalletDBOptions {
+  /**
+   * How long open() waits when another connection (another tab running an
+   * older version, say) blocks the version upgrade, before failing.
+   * Default 10 000 ms.
+   */
+  blockedTimeoutMs?: number;
 }
 
 function idbTx(tx: IDBTransaction): Promise<void> {
@@ -55,6 +101,12 @@ export class IndexedDBWalletDB implements IWalletDB {
   private db: IDBDatabase | null = null;
   private keyManager: KeyManager | null = null;
   private opened = false;
+  private closedByVersionChange = false;
+  private readonly blockedTimeoutMs: number;
+
+  constructor(options: IndexedDBWalletDBOptions = {}) {
+    this.blockedTimeoutMs = options.blockedTimeoutMs ?? DEFAULT_BLOCKED_TIMEOUT_MS;
+  }
 
   // -- static helpers ---------------------------------------------------
 
@@ -71,12 +123,31 @@ export class IndexedDBWalletDB implements IWalletDB {
     return false;
   }
 
-  static deleteDatabase(path: string): Promise<void> {
+  /**
+   * Delete a wallet database. Open connections are asked to close (an
+   * IndexedDBWalletDB closes on request); if one stays open the deletion
+   * waits, and this rejects after `blockedTimeoutMs`. The deletion itself
+   * stays queued and completes once that connection closes.
+   */
+  static deleteDatabase(path: string, blockedTimeoutMs = DEFAULT_BLOCKED_TIMEOUT_MS): Promise<void> {
     return new Promise((resolve, reject) => {
+      let blockedTimer: ReturnType<typeof setTimeout> | undefined;
       const req = indexedDB.deleteDatabase(IndexedDBWalletDB.getDatabaseName(path));
-      req.onsuccess = () => resolve();
-      req.onerror = () => reject(req.error);
-      req.onblocked = () => resolve();
+      req.onsuccess = () => {
+        clearTimeout(blockedTimer);
+        resolve();
+      };
+      req.onerror = () => {
+        clearTimeout(blockedTimer);
+        reject(req.error);
+      };
+      req.onblocked = () => {
+        clearTimeout(blockedTimer);
+        blockedTimer = setTimeout(() => reject(new Error(
+          `Cannot delete wallet database "${path}": it is still open in another tab or window. ` +
+          'Close it there; the deletion completes once it is closed.'
+        )), blockedTimeoutMs);
+      };
     });
   }
 
@@ -86,6 +157,7 @@ export class IndexedDBWalletDB implements IWalletDB {
     if (this.opened) throw new Error('Database already open');
     this.db = await this.openIDB(path);
     this.opened = true;
+    this.closedByVersionChange = false;
   }
 
   async close(): Promise<void> {
@@ -102,16 +174,55 @@ export class IndexedDBWalletDB implements IWalletDB {
 
   private openIDB(path: string): Promise<IDBDatabase> {
     return new Promise((resolve, reject) => {
+      let settled = false;
+      let blockedTimer: ReturnType<typeof setTimeout> | undefined;
+      const fail = (error: Error): void => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(blockedTimer);
+        reject(error);
+      };
+
       const req = indexedDB.open(IndexedDBWalletDB.getDatabaseName(path), IDB_VERSION);
-      req.onerror = () => reject(new Error('Failed to open IndexedDB'));
+      req.onerror = () => fail(new Error(`Failed to open IndexedDB: ${req.error?.message ?? 'unknown error'}`));
+      req.onblocked = () => {
+        // Another connection holds the database at an older version and did
+        // not close when asked (one opened by an older SDK, for instance).
+        // The upgrade proceeds if it closes in time.
+        clearTimeout(blockedTimer);
+        blockedTimer = setTimeout(() => fail(new Error(
+          `Cannot open wallet database "${path}": it is open in another tab or window ` +
+          'that blocks the upgrade to this version. Close it there and try again.'
+        )), this.blockedTimeoutMs);
+      };
       req.onupgradeneeded = (ev) => {
         const db = (ev.target as IDBOpenDBRequest).result;
         this.createStores(db);
-        if (ev.oldVersion > 0 && ev.oldVersion < 5 && req.transaction) {
-          this.backfillStakedCommitments(req.transaction);
+        if (ev.oldVersion > 0 && ev.oldVersion < IDB_VERSION && req.transaction) {
+          this.upgradeRecords(req.transaction, ev.oldVersion);
         }
       };
-      req.onsuccess = () => resolve(req.result);
+      req.onsuccess = () => {
+        const db = req.result;
+        if (settled) {
+          // Gave up while blocked; do not keep a connection nobody holds.
+          db.close();
+          return;
+        }
+        settled = true;
+        clearTimeout(blockedTimer);
+        // Let other tabs upgrade or delete the database: close instead of
+        // blocking them. Later calls fail with a clear error.
+        db.onversionchange = () => {
+          db.close();
+          if (this.db === db) {
+            this.db = null;
+            this.opened = false;
+            this.closedByVersionChange = true;
+          }
+        };
+        resolve(db);
+      };
     });
   }
 
@@ -146,30 +257,69 @@ export class IndexedDBWalletDB implements IWalletDB {
   }
 
   /**
-   * Flag the staked commitments among outputs stored before records carried
-   * isStakedCommitment, from their serialized output. Runs inside the
+   * Bring records stored by an older version up to date. Runs inside the
    * versionchange transaction, so the database opens only once it is done.
+   * One cursor per store applies every step: two cursors updating the same
+   * records would overwrite each other's changes.
+   *
+   * - v5: flag the staked commitments among outputs stored before records
+   *   carried isStakedCommitment, from their serialized output
+   * - v8: amounts become decimal strings (numbers above 2^53 had already
+   *   lost precision; they keep what is left), and NAV outputs get tokenId
+   *   null, as sync writes it now
    */
-  private backfillStakedCommitments(tx: IDBTransaction): void {
-    const cursorReq = tx.objectStore('walletOutputs').openCursor();
-    cursorReq.onsuccess = () => {
-      const cursor = cursorReq.result;
+  private upgradeRecords(tx: IDBTransaction, oldVersion: number): void {
+    const outputsCursor = tx.objectStore('walletOutputs').openCursor();
+    outputsCursor.onsuccess = () => {
+      const cursor = outputsCursor.result;
       if (!cursor) return;
-      const rec = cursor.value;
+      const rec = { ...cursor.value };
+      let changed = false;
       if (rec.isStakedCommitment === undefined) {
-        cursor.update({
-          ...rec,
-          isStakedCommitment: isStakedCommitmentOutputHex(rec.outputData ?? '') ? 1 : 0,
-        });
+        rec.isStakedCommitment = isStakedCommitmentOutputHex(rec.outputData ?? '') ? 1 : 0;
+        changed = true;
       }
+      if (oldVersion < 8) {
+        if (typeof rec.amount !== 'string') {
+          // A corrupt amount stays as it is (reads leave the row out with a
+          // warning) rather than aborting the upgrade.
+          const amount = readStoredAmount(rec.amount, `output ${rec.outputHash}`);
+          if (amount !== null) {
+            rec.amount = amount.toString();
+            changed = true;
+          }
+        }
+        if (rec.tokenId != null && isNavTokenId(rec.tokenId)) {
+          rec.tokenId = null;
+          changed = true;
+        }
+      }
+      if (changed) cursor.update(rec);
       cursor.continue();
     };
+
+    if (oldVersion < 8) {
+      const collectionsCursor = tx.objectStore('createdCollections').openCursor();
+      collectionsCursor.onsuccess = () => {
+        const cursor = collectionsCursor.result;
+        if (!cursor) return;
+        if (typeof cursor.value.totalSupply !== 'string') {
+          const supply = readStoredAmount(cursor.value.totalSupply, `collection ${cursor.value.collectionTokenId}`);
+          if (supply !== null) cursor.update({ ...cursor.value, totalSupply: supply.toString() });
+        }
+        cursor.continue();
+      };
+    }
   }
 
   // -- low-level helpers ------------------------------------------------
 
   private ensureOpen(): IDBDatabase {
-    if (!this.db) throw new Error('Database not open');
+    if (!this.db) {
+      throw new Error(this.closedByVersionChange
+        ? 'Database closed: another tab or window upgraded or deleted it. Reopen it.'
+        : 'Database not open');
+    }
     return this.db;
   }
 
@@ -207,19 +357,17 @@ export class IndexedDBWalletDB implements IWalletDB {
   private async deleteByIndexRange(store: string, idx: string, range: IDBKeyRange): Promise<void> {
     const db = this.ensureOpen();
     const tx = db.transaction(store, 'readwrite');
+    const done = idbTx(tx);
     const index = tx.objectStore(store).index(idx);
     const cursorReq = index.openKeyCursor(range);
-    await new Promise<void>((resolve, reject) => {
-      cursorReq.onsuccess = () => {
-        const cursor = cursorReq.result;
-        if (cursor) {
-          tx.objectStore(store).delete(cursor.primaryKey);
-          cursor.continue();
-        }
-      };
-      tx.oncomplete = () => resolve();
-      tx.onerror = () => reject(tx.error);
-    });
+    cursorReq.onsuccess = () => {
+      const cursor = cursorReq.result;
+      if (cursor) {
+        tx.objectStore(store).delete(cursor.primaryKey);
+        cursor.continue();
+      }
+    };
+    await done;
   }
 
   // -- wallet core ------------------------------------------------------
@@ -339,9 +487,7 @@ export class IndexedDBWalletDB implements IWalletDB {
     km.newSubAddressPool(-1);
     km.newSubAddressPool(-2);
 
-    await this.discardForeignWalletData(km);
-    await this.saveWallet(km);
-    await this.saveWalletMetadata({
+    await this.replaceWallet(km, {
       creationHeight: creationHeight ?? 0,
       creationTime: Date.now(),
       restoredFromSeed: false,
@@ -360,9 +506,7 @@ export class IndexedDBWalletDB implements IWalletDB {
     km.newSubAddressPool(-1);
     km.newSubAddressPool(-2);
 
-    await this.discardForeignWalletData(km);
-    await this.saveWallet(km);
-    await this.saveWalletMetadata({
+    await this.replaceWallet(km, {
       creationHeight: creationHeight ?? 0,
       creationTime: Date.now(),
       restoredFromSeed: true,
@@ -384,9 +528,7 @@ export class IndexedDBWalletDB implements IWalletDB {
       throw new Error('Failed to import audit key');
     }
 
-    await this.discardForeignWalletData(km);
-    await this.saveWallet(km);
-    await this.saveWalletMetadata({
+    await this.replaceWallet(km, {
       creationHeight: creationHeight ?? 0,
       creationTime: Date.now(),
       restoredFromSeed: true,
@@ -404,9 +546,7 @@ export class IndexedDBWalletDB implements IWalletDB {
     km.newSubAddressPool(-1);
     km.newSubAddressPool(-2);
 
-    await this.discardForeignWalletData(km);
-    await this.saveWallet(km);
-    await this.saveWalletMetadata({
+    await this.replaceWallet(km, {
       creationHeight: creationHeight ?? 0,
       creationTime: Date.now(),
       restoredFromSeed: true,
@@ -422,14 +562,35 @@ export class IndexedDBWalletDB implements IWalletDB {
     if (!km) throw new Error('No KeyManager instance to save');
 
     const db = this.ensureOpen();
-    const storeNames = [
-      'config', 'keys', 'outKeys', 'cryptedKeys',
-      'cryptedOutKeys', 'subAddresses', 'keyMetadata',
-    ];
-    const tx = db.transaction(storeNames, 'readwrite');
+    const tx = db.transaction(WALLET_KEY_STORES, 'readwrite');
+    await this.commitWrites(tx, () => this.writeWallet(tx, km));
+  }
 
+  /**
+   * Queue writes on `tx` and wait for it to commit. If queueing throws, the
+   * transaction is aborted: it would otherwise commit whatever was queued
+   * before the throw.
+   */
+  private async commitWrites(tx: IDBTransaction, queue: () => void): Promise<void> {
+    const done = idbTx(tx);
+    try {
+      queue();
+    } catch (error) {
+      tx.abort();
+      await done.catch(() => undefined);
+      throw error;
+    }
+    await done;
+  }
+
+  /**
+   * Queue the writes that replace the stored keys with `km`'s on `tx`, which
+   * must cover WALLET_KEY_STORES. Records `km` has no value for are deleted,
+   * so a view-only wallet saved over a full one keeps none of its keys.
+   */
+  private writeWallet(tx: IDBTransaction, km: KeyManager): void {
     // Clear key-related stores
-    for (const name of storeNames.filter((n) => n !== 'config')) {
+    for (const name of WALLET_KEY_STORES.filter((n) => n !== 'config')) {
       tx.objectStore(name).clear();
     }
 
@@ -445,6 +606,8 @@ export class IndexedDBWalletDB implements IWalletDB {
         tokenId: this.bytesToHex(hdChain.tokenId),
         blindingId: this.bytesToHex(hdChain.blindingId),
       });
+    } else {
+      tx.objectStore('config').delete('hdChain');
     }
 
     // Seed: encrypted for an encrypted wallet, otherwise the mnemonic.
@@ -479,7 +642,10 @@ export class IndexedDBWalletDB implements IWalletDB {
         publicKey: this.serializePublicKey(viewPub),
         secretKey: this.serializeViewKey(viewKey),
       });
-    } catch { /* not available */ }
+    } catch {
+      // Not available
+      tx.objectStore('config').delete('viewKey');
+    }
 
     // Spend key
     try {
@@ -488,14 +654,15 @@ export class IndexedDBWalletDB implements IWalletDB {
         key: 'spendKey',
         publicKey: this.serializePublicKey(spendPub),
       });
-    } catch { /* not available */ }
+    } catch {
+      // Not available
+      tx.objectStore('config').delete('spendKey');
+    }
 
     // Sub-address mappings (hashId -> account/address)
     for (const entry of km.getSubAddressEntries()) {
       tx.objectStore('subAddresses').put({ hashId: entry.hashId, account: entry.account, address: entry.address });
     }
-
-    await idbTx(tx);
   }
 
   async saveSubAddresses(entries: SubAddressEntry[]): Promise<void> {
@@ -509,33 +676,38 @@ export class IndexedDBWalletDB implements IWalletDB {
   }
 
   /**
-   * Drop data that belongs to a previously stored wallet when a different
-   * wallet (different spending key) is written into this database. Outputs,
-   * created collections and sync progress are tied to the keys that detected
-   * them; kept across a restore with another seed they are selected as inputs
-   * and the spend fails with "does not map to a known sub-address in this
-   * wallet". Restoring the same seed keeps everything.
+   * Write a newly created or restored wallet, with its metadata, in one
+   * transaction. When a different wallet (different spending key) was stored
+   * before, that transaction first drops its data: outputs, created
+   * collections and sync progress are tied to the keys that detected them;
+   * kept across a restore with another seed they are selected as inputs and
+   * the spend fails with "does not map to a known sub-address in this
+   * wallet". Restoring the same seed keeps everything. One transaction, so a
+   * crash cannot leave the old outputs dropped but the new keys unsaved.
    */
-  private async discardForeignWalletData(incoming: KeyManager): Promise<void> {
-    if (!(await this.holdsDifferentWallet(incoming))) return;
+  private async replaceWallet(km: KeyManager, meta: WalletMetadata): Promise<void> {
+    const discard = await this.holdsDifferentWallet(km);
     const db = this.ensureOpen();
     const tx = db.transaction(
-      ['walletOutputs', 'createdCollections', 'standingOrders', 'outputBlindingKeys'],
+      discard ? [...WALLET_KEY_STORES, ...FOREIGN_WALLET_DATA_STORES] : WALLET_KEY_STORES,
       'readwrite',
     );
-    tx.objectStore('walletOutputs').clear();
-    tx.objectStore('createdCollections').clear();
-    tx.objectStore('standingOrders').clear();
-    // Another seed's blinding scalars are not ours and can never verify.
-    tx.objectStore('outputBlindingKeys').clear();
-    await idbTx(tx);
-    await this.clearSyncData();
+    await this.commitWrites(tx, () => {
+      if (discard) {
+        for (const name of FOREIGN_WALLET_DATA_STORES) {
+          tx.objectStore(name).clear();
+        }
+      }
+      this.writeWallet(tx, km);
+      tx.objectStore('config').put(walletMetadataRecord(meta));
+    });
   }
 
   private async holdsDifferentWallet(incoming: KeyManager): Promise<boolean> {
-    const outputs = await this.getAll<any>('walletOutputs');
+    const db = this.ensureOpen();
+    const outputCount = await idbReq(db.transaction('walletOutputs', 'readonly').objectStore('walletOutputs').count());
     const syncState = await this.get<any>('syncState', 0);
-    if (outputs.length === 0 && !syncState) return false;
+    if (outputCount === 0 && !syncState) return false;
 
     const spendRec = await this.get<any>('config', 'spendKey');
     if (!spendRec?.publicKey) return true;
@@ -553,11 +725,11 @@ export class IndexedDBWalletDB implements IWalletDB {
   // -- metadata ---------------------------------------------------------
 
   private async saveWalletMetadata(meta: WalletMetadata): Promise<void> {
-    await this.put('config', { key: 'walletMetadata', ...meta });
+    await this.put('config', walletMetadataRecord(meta));
   }
 
   async getWalletMetadata(): Promise<WalletMetadata | null> {
-    const rec = await this.get<any>('config', 'walletMetadata');
+    const rec = await this.get<any>('config', WALLET_METADATA_KEY);
     if (!rec) return null;
     return {
       creationHeight: rec.creationHeight,
@@ -575,7 +747,7 @@ export class IndexedDBWalletDB implements IWalletDB {
   async setCreationHeight(height: number): Promise<void> {
     const existing = await this.getWalletMetadata();
     if (existing) {
-      await this.put('config', { key: 'walletMetadata', ...existing, creationHeight: height });
+      await this.put('config', walletMetadataRecord({ ...existing, creationHeight: height }));
     } else {
       await this.saveWalletMetadata({
         creationHeight: height,
@@ -601,7 +773,7 @@ export class IndexedDBWalletDB implements IWalletDB {
           const rec = cursor.value;
           // Spendable balance: staked commitments are locked for staking.
           if (rec.isStakedCommitment !== 1 && this.matchesTokenFilter(rec.tokenId, tokenId)) {
-            total += BigInt(rec.amount);
+            total += readStoredAmount(rec.amount, `output ${rec.outputHash}`) ?? 0n;
           }
           cursor.continue();
         } else {
@@ -617,32 +789,37 @@ export class IndexedDBWalletDB implements IWalletDB {
     return recs
       .filter((r) => r.isStakedCommitment !== 1 && this.matchesTokenFilter(r.tokenId, tokenId))
       .sort((a, b) => a.blockHeight - b.blockHeight)
-      .map(this.recordToOutput);
+      .map(this.recordToOutput)
+      .filter((o): o is WalletOutput => o !== null);
   }
 
   async getAllOutputs(): Promise<WalletOutput[]> {
     const recs = await this.getAll<any>('walletOutputs');
-    return recs.sort((a, b) => a.blockHeight - b.blockHeight).map(this.recordToOutput);
+    return recs
+      .sort((a, b) => a.blockHeight - b.blockHeight)
+      .map(this.recordToOutput)
+      .filter((o): o is WalletOutput => o !== null);
   }
 
   private matchesTokenFilter(recTokenId: string | null, filterTokenId: string | null): boolean {
-    if (filterTokenId === null) {
-      // NAV: no token id, or the default token id in either spelling (bare
-      // zero hash, or TokenId.serialize()'s zero hash + ffff… no-subid
-      // marker, written by older mempool processing)
-      return !recTokenId
-        || recTokenId === DEFAULT_TOKEN_ID
-        || recTokenId === DEFAULT_TOKEN_ID + 'ffffffffffffffff';
+    // NAV is stored as null since v8, so an explicit NAV id selects NAV too.
+    if (isNavTokenId(filterTokenId)) {
+      // NAV: no token id, or the NAV token id in any stored spelling
+      return isNavTokenId(recTokenId);
     }
     return recTokenId === filterTokenId;
   }
 
-  private recordToOutput = (r: any): WalletOutput => ({
+  /** Map a stored record to a WalletOutput, or null (with a warning) when its amount is corrupt. */
+  private recordToOutput = (r: any): WalletOutput | null => {
+    const amount = readStoredAmount(r.amount, `output ${r.outputHash}`);
+    if (amount === null) return null;
+    return {
     outputHash: r.outputHash,
     txHash: r.txHash,
     outputIndex: r.outputIndex,
     blockHeight: r.blockHeight,
-    amount: BigInt(r.amount),
+    amount,
     gamma: r.gamma ?? '0',
     memo: r.memo ?? null,
     tokenId: r.tokenId ?? null,
@@ -655,7 +832,8 @@ export class IndexedDBWalletDB implements IWalletDB {
     txType: (r.txType ?? 'received') as TxType,
     timestamp: r.timestamp ?? 0,
     isStakedCommitment: r.isStakedCommitment === 1,
-  });
+    };
+  };
 
   // -- sync state -------------------------------------------------------
 
@@ -702,19 +880,17 @@ export class IndexedDBWalletDB implements IWalletDB {
   async deleteBlockHashesBefore(height: number): Promise<void> {
     const db = this.ensureOpen();
     const tx = db.transaction('blockHashes', 'readwrite');
+    const done = idbTx(tx);
     const store = tx.objectStore('blockHashes');
     const req = store.openKeyCursor(IDBKeyRange.upperBound(height, true));
-    await new Promise<void>((resolve, reject) => {
-      req.onsuccess = () => {
-        const cursor = req.result;
-        if (cursor) {
-          store.delete(cursor.key);
-          cursor.continue();
-        }
-      };
-      tx.oncomplete = () => resolve();
-      tx.onerror = () => reject(tx.error);
-    });
+    req.onsuccess = () => {
+      const cursor = req.result;
+      if (cursor) {
+        store.delete(cursor.key);
+        cursor.continue();
+      }
+    };
+    await done;
   }
 
   // -- transaction keys -------------------------------------------------
@@ -726,15 +902,19 @@ export class IndexedDBWalletDB implements IWalletDB {
   async getTxKeys(txHash: string): Promise<any | null> {
     const rec = await this.get<any>('txKeys', txHash);
     if (!rec) return null;
-    try { return JSON.parse(rec.keysData); } catch { return null; }
+    return parseTxKeys(txHash, rec.keysData);
   }
 
   async getTxKeysByHeight(height: number): Promise<{ txHash: string; keys: any }[]> {
     const recs = await this.getAllByIndex<any>('txKeys', 'blockHeight', height);
-    return recs.map((r) => ({
-      txHash: r.txHash,
-      keys: JSON.parse(r.keysData),
-    }));
+    const results: { txHash: string; keys: any }[] = [];
+    for (const r of recs) {
+      const keys = parseTxKeys(r.txHash, r.keysData);
+      if (keys !== null) {
+        results.push({ txHash: r.txHash, keys });
+      }
+    }
+    return results;
   }
 
   async deleteTxKeysByHeight(height: number): Promise<void> {
@@ -744,13 +924,13 @@ export class IndexedDBWalletDB implements IWalletDB {
   // -- wallet output mutations ------------------------------------------
 
   async storeWalletOutput(p: StoreOutputParams): Promise<void> {
-    await this.put('walletOutputs', {
+    const record: Record<string, any> = {
       outputHash: p.outputHash,
       txHash: p.txHash,
       outputIndex: p.outputIndex,
       blockHeight: p.blockHeight,
       outputData: p.outputData,
-      amount: p.amount,
+      amount: encodeAmount(p.amount),
       gamma: p.gamma,
       memo: p.memo,
       tokenId: p.tokenId,
@@ -764,7 +944,29 @@ export class IndexedDBWalletDB implements IWalletDB {
       timestamp: p.timestamp,
       isStakedCommitment: p.isStakedCommitment ? 1 : 0,
       createdAt: Date.now(),
-    });
+    };
+
+    // Upsert in one transaction: re-processing a block must not reset a
+    // spent output to unspent, nor its creation time. Once a record is spent
+    // its spent state is kept; unspending is revertBlocksFrom's job.
+    const db = this.ensureOpen();
+    const tx = db.transaction('walletOutputs', 'readwrite');
+    const done = idbTx(tx);
+    const store = tx.objectStore('walletOutputs');
+    const existingReq = store.get(p.outputHash);
+    existingReq.onsuccess = () => {
+      const existing = existingReq.result;
+      if (existing) {
+        record.createdAt = existing.createdAt ?? record.createdAt;
+        if (existing.isSpent === 1) {
+          for (const field of SPENT_STATE_FIELDS) {
+            record[field] = existing[field] ?? null;
+          }
+        }
+      }
+      store.put(record);
+    };
+    await done;
   }
 
   async isOutputUnspent(outputHash: string): Promise<boolean> {
@@ -863,7 +1065,10 @@ export class IndexedDBWalletDB implements IWalletDB {
   }
 
   async saveCreatedCollection(record: CreatedCollectionRecord): Promise<void> {
-    await this.put('createdCollections', { ...record });
+    await this.put('createdCollections', {
+      ...record,
+      totalSupply: encodeAmount(record.totalSupply, 'totalSupply'),
+    });
   }
 
   async saveOutputBlindingKey(outputHash: string, blindingKeyPrivate: string): Promise<void> {
@@ -892,8 +1097,14 @@ export class IndexedDBWalletDB implements IWalletDB {
   }
 
   async getCreatedCollections(): Promise<CreatedCollectionRecord[]> {
-    const recs = await this.getAll<CreatedCollectionRecord>('createdCollections');
-    return recs.sort((a, b) => a.createdAt - b.createdAt);
+    const recs = await this.getAll<any>('createdCollections');
+    return recs
+      .sort((a, b) => a.createdAt - b.createdAt)
+      .flatMap((rec): CreatedCollectionRecord[] => {
+        // A corrupt supply leaves the record out, with a warning.
+        const totalSupply = readStoredAmount(rec.totalSupply, `collection ${rec.collectionTokenId}`);
+        return totalSupply === null ? [] : [{ ...rec, totalSupply }];
+      });
   }
 
   async getPendingSpentAmount(tokenId: string | null = null): Promise<bigint> {
@@ -902,7 +1113,7 @@ export class IndexedDBWalletDB implements IWalletDB {
     for (const rec of recs) {
       if (rec.isSpent !== 1) continue;
       if (!this.matchesTokenFilter(rec.tokenId, tokenId)) continue;
-      total += BigInt(rec.amount);
+      total += readStoredAmount(rec.amount, `output ${rec.outputHash}`) ?? 0n;
     }
     return total;
   }

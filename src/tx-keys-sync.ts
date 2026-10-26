@@ -18,6 +18,7 @@ import { sha256 } from '@noble/hashes/sha256';
 import { canonicalAnchorOutid, searchBlindingKey } from './blinding-key';
 import { parseOutputHex, parseTransaction, type ParsedOutput } from './p2p-block-parser';
 import { isStakedCommitmentOutput, isStakedCommitmentOutputHex } from './staking';
+import { isNavTokenId } from './storage-codec';
 
 /**
  * Serialization of an empty bulletproofs+ range proof: just the zero Vs
@@ -27,16 +28,6 @@ import { isStakedCommitmentOutput, isStakedCommitmentOutputHex } from './staking
  * before calling it.
  */
 const EMPTY_RANGE_PROOF_HEX = '00';
-
-/**
- * Hex spellings of the NAV (default) token id as they appear from different
- * sources: the bare 32-byte zero hash, and TokenId.serialize()'s 40-byte
- * form (zero hash + ffff… no-subid marker).
- */
-const NAV_TOKEN_ID_HEX_FORMS = new Set([
-  '0'.repeat(64),
-  '0'.repeat(64) + 'ffffffffffffffff',
-]);
 
 /**
  * Yield control back to the browser's event loop so it can repaint and
@@ -824,7 +815,7 @@ export class TransactionKeysSync {
 
       if (!isMine) continue;
 
-      let recoveredAmount = 0;
+      let recoveredAmount = 0n;
       let recoveredGamma = '0';
       let recoveredMemo: string | null = null;
       let tokenIdHex: string | null = null;
@@ -841,14 +832,14 @@ export class TransactionKeysSync {
           // ABORTS the process (uncatchable native exception), so it must
           // never be called here: this path runs on every own broadcast and
           // killed apps the moment they minted an NFT.
-          recoveredAmount = Number(ctxOut.getValue());
+          recoveredAmount = BigInt(ctxOut.getValue());
           recoveredGamma = '0';
         } else {
           const req = new AmountRecoveryReq(rangeProof, nonce, tokenId);
           const results = RangeProof.recoverAmounts([req]);
 
           if (results.length > 0 && results[0].isSucc) {
-            recoveredAmount = Number(results[0].amount);
+            recoveredAmount = BigInt(results[0].amount);
             recoveredGamma = results[0].gamma ?? '0';
             recoveredMemo = results[0].msg || null;
           }
@@ -1135,7 +1126,7 @@ export class TransactionKeysSync {
     outputIndex: number,
     blindingKeyObj: any,
     outputHex: string
-  ): Promise<{ amount: number; gamma: string; memo: string | null; tokenIdHex: string | null }> {
+  ): Promise<{ amount: bigint; gamma: string; memo: string | null; tokenIdHex: string | null }> {
     // Fast path: hand-parse the serialized output. This reliably recovers
     // plain (NAV) outputs, but the parser mis-handles token/predicate outputs
     // — their range proof sits behind a variable predicate layout — so it can
@@ -1144,14 +1135,14 @@ export class TransactionKeysSync {
     // full-transaction parser, which understands every output shape. A
     // positive amount is always trustworthy and returned immediately.
     const fastRecovery = this.tryRecoverFromSerializedOutput(outputHex, blindingKeyObj);
-    if (fastRecovery !== null && fastRecovery.amount > 0) {
+    if (fastRecovery !== null && fastRecovery.amount > 0n) {
       return fastRecovery;
     }
 
     const rawTx = await this.withRetry(() => this.syncProvider.getRawTransaction(txHash));
     if (typeof rawTx === 'string') {
       const rawRecovery = this.tryRecoverFromRawTransaction(rawTx, outputIndex, blindingKeyObj);
-      if (rawRecovery !== null && rawRecovery.amount > 0) {
+      if (rawRecovery !== null && rawRecovery.amount > 0n) {
         return rawRecovery;
       }
     }
@@ -1159,7 +1150,7 @@ export class TransactionKeysSync {
     // Neither path found a positive amount — return the fast result if we had
     // one (a genuine zero-value output), else zero.
     return fastRecovery ?? {
-      amount: 0,
+      amount: 0n,
       gamma: '0',
       memo: null,
       tokenIdHex: null,
@@ -1169,7 +1160,7 @@ export class TransactionKeysSync {
   private tryRecoverFromSerializedOutput(
     outputHex: string,
     blindingKeyObj: any
-  ): { amount: number; gamma: string; memo: string | null; tokenIdHex: string | null } | null {
+  ): { amount: bigint; gamma: string; memo: string | null; tokenIdHex: string | null } | null {
     if (!outputHex) {
       return null;
     }
@@ -1188,7 +1179,7 @@ export class TransactionKeysSync {
       // blinding factor, so gamma is 0.
       if (rangeProofResult.transparentValue !== null && rangeProofResult.transparentValue > 0n) {
         return {
-          amount: Number(rangeProofResult.transparentValue),
+          amount: rangeProofResult.transparentValue,
           gamma: '0',
           memo: null,
           tokenIdHex,
@@ -1200,7 +1191,7 @@ export class TransactionKeysSync {
         // No proof (or the empty proof) — nothing to recover, and
         // recoverAmounts on an empty proof aborts the process.
         return {
-          amount: 0,
+          amount: 0n,
           gamma: '0',
           memo: null,
           tokenIdHex,
@@ -1217,7 +1208,7 @@ export class TransactionKeysSync {
 
       if (results.length > 0 && results[0].isSucc) {
         return {
-          amount: Number(results[0].amount),
+          amount: BigInt(results[0].amount),
           gamma: results[0].gamma ?? '0',
           memo: results[0].msg || null,
           tokenIdHex,
@@ -1234,7 +1225,7 @@ export class TransactionKeysSync {
     rawTx: string,
     outputIndex: number,
     blindingKeyObj: any
-  ): { amount: number; gamma: string; memo: string | null; tokenIdHex: string | null } | null {
+  ): { amount: bigint; gamma: string; memo: string | null; tokenIdHex: string | null } | null {
     const { CTx, RangeProof, AmountRecoveryReq } = blsctModule as any;
 
     try {
@@ -1254,7 +1245,7 @@ export class TransactionKeysSync {
         // Mint outputs carry a transparent value and no range proof; calling
         // recoverAmounts on an empty proof aborts the process.
         return {
-          amount: Number(ctxOut.getValue()),
+          amount: BigInt(ctxOut.getValue()),
           gamma: '0',
           memo: null,
           tokenIdHex,
@@ -1266,7 +1257,7 @@ export class TransactionKeysSync {
 
       if (results.length > 0 && results[0].isSucc) {
         return {
-          amount: Number(results[0].amount),
+          amount: BigInt(results[0].amount),
           gamma: results[0].gamma ?? '0',
           memo: results[0].msg || null,
           tokenIdHex,
@@ -1274,7 +1265,7 @@ export class TransactionKeysSync {
       }
 
       return {
-        amount: 0,
+        amount: 0n,
         gamma: '0',
         memo: null,
         tokenIdHex,
@@ -1314,7 +1305,7 @@ export class TransactionKeysSync {
     outputIndex: number,
     blockHeight: number,
     outputData: string,
-    amount: number,
+    amount: bigint,
     gamma: string,
     memo: string | null,
     tokenId: string | null,
@@ -1334,9 +1325,7 @@ export class TransactionKeysSync {
     // filters (which match null / the 64-zero hash), making the wallet's own
     // unconfirmed change invisible until the next block ("balance shows 0
     // after minting/sending").
-    const normalizedTokenId = tokenId !== null && NAV_TOKEN_ID_HEX_FORMS.has(tokenId.toLowerCase())
-      ? null
-      : tokenId;
+    const normalizedTokenId = isNavTokenId(tokenId) ? null : tokenId;
     await this.walletDB.storeWalletOutput({
       outputHash, txHash, outputIndex, blockHeight, outputData,
       amount, gamma, memo, tokenId: normalizedTokenId, blindingKey, ephemeralKey, spendingKey,
