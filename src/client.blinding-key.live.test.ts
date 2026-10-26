@@ -56,6 +56,8 @@ describeLive('NavioClient blinding key recovery (live testnet)', () => {
         electrum: { host: HOST, port: PORT, ssl: SSL, timeout: 120000 },
         createWalletIfNotExists: true,
         restoreFromMnemonic: MNEMONIC,
+        // NAVIO_BLINDING_MNEMONIC wallets were created with navio-sdk 0.4.0's derivation
+        mnemonicDerivation: 'legacy',
         restoreFromHeight: 0,
       });
 

@@ -115,7 +115,10 @@ interface NavioClientConfig {
   // Wallet options
   createWalletIfNotExists?: boolean; // Create wallet if missing (default: false)
   restoreFromSeed?: string; // Restore from seed (hex string)
-  restoreFromMnemonic?: string; // Restore from BIP39 mnemonic (12-24 words)
+  restoreFromMnemonic?: string; // Restore from BIP39 mnemonic (24 words, or 26 with the birthday words)
+  mnemonicDerivation?: 'core' | 'legacy'; // Mnemonic key derivation (default: 'core'; 'legacy' for wallets from navio-sdk <= 0.4.0)
+  mnemonicPassphrase?: string; // BIP39 passphrase for restoreFromMnemonic / createWalletIfNotExists ('core' only)
+  replaceExistingWallet?: boolean; // Let restoreFromMnemonic replace a stored wallet the phrase does not restore
   restoreFromAuditKey?: string; // Restore watch-only wallet from audit key (160 hex chars)
   restoreFromHeight?: number; // Block height when wallet was created (for restore)
   creationHeight?: number; // Creation height for new wallets (default: chainTip - 100)
@@ -796,6 +799,9 @@ const mnemonic = keyManager.generateNewMnemonic();
 console.log('Mnemonic:', mnemonic);
 // "abandon ability able about above absent absorb abstract absurd abuse access accident..."
 
+// With a BIP39 passphrase (ASCII for a new wallet)
+keyManager.generateNewMnemonic(256, { passphrase: 'extra words' });
+
 // Or generate mnemonic with different word counts
 const mnemonic12 = KeyManager.generateMnemonic(128); // 12 words
 const mnemonic24 = KeyManager.generateMnemonic(256); // 24 words (default)
@@ -804,8 +810,13 @@ const mnemonic24 = KeyManager.generateMnemonic(256); // 24 words (default)
 const isValid = KeyManager.validateMnemonic(mnemonic);
 console.log('Valid:', isValid); // true
 
-// Restore from mnemonic
+// Restore from mnemonic (navio-core's derivation)
 keyManager.setHDSeedFromMnemonic(mnemonic);
+keyManager.setHDSeedFromMnemonic(mnemonic, { passphrase: 'extra words' });
+
+// Restore a wallet created by navio-sdk 0.4.0 or earlier
+keyManager.setHDSeedFromMnemonic(mnemonic, { derivation: 'legacy' });
+keyManager.getMnemonicDerivation(); // 'legacy'
 
 // Get mnemonic from current seed (for backup)
 const backupMnemonic = keyManager.getMnemonic();
@@ -817,9 +828,46 @@ const auditKeyHex = keyManager.getAuditKeyHex();
 console.log('Audit key:', auditKeyHex);
 
 // Static conversion methods
-const scalar = KeyManager.mnemonicToScalar(mnemonic); // Convert to Scalar
-const recovered = KeyManager.seedToMnemonic(scalar); // Convert back to mnemonic
+const scalar = KeyManager.mnemonicToScalar(mnemonic); // Master key, navio-core's derivation
+const legacy = KeyManager.mnemonicToScalar(mnemonic, { derivation: 'legacy' });
+const recovered = KeyManager.seedToMnemonic(legacy); // Back to a mnemonic ('legacy' only)
 ```
+
+A mnemonic becomes the wallet's master key the way navio-core
+(`KeyMan::SetupMnemonicFromEntropy`) and navio-electrum do it, so the same
+phrase restores the same wallet in all three:
+
+- **`'core'`** (default): the master key is EIP-2333 `derive_master_SK` of the
+  32-byte mnemonic entropy, or, with a passphrase, of the 64-byte BIP39 seed of
+  the 24 words. Only 24-word phrases, or 26-word Navio birthday phrases (whose
+  two extra words do not change the keys). As in navio-core, the passphrase is
+  used as raw UTF-8 without NFKD normalization, and a new wallet's passphrase
+  must be ASCII.
+- **`'legacy'`**: navio-sdk 0.4.0 and earlier read the entropy directly as the
+  master key. A wallet created that way restores only with
+  `derivation: 'legacy'`, which also accepts 12–24 words but no passphrase.
+
+`WalletDB` and `IndexedDBWalletDB` store the derivation and passphrase with the
+mnemonic (inside the encrypted seed for an encrypted wallet), so a wallet
+reloads with the keys it was created with. A wallet stored by 0.4.0 or earlier
+has no derivation recorded and loads as `'legacy'`. There is no `'core'`
+mnemonic for a raw master key: `seedToMnemonic()`, and `getMnemonic()` on a
+wallet imported from a seed, give a phrase that restores it only with
+`'legacy'`.
+
+`restoreWalletFromMnemonic()` (and `restoreFromMnemonic` in `NavioClient`)
+over a database that already holds a wallet keeps that wallet when the phrase
+restores it: with the stored derivation and passphrase when the database
+stores this phrase in plaintext, otherwise with whichever derivation matches
+its keys. Its outputs and sync state are kept, and an encrypted wallet stays
+encrypted (it is returned as stored, locked until `unlock()` with its
+password), so an app may pass the phrase on every start, including for a
+wallet created by 0.4.0. A phrase that does
+not restore the stored wallet replaces it (deleting its outputs and sync
+state) only when the stored plaintext phrase is a different one, or with
+`replaceExisting: true` (`replaceExistingWallet` in `NavioClient`); otherwise
+it throws, since it may be the stored wallet's phrase with another derivation
+or passphrase.
 
 #### Sub-addresses
 
@@ -884,6 +932,10 @@ const success = await keyManager.unlock('my-secure-password');
 if (!success) {
   console.log('Wrong password');
 }
+// A lock() while unlock() or changePassword() is still running wins: the
+// pending call throws 'Wallet was locked during unlock' (or
+// '... during changePassword', keeping the old password) and the wallet
+// stays locked.
 
 // Change password
 const changed = await keyManager.changePassword('old-password', 'new-password');
@@ -931,14 +983,22 @@ Manages wallet database persistence.
 #### Wallet Operations
 
 ```typescript
-// Create new wallet
+// Create new wallet (24-word mnemonic, navio-core derivation)
 const keyManager = await walletDB.createWallet(creationHeight);
+const withPassphrase = await walletDB.createWallet(creationHeight, { passphrase: 'extra words' });
 
 // Load existing wallet
 const keyManager = await walletDB.loadWallet();
 
 // Restore wallet from seed
 const keyManager = await walletDB.restoreWallet(seedHex, creationHeight);
+
+// Restore wallet from mnemonic (options: derivation, passphrase, replaceExisting).
+// A wallet already stored that this phrase restores keeps its derivation and data.
+const keyManager = await walletDB.restoreWalletFromMnemonic(mnemonic, creationHeight);
+const legacy = await walletDB.restoreWalletFromMnemonic(mnemonic, creationHeight, {
+  derivation: 'legacy', // created by navio-sdk 0.4.0 or earlier
+});
 
 // Save wallet state
 await walletDB.saveWallet(keyManager);
@@ -1236,6 +1296,8 @@ const client = new NavioClient({
     'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon art',
   restoreFromHeight: 50000, // Block height when wallet was created
   network: 'testnet',
+  // mnemonicPassphrase: 'extra words', // if the wallet has a BIP39 passphrase
+  // mnemonicDerivation: 'legacy',      // if created by navio-sdk 0.4.0 or earlier
 });
 
 await client.initialize();
@@ -1666,7 +1728,7 @@ The wallet database includes the following tables:
 | `view_key`             | View key for output detection                           |
 | `spend_key`            | Spending public key                                     |
 | `hd_chain`             | HD chain information                                    |
-| `master_seed`          | Mnemonic phrase for wallet recovery                     |
+| `master_seed`          | Mnemonic, its derivation and passphrase, or encrypted   |
 | `sub_addresses`        | Sub-address mappings                                    |
 | `wallet_outputs`       | Wallet UTXOs with amounts                               |
 | `output_blinding_keys` | Private blinding scalars of outputs this wallet created |

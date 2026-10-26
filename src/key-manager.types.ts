@@ -59,6 +59,56 @@ export interface HDChain {
 export type SeedType = 'IMPORT_MASTER_KEY' | 'IMPORT_VIEW_KEY';
 
 /**
+ * How a mnemonic becomes the wallet's master key.
+ *
+ * - `'core'`: navio-core's derivation (KeyMan::SetupMnemonicFromEntropy),
+ *   also used by navio-electrum. The master key is EIP-2333
+ *   `derive_master_SK` of the 32-byte mnemonic entropy, or, with a
+ *   passphrase, of the 64-byte BIP39 seed. 24-word mnemonics (or 26-word
+ *   Navio birthday mnemonics) only.
+ * - `'legacy'`: what navio-sdk 0.4.0 and earlier did. The master key is the
+ *   mnemonic entropy read directly as a scalar. Accepts 12–24 words, no
+ *   passphrase. The same mnemonic restores a different wallet in navio-core.
+ */
+export type MnemonicDerivation = 'core' | 'legacy';
+
+/**
+ * Options for turning a mnemonic into a wallet.
+ */
+export interface MnemonicOptions {
+  /** Derivation to use (default `'core'`) */
+  derivation?: MnemonicDerivation;
+  /**
+   * BIP39 passphrase (`'core'` derivation only). As in navio-core it is
+   * used as raw UTF-8 without NFKD normalization; new wallets must use an
+   * ASCII passphrase.
+   */
+  passphrase?: string;
+}
+
+/**
+ * Options for restoring a wallet from a mnemonic into a wallet database.
+ *
+ * When the database already holds a wallet, the restore keeps it if the
+ * phrase restores it: with the stored derivation and passphrase when the
+ * database stores this phrase in plaintext, otherwise with whichever
+ * derivation (`'core'`, then `'legacy'`) matches its keys. Its outputs and
+ * sync state are kept, and an encrypted wallet stays encrypted: the restore
+ * returns it as stored, locked until `unlock()` with its password. A restore that does not match the stored wallet
+ * replaces it, and deletes its outputs and sync state, only when the stored
+ * plaintext phrase shows it is a different wallet, or with
+ * `replaceExisting: true`; otherwise it throws, since the phrase might be
+ * this wallet's with another derivation or passphrase.
+ */
+export interface RestoreMnemonicOptions extends MnemonicOptions {
+  /**
+   * Replace a stored wallet this phrase does not restore, deleting its
+   * outputs and sync state (default false)
+   */
+  replaceExisting?: boolean;
+}
+
+/**
  * Key storage interface for persistent storage
  */
 export interface KeyStorage {

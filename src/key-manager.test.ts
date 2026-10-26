@@ -172,7 +172,7 @@ describe('KeyManager', () => {
       expect(KeyManager.validateMnemonic(invalidMnemonic)).toBe(false);
     });
 
-    it('should convert seed to mnemonic and back', () => {
+    it('should convert seed to mnemonic and back with the legacy derivation', () => {
       const keyManager = new KeyManager();
       const seed = keyManager.generateNewSeed();
       keyManager.setHDSeed(seed);
@@ -181,9 +181,10 @@ describe('KeyManager', () => {
       const mnemonic = keyManager.getMnemonic();
       expect(mnemonic.split(' ').length).toBe(24);
 
-      // Create new key manager from mnemonic
+      // Create new key manager from mnemonic: a raw seed's phrase is its
+      // entropy encoding, which only the legacy derivation inverts
       const keyManager2 = new KeyManager();
-      keyManager2.setHDSeedFromMnemonic(mnemonic);
+      keyManager2.setHDSeedFromMnemonic(mnemonic, { derivation: 'legacy' });
 
       // Should produce the same seed
       expect(keyManager2.getMasterSeedHex()).toBe(keyManager.getMasterSeedHex());
@@ -241,12 +242,12 @@ describe('KeyManager', () => {
       expect(scalar1.serialize()).toBe(scalar2.serialize());
     });
 
-    it('static seedToMnemonic should be reversible', () => {
+    it('static seedToMnemonic should be reversible with the legacy derivation', () => {
       const keyManager = new KeyManager();
       const seed = keyManager.generateNewSeed();
 
       const mnemonic = KeyManager.seedToMnemonic(seed);
-      const recoveredSeed = KeyManager.mnemonicToScalar(mnemonic);
+      const recoveredSeed = KeyManager.mnemonicToScalar(mnemonic, { derivation: 'legacy' });
 
       expect(recoveredSeed.serialize()).toBe(seed.serialize());
     });

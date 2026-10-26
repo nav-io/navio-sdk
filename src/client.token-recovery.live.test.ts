@@ -37,6 +37,8 @@ describeLive('NavioClient token amount recovery live sync', () => {
         backend: 'electrum',
         electrum: { host: HOST, port: PORT, ssl: SSL, timeout: 120000 },
         restoreFromMnemonic: MNEMONIC,
+        // The test wallet was created with navio-sdk 0.4.0's derivation
+        mnemonicDerivation: 'legacy',
         restoreFromHeight: RESTORE_HEIGHT,
       });
 

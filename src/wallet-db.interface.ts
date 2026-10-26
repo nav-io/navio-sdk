@@ -8,6 +8,7 @@
  */
 
 import type { KeyManager } from './key-manager';
+import type { MnemonicOptions, RestoreMnemonicOptions } from './key-manager.types';
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
@@ -176,10 +177,18 @@ export interface IWalletDB {
 
   // -- wallet core ------------------------------------------------------
   loadWallet(): Promise<KeyManager>;
-  createWallet(creationHeight?: number): Promise<KeyManager>;
+  createWallet(creationHeight?: number, options?: Pick<MnemonicOptions, 'passphrase'>): Promise<KeyManager>;
   restoreWallet(seedHex: string, creationHeight?: number): Promise<KeyManager>;
   restoreWalletFromAuditKey(auditKeyHex: string, creationHeight?: number): Promise<KeyManager>;
-  restoreWalletFromMnemonic(mnemonic: string, creationHeight?: number): Promise<KeyManager>;
+  /**
+   * Restore a wallet from a mnemonic. A wallet already stored keeps its
+   * derivation and data; see {@link RestoreMnemonicOptions}.
+   */
+  restoreWalletFromMnemonic(
+    mnemonic: string,
+    creationHeight?: number,
+    options?: RestoreMnemonicOptions
+  ): Promise<KeyManager>;
   saveWallet(keyManager?: KeyManager): Promise<void>;
   /**
    * Persist (hashId -> sub-address) mappings so sub-addresses generated or
