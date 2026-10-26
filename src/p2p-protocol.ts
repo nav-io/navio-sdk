@@ -373,7 +373,11 @@ export class P2PClient {
     this.closeWith(new Error('Disconnected'));
   }
 
-  /** Destroy the socket and fail everything waiting on it with `err`. */
+  /**
+   * Destroy the socket and fail everything waiting on it with `err`,
+   * including a connect() still in its handshake: the socket's close handler
+   * ignores a socket that is no longer live, so it would not.
+   */
   private closeWith(err: Error): void {
     const socket = this.socket;
     this.socket = null;
@@ -381,7 +385,10 @@ export class P2PClient {
       socket.removeAllListeners('data');
       socket.destroy();
     }
+    const handshake = this.handshakeWaiter;
+    this.handshakeWaiter = null;
     this.onClosed(err);
+    handshake?.reject(err);
   }
 
   private resetReceiveBuffer(): void {

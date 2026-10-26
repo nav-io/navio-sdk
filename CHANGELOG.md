@@ -83,7 +83,8 @@ Format follows [Keep a Changelog](https://keepachangelog.com/); versions follow 
   rejected and the count stays at zero.
 - `P2PClient` drops a peer that announces a message over 32 MB
   (`MAX_P2P_MESSAGE_LENGTH`) instead of buffering it, and joins a large
-  message's chunks once instead of on every chunk.
+  message's chunks once instead of on every chunk. During the handshake
+  `connect()` fails with that reason instead of a connection timeout.
 
 ### Changed
 

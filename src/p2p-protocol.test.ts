@@ -3,6 +3,7 @@
  * into the receive path of a client marked connected.
  */
 
+import * as net from 'net';
 import { describe, expect, it } from 'vitest';
 import { sha256 } from '@noble/hashes/sha256';
 import { MAX_P2P_MESSAGE_LENGTH, NetworkMagic, P2PClient } from './p2p-protocol';
@@ -43,6 +44,29 @@ describe('P2PClient message framing', () => {
     expect(client.isConnected()).toBe(false);
     expect(closed).toHaveLength(1);
     expect((client as any).receiveBuffer.length).toBe(0);
+  });
+
+  it('fails a connect() in its handshake with the reason, not a timeout', async () => {
+    // A peer that answers the connection with an oversized message header
+    const peers: net.Socket[] = [];
+    const server = net.createServer(socket => {
+      peers.push(socket);
+      socket.on('error', () => undefined);
+      socket.write(frame('version', Buffer.alloc(0), MAX_P2P_MESSAGE_LENGTH + 1).subarray(0, 24));
+    });
+    await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+    const port = (server.address() as net.AddressInfo).port;
+    const client = new P2PClient({ host: '127.0.0.1', port, network: 'regtest', timeout: 10_000 });
+    try {
+      const started = Date.now();
+      await expect(client.connect()).rejects.toThrow('oversized version message');
+      expect(Date.now() - started).toBeLessThan(5_000);
+      expect(client.isConnected()).toBe(false);
+    } finally {
+      client.disconnect();
+      peers.forEach(peer => peer.destroy());
+      await new Promise(resolve => server.close(resolve));
+    }
   });
 
   it('reassembles a large message delivered in many chunks', async () => {
