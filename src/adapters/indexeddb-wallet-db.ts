@@ -17,6 +17,7 @@ import { KeyManager } from '../key-manager';
 import type { HDChain, SubAddressIdentifier } from '../key-manager.types';
 import * as blsctModule from '@nav-io/navio-blsct';
 import { isStakedCommitmentOutputHex } from '../staking';
+import { isSealedBlindingKey } from '../output-blinding-key-store';
 import type {
   IWalletDB,
   SyncState,
@@ -879,9 +880,52 @@ export class IndexedDBWalletDB implements IWalletDB {
     return rec?.blindingKey ?? null;
   }
 
-  async getAllOutputBlindingKeys(): Promise<Array<{ outputHash: string; blindingKey: string }>> {
-    const rows = await this.getAll<{ outputHash: string; blindingKey: string }>('outputBlindingKeys');
-    return rows.map(({ outputHash, blindingKey }) => ({ outputHash, blindingKey }));
+  async getUnsealedOutputBlindingKeys(): Promise<Array<{ outputHash: string; blindingKey: string }>> {
+    // The store has no index on the record, so walk it with a cursor and keep
+    // only the plaintext rows rather than materialising every record.
+    const db = this.ensureOpen();
+    const tx = db.transaction('outputBlindingKeys', 'readonly');
+    const rows: Array<{ outputHash: string; blindingKey: string }> = [];
+    const req = tx.objectStore('outputBlindingKeys').openCursor();
+    req.onsuccess = () => {
+      const cursor = req.result;
+      if (!cursor) return;
+      const { outputHash, blindingKey } = cursor.value as { outputHash: string; blindingKey: string };
+      if (!isSealedBlindingKey(blindingKey)) rows.push({ outputHash, blindingKey });
+      cursor.continue();
+    };
+    await idbTx(tx);
+    return rows;
+  }
+
+  async replaceOutputBlindingKey(
+    outputHash: string,
+    expected: string,
+    replacement: string,
+  ): Promise<boolean> {
+    // Compare and write in one readwrite transaction, keeping createdAt.
+    const db = this.ensureOpen();
+    const tx = db.transaction('outputBlindingKeys', 'readwrite');
+    const store = tx.objectStore('outputBlindingKeys');
+    let replaced = false;
+    const getReq = store.get(outputHash);
+    getReq.onsuccess = () => {
+      const rec = getReq.result as { outputHash: string; blindingKey: string; createdAt?: number } | undefined;
+      if (rec?.blindingKey !== expected) return;
+      store.put({ ...rec, blindingKey: replacement });
+      replaced = true;
+    };
+    await idbTx(tx);
+    return replaced;
+  }
+
+  async getBlindingGeneration(anchorOutid: string): Promise<number | null> {
+    const rec = await this.get<{ anchorOutid: string; nextGeneration: number }>(
+      'blindingGenerations',
+      anchorOutid.toLowerCase(),
+    );
+    const next = rec?.nextGeneration;
+    return typeof next === 'number' && Number.isInteger(next) && next >= 0 ? next : null;
   }
 
   async reserveBlindingGeneration(anchorOutid: string): Promise<number> {

@@ -36,7 +36,7 @@ function makeClient(walletDB: Partial<IWalletDB>, seed = Scalar.deserialize('07'
 }
 
 function inputs(...outids: string[]): Array<{ output: WalletOutput }> {
-  return outids.map((outputHash) => ({ output: { outputHash } as WalletOutput }));
+  return outids.map(outputHash => ({ output: { outputHash } as WalletOutput }));
 }
 
 function allocate(client: NavioClient, ...outids: string[]): Promise<BlindingKeyAllocator> {
@@ -71,6 +71,19 @@ describe('WalletDB.reserveBlindingGeneration', () => {
       Array.from({ length: 10 }, () => db.reserveBlindingGeneration(ANCHOR))
     );
     expect([...claimed].sort((a, b) => a - b)).toEqual([0, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
+    await db.close();
+  });
+
+  it('reports the counter without claiming one', async () => {
+    const db = new WalletDB({ type: 'better-sqlite3' });
+    await db.open(':memory:');
+
+    expect(await db.getBlindingGeneration(ANCHOR)).toBeNull();
+    await db.reserveBlindingGeneration(ANCHOR);
+    await db.reserveBlindingGeneration(ANCHOR);
+    expect(await db.getBlindingGeneration(ANCHOR.toUpperCase())).toBe(2);
+    expect(await db.getBlindingGeneration(ANCHOR)).toBe(2);
+    expect(await db.reserveBlindingGeneration(ANCHOR)).toBe(2);
     await db.close();
   });
 
@@ -111,6 +124,8 @@ describe('IndexedDBWalletDB.reserveBlindingGeneration', () => {
 
     const reopened = new IndexedDBWalletDB();
     await reopened.open(PATH);
+    expect(await reopened.getBlindingGeneration(ANCHOR.toUpperCase())).toBe(6);
+    expect(await reopened.getBlindingGeneration('cd'.repeat(32))).toBeNull();
     expect(await reopened.reserveBlindingGeneration(ANCHOR)).toBe(6);
     await reopened.close();
   });
@@ -154,15 +169,22 @@ describe('NavioClient blinding-key generations', () => {
 
     const firstKeys = [first.next(), first.next()];
     const secondKeys = [second.next(), second.next()];
-    const firstHex = firstKeys.map((k) => k.serialize());
-    expect(secondKeys.some((k) => firstHex.includes(k.serialize()))).toBe(false);
+    const firstHex = firstKeys.map(k => k.serialize());
+    expect(secondKeys.some(k => firstHex.includes(k.serialize()))).toBe(false);
 
     // Each matches navio-core's derivation for its generation…
-    expect(firstKeys[1].serialize()).toBe(deriveBlindingKey(seed, first.anchorOutid!, 1, 0).serialize());
-    expect(secondKeys[1].serialize()).toBe(deriveBlindingKey(seed, first.anchorOutid!, 1, 1).serialize());
+    expect(firstKeys[1].serialize()).toBe(
+      deriveBlindingKey(seed, first.anchorOutid!, 1, 0).serialize()
+    );
+    expect(secondKeys[1].serialize()).toBe(
+      deriveBlindingKey(seed, first.anchorOutid!, 1, 1).serialize()
+    );
 
     // …and seed-only recovery finds both.
-    for (const [generation, key] of [[0, firstKeys[1]], [1, secondKeys[1]]] as const) {
+    for (const [generation, key] of [
+      [0, firstKeys[1]],
+      [1, secondKeys[1]],
+    ] as const) {
       const match = searchBlindingKey(seed, [ANCHOR, OTHER], blindingPublicKeyHex(key));
       expect(match!.generation).toBe(generation);
       expect(match!.counter).toBe(1);
@@ -180,18 +202,49 @@ describe('NavioClient blinding-key generations', () => {
     expect(allocator.next().serialize()).toBe(deriveBlindingKey(seed, ANCHOR, 0, 3).serialize());
   });
 
-  it('falls back to random keys when the generation cannot be persisted', async () => {
-    const { client } = makeClient({
-      reserveBlindingGeneration: vi.fn(async () => { throw new Error('disk full'); }),
-    });
-    expect((await allocate(client, ANCHOR)).isDeterministic).toBe(false);
+  it('falls back to random keys when the generation cannot be persisted, and warns once', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const { client } = makeClient({
+        reserveBlindingGeneration: vi.fn(async () => {
+          throw new Error('disk full');
+        }),
+      });
+      expect((await allocate(client, ANCHOR)).isDeterministic).toBe(false);
+      expect((await allocate(client, OTHER)).isDeterministic).toBe(false);
+      expect(warn).toHaveBeenCalledTimes(1);
+      expect(String(warn.mock.calls[0][0])).toMatch(/random blinding keys/);
+    } finally {
+      warn.mockRestore();
+    }
   });
 
-  it('falls back to random keys once an anchor has used every generation', async () => {
-    const { client } = makeClient({
-      reserveBlindingGeneration: vi.fn(async () => MAX_GENERATION_SEARCH),
-    });
-    expect((await allocate(client, ANCHOR)).isDeterministic).toBe(false);
+  it('falls back to random keys once an anchor has used every generation, and warns once per anchor', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const { client } = makeClient({
+        reserveBlindingGeneration: vi.fn(async () => MAX_GENERATION_SEARCH),
+      });
+      expect((await allocate(client, ANCHOR)).isDeterministic).toBe(false);
+      expect((await allocate(client, ANCHOR)).isDeterministic).toBe(false);
+      expect(warn).toHaveBeenCalledTimes(1);
+      expect(String(warn.mock.calls[0][0])).toContain(ANCHOR);
+      expect((await allocate(client, OTHER)).isDeterministic).toBe(false);
+      expect(warn).toHaveBeenCalledTimes(2);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('does not warn for a build that gets its generation', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const { client } = makeClient({ reserveBlindingGeneration: vi.fn(async () => 0) });
+      expect((await allocate(client, ANCHOR)).isDeterministic).toBe(true);
+      expect(warn).not.toHaveBeenCalled();
+    } finally {
+      warn.mockRestore();
+    }
   });
 
   it('claims nothing for random keys', async () => {

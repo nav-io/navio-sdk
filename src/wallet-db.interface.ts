@@ -280,10 +280,26 @@ export interface IWalletDB {
    */
   getOutputBlindingKey(outputHash: string): Promise<string | null>;
   /**
-   * Every stored blinding-key record, as saved. Used to encrypt the plaintext
-   * rows of a wallet that has been encrypted since they were written.
+   * The stored blinding-key records that are not encrypted (do not start with
+   * `SEALED_BLINDING_KEY_PREFIX`), as saved. Used to encrypt the plaintext rows
+   * of a wallet that has been encrypted since they were written.
    */
-  getAllOutputBlindingKeys(): Promise<Array<{ outputHash: string; blindingKey: string }>>;
+  getUnsealedOutputBlindingKeys(): Promise<Array<{ outputHash: string; blindingKey: string }>>;
+  /**
+   * Replace an output's blinding-key record in place, only if it still holds
+   * `expected`. Unlike {@link saveOutputBlindingKey} it keeps the row's
+   * creation time, and it never overwrites a record written concurrently.
+   *
+   * @param outputHash - Output hash, display hex
+   * @param expected - The record the caller read
+   * @param replacement - The record to store instead
+   * @returns Whether the row was replaced
+   */
+  replaceOutputBlindingKey(
+    outputHash: string,
+    expected: string,
+    replacement: string
+  ): Promise<boolean>;
   /**
    * Claim the next build generation for a blinding-key anchor, persisting the
    * bump before returning.
@@ -304,6 +320,17 @@ export interface IWalletDB {
    * @returns The generation for this build
    */
   reserveBlindingGeneration(anchorOutid: string): Promise<number>;
+  /**
+   * How many build generations this database has handed out for an anchor
+   * (the next one {@link reserveBlindingGeneration} would return), without
+   * claiming one. Null when it has never handed one out.
+   *
+   * Only says what *this* database reserved: after a seed-only restore, or on
+   * another wallet sharing the seed, outputs may exist at higher generations.
+   *
+   * @param anchorOutid - The canonical anchor outid, display hex
+   */
+  getBlindingGeneration(anchorOutid: string): Promise<number | null>;
 
   // -- created collections ----------------------------------------------
   saveCreatedCollection(record: CreatedCollectionRecord): Promise<void>;

@@ -161,8 +161,15 @@ function makeRecoveryClient(options: {
   (client as any).walletDB = {
     getOutputBlindingKey: vi.fn(async (hash: string) => stored.get(hash) ?? null),
     saveOutputBlindingKey: vi.fn(async (hash: string, key: string) => { stored.set(hash, key); }),
-    getAllOutputBlindingKeys: vi.fn(async () =>
-      [...stored].map(([outputHash, blindingKey]) => ({ outputHash, blindingKey }))),
+    getUnsealedOutputBlindingKeys: vi.fn(async () =>
+      [...stored]
+        .filter(([, blindingKey]) => !blindingKey.startsWith('enc1:'))
+        .map(([outputHash, blindingKey]) => ({ outputHash, blindingKey }))),
+    replaceOutputBlindingKey: vi.fn(async (hash: string, expected: string, next: string) => {
+      if (stored.get(hash) !== expected) return false;
+      stored.set(hash, next);
+      return true;
+    }),
   };
   (client as any).keyManager = options.keyManager ?? {
     isEncrypted: () => false,
@@ -402,6 +409,78 @@ describe('searchBlindingKey', () => {
     const target = blindingPublicKeyHex(deriveBlindingKey(seed, ours, 0, 0));
     const match = searchBlindingKey(seed, ['', 'not-hex', 'abcd', ours], target);
     expect(match!.outid).toBe(ours);
+  });
+
+  /** How many candidate scalars a search checks, counted by deserializations. */
+  function countChecks(run: () => unknown): number {
+    const spy = vi.spyOn(Scalar, 'deserialize');
+    try {
+      run();
+      return spy.mock.calls.length;
+    } finally {
+      spy.mockRestore();
+    }
+  }
+
+  it('tries the legacy layout right after generation 0, not after 31 more', () => {
+    // Most existing outputs were built by navio-sdk 0.4, so this is the
+    // common recovery case; it used to cost 32 * 16 wasted checks first.
+    const legacy = deriveLegacyBlindingKey(seed, ours, 1);
+    const checks = countChecks(() =>
+      expect(searchBlindingKey(seed, [ours], blindingPublicKeyHex(legacy))!.generation).toBeNull()
+    );
+    expect(checks).toBeLessThanOrEqual(MAX_OUTPUT_SEARCH + 2);
+  });
+
+  it('searches the first candidate completely before the fallbacks', () => {
+    const fallbacks = [foreignOutid(0x11), foreignOutid(0x22), foreignOutid(0x33)];
+    const target = blindingPublicKeyHex(deriveBlindingKey(seed, ours, 0, 1));
+    const checks = countChecks(() =>
+      expect(searchBlindingKey(seed, [ours, ...fallbacks], target)!.generation).toBe(1)
+    );
+    // Generation 0 and legacy of the anchor, then the hit.
+    expect(checks).toBe(2 * MAX_OUTPUT_SEARCH + 1);
+  });
+
+  it('bounds generations per candidate with generationLimit', () => {
+    const fallbacks = [foreignOutid(0x11), foreignOutid(0x22), foreignOutid(0x33)];
+    const generationLimit = (outid: string) => (outid === ours ? 2 : 1);
+
+    // A key at generation 2 is past the anchor's bound…
+    const gen2 = blindingPublicKeyHex(deriveBlindingKey(seed, ours, 0, 2));
+    expect(searchBlindingKey(seed, [ours, ...fallbacks], gen2, { generationLimit })).toBeNull();
+    // …generation 1 is inside it…
+    const gen1 = blindingPublicKeyHex(deriveBlindingKey(seed, ours, 4, 1));
+    expect(searchBlindingKey(seed, [ours], gen1, { generationLimit })!.generation).toBe(1);
+    // …and a fallback only gets generation 0 and the legacy layout.
+    const fallbackGen1 = blindingPublicKeyHex(deriveBlindingKey(seed, fallbacks[1], 0, 1));
+    expect(searchBlindingKey(seed, [ours, ...fallbacks], fallbackGen1, { generationLimit })).toBeNull();
+    const fallbackLegacy = blindingPublicKeyHex(deriveLegacyBlindingKey(seed, fallbacks[1], 0));
+    expect(
+      searchBlindingKey(seed, [ours, ...fallbacks], fallbackLegacy, { generationLimit })!.outid
+    ).toBe(fallbacks[1]);
+
+    // A miss costs exactly the bounded work: (2 + 1) * 16 for the anchor and
+    // (1 + 1) * 16 per fallback, instead of 33 * 16 for each of the four.
+    const foreign = blindingPublicKeyHex(Scalar.deserialize('3b'.repeat(32)));
+    const checks = countChecks(() =>
+      searchBlindingKey(seed, [ours, ...fallbacks], foreign, { generationLimit })
+    );
+    expect(checks).toBe((3 + 3 * 2) * MAX_OUTPUT_SEARCH);
+    expect(countChecks(() => searchBlindingKey(seed, [ours], foreign))).toBe(
+      (MAX_GENERATION_SEARCH + 1) * MAX_OUTPUT_SEARCH
+    );
+  });
+
+  it('still tries the legacy layout when generationLimit is 0, and clamps a limit past the maximum', () => {
+    const legacy = blindingPublicKeyHex(deriveLegacyBlindingKey(seed, ours, 2));
+    expect(searchBlindingKey(seed, [ours], legacy, { generationLimit: () => 0 })!.counter).toBe(2);
+    const gen0 = blindingPublicKeyHex(deriveBlindingKey(seed, ours, 0, 0));
+    expect(searchBlindingKey(seed, [ours], gen0, { generationLimit: () => 0 })).toBeNull();
+    const last = blindingPublicKeyHex(deriveBlindingKey(seed, ours, 0, MAX_GENERATION_SEARCH - 1));
+    expect(searchBlindingKey(seed, [ours], last, { generationLimit: () => 1e9 })!.generation).toBe(
+      MAX_GENERATION_SEARCH - 1
+    );
   });
 });
 

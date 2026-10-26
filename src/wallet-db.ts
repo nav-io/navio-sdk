@@ -33,6 +33,7 @@ import type { HDChain, SubAddressIdentifier } from './key-manager.types';
 import * as blsctModule from '@nav-io/navio-blsct';
 import type { IDatabaseAdapter, DatabaseAdapterOptions } from './database-adapter';
 import { createDatabaseAdapter } from './database-adapter';
+import { SEALED_BLINDING_KEY_PREFIX } from './output-blinding-key-store';
 import type { SyncState, StoreOutputParams, TxType, CreatedCollectionRecord, SubAddressEntry, StandingOrderRow } from './wallet-db.interface';
 export type { SyncState, WalletOutput, WalletMetadata, StoreOutputParams, IWalletDB, TxType, CreatedCollectionRecord, SubAddressEntry } from './wallet-db.interface';
 
@@ -1421,11 +1422,14 @@ export class WalletDB {
     return value;
   }
 
-  async getAllOutputBlindingKeys(): Promise<Array<{ outputHash: string; blindingKey: string }>> {
+  async getUnsealedOutputBlindingKeys(): Promise<Array<{ outputHash: string; blindingKey: string }>> {
     if (!this.adapter) throw new Error('Database not open');
+    // substr rather than LIKE: LIKE treats '_' as a wildcard and is
+    // case-insensitive.
     const stmt = await this.adapter.prepare(
-      'SELECT output_hash, blinding_key FROM output_blinding_keys'
+      'SELECT output_hash, blinding_key FROM output_blinding_keys WHERE substr(blinding_key, 1, ?) <> ?'
     );
+    stmt.bind([SEALED_BLINDING_KEY_PREFIX.length, SEALED_BLINDING_KEY_PREFIX]);
     const rows: Array<{ outputHash: string; blindingKey: string }> = [];
     while (await stmt.step()) {
       const row = await stmt.getAsObject();
@@ -1433,6 +1437,37 @@ export class WalletDB {
     }
     await stmt.free();
     return rows;
+  }
+
+  async replaceOutputBlindingKey(
+    outputHash: string,
+    expected: string,
+    replacement: string
+  ): Promise<boolean> {
+    if (!this.adapter) throw new Error('Database not open');
+    const stmt = await this.adapter.prepare(
+      `UPDATE output_blinding_keys SET blinding_key = ?
+       WHERE output_hash = ? AND blinding_key = ?
+       RETURNING output_hash`
+    );
+    stmt.bind([replacement, outputHash, expected]);
+    const replaced = await stmt.step();
+    await stmt.free();
+    return replaced;
+  }
+
+  async getBlindingGeneration(anchorOutid: string): Promise<number | null> {
+    if (!this.adapter) throw new Error('Database not open');
+    const stmt = await this.adapter.prepare(
+      'SELECT next_generation FROM blinding_generations WHERE anchor_outid = ?'
+    );
+    stmt.bind([anchorOutid.toLowerCase()]);
+    let next: number | null = null;
+    if (await stmt.step()) {
+      next = Number((await stmt.getAsObject()).next_generation);
+    }
+    await stmt.free();
+    return next !== null && Number.isInteger(next) && next >= 0 ? next : null;
   }
 
   async reserveBlindingGeneration(anchorOutid: string): Promise<number> {

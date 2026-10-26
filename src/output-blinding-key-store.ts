@@ -14,6 +14,7 @@
  * @module output-blinding-key-store
  */
 
+import { bytesToHex, hexToBytes } from '@noble/hashes/utils';
 import type { KeyManager } from './key-manager';
 import type { IWalletDB } from './wallet-db.interface';
 
@@ -82,7 +83,8 @@ export async function openOutputBlindingKey(
 /**
  * Encrypt every plaintext blinding scalar an encrypted wallet still stores:
  * rows written before the wallet was encrypted, or by an SDK version that did
- * not encrypt them.
+ * not encrypt them. Each row is rewritten in place, keeping its creation time,
+ * and only if it still holds the plaintext that was read.
  *
  * Does nothing for an unencrypted or locked wallet. Safe to call repeatedly.
  *
@@ -91,37 +93,72 @@ export async function openOutputBlindingKey(
  * @returns How many rows were encrypted
  */
 export async function sealPlaintextOutputBlindingKeys(
-  walletDB: Pick<IWalletDB, 'getAllOutputBlindingKeys' | 'saveOutputBlindingKey'>,
+  walletDB: Pick<IWalletDB, 'getUnsealedOutputBlindingKeys' | 'replaceOutputBlindingKey'>,
   keyManager: Pick<KeyManager, 'isEncrypted' | 'isUnlocked' | 'encryptSecret'>
 ): Promise<number> {
   if (!keyManager.isEncrypted() || !keyManager.isUnlocked()) {
     return 0;
   }
   let sealed = 0;
-  for (const { outputHash, blindingKey } of await walletDB.getAllOutputBlindingKeys()) {
+  for (const { outputHash, blindingKey } of await walletDB.getUnsealedOutputBlindingKeys()) {
     if (isSealedBlindingKey(blindingKey)) continue;
-    await walletDB.saveOutputBlindingKey(
-      outputHash,
-      await sealOutputBlindingKey(keyManager, blindingKey)
-    );
-    sealed++;
+    const record = await sealOutputBlindingKey(keyManager, blindingKey);
+    if (await walletDB.replaceOutputBlindingKey(outputHash, blindingKey, record)) {
+      sealed++;
+    }
   }
   return sealed;
 }
 
-function hexToBytes(hex: string): Uint8Array {
-  if (hex.length % 2 !== 0 || !/^[0-9a-fA-F]*$/.test(hex)) {
-    throw new Error('Invalid hex');
-  }
-  const out = new Uint8Array(hex.length / 2);
-  for (let i = 0; i < out.length; i++) {
-    out[i] = parseInt(hex.slice(i * 2, i * 2 + 2), 16);
-  }
-  return out;
+/** Per database: whether its rows are sealed, and how many attempts failed. */
+const sealState = new WeakMap<object, { sealed: boolean; failures: number }>();
+
+/**
+ * Record that every plaintext row of `walletDB` has been sealed, so
+ * {@link ensureOutputBlindingKeysSealed} stops scanning it.
+ *
+ * @param walletDB - The wallet database
+ */
+export function markOutputBlindingKeysSealed(walletDB: object): void {
+  sealState.set(walletDB, { sealed: true, failures: 0 });
 }
 
-function bytesToHex(bytes: Uint8Array): string {
-  return Array.from(bytes)
-    .map(b => b.toString(16).padStart(2, '0'))
-    .join('');
+/**
+ * {@link sealPlaintextOutputBlindingKeys}, at most once per database while the
+ * wallet is encrypted and unlocked, and never throwing.
+ *
+ * The client and the sync engine call it whenever they touch the table. Once
+ * a pass succeeds no plaintext row can reappear: every write after it goes
+ * through {@link sealOutputBlindingKey}, and an encrypted, locked wallet cannot
+ * write one at all. A failed pass leaves the plaintext readable, is retried on
+ * the next call, and is reported with `console.warn` on the first failure and
+ * then at every power of two, so a database that keeps failing is visible
+ * without flooding the log.
+ *
+ * @param walletDB - The wallet database
+ * @param keyManager - The wallet's key manager
+ */
+export async function ensureOutputBlindingKeysSealed(
+  walletDB: Pick<IWalletDB, 'getUnsealedOutputBlindingKeys' | 'replaceOutputBlindingKey'>,
+  keyManager: Pick<KeyManager, 'isEncrypted' | 'isUnlocked' | 'encryptSecret'>
+): Promise<void> {
+  const state = sealState.get(walletDB) ?? { sealed: false, failures: 0 };
+  if (state.sealed || !keyManager.isEncrypted() || !keyManager.isUnlocked()) {
+    return;
+  }
+  try {
+    await sealPlaintextOutputBlindingKeys(walletDB, keyManager);
+    markOutputBlindingKeysSealed(walletDB);
+  } catch (error) {
+    state.failures++;
+    sealState.set(walletDB, state);
+    if ((state.failures & (state.failures - 1)) === 0) {
+      console.warn(
+        `Could not encrypt the plaintext output blinding keys of an encrypted wallet ` +
+          `(attempt ${state.failures}); they stay on disk in plaintext until this succeeds. ` +
+          'Retrying on the next use.',
+        error
+      );
+    }
+  }
 }

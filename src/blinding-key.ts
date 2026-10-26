@@ -46,13 +46,15 @@
  *   {@link MAX_GENERATION_SEARCH} generations.
  *
  * navio-sdk 0.4 and earlier used a 91-byte layout without the generation (see
- * {@link buildLegacyBlindingMaterial}). Recovery still tries it after the
- * current layout, so outputs those versions created stay recoverable.
+ * {@link buildLegacyBlindingMaterial}). Recovery still tries it, right after
+ * generation 0 of the current layout, so outputs those versions created stay
+ * recoverable.
  *
  * @module blinding-key
  */
 
 import { sha256 } from '@noble/hashes/sha256';
+import { hexToBytes } from '@noble/hashes/utils';
 import { PublicKey, Scalar } from '@nav-io/navio-blsct';
 
 /** ASCII domain separator. Exactly 23 bytes, no NUL terminator. */
@@ -337,6 +339,25 @@ export interface BlindingKeySearchResult {
 }
 
 /**
+ * Options for {@link searchBlindingKey}.
+ */
+export interface BlindingKeySearchOptions {
+  /**
+   * How many generations of the current layout to try for a candidate anchor:
+   * generations `0` to `limit - 1`. Clamped to
+   * `[0, MAX_GENERATION_SEARCH]`; return `undefined` for the full
+   * {@link MAX_GENERATION_SEARCH}. The legacy layout is tried regardless.
+   *
+   * A caller that knows how many generations were handed out for an anchor
+   * (its `IWalletDB` counter) can pass that to skip the rest; one that knows
+   * nothing should leave it out, since after a seed-only restore, or on a
+   * second wallet sharing the seed, the local counter says nothing about what
+   * was built.
+   */
+  generationLimit?: (outid: string) => number | undefined;
+}
+
+/**
  * Search for the blinding scalar of an output with public point
  * `targetPublicKeyHex`, over each candidate anchor, every generation and every
  * ordinal.
@@ -354,68 +375,116 @@ export interface BlindingKeySearchResult {
  *   transaction in a block into one, so an output's final index is not the one
  *   its sender assigned.
  * - **Generations** are searched because the counter that picked one is not
- *   available after a seed-only restore. Generation is the outer loop, so an
- *   anchor that was never rebuilt on is found first.
- * - The **legacy layout** of navio-sdk 0.4 and earlier is tried for each
- *   anchor after every generation of the current one, so outputs those
- *   versions created stay recoverable.
+ *   available after a seed-only restore.
+ * - The **legacy layout** of navio-sdk 0.4 and earlier keeps outputs those
+ *   versions created recoverable.
  *
- * The worst case is
- * `|vin| * MAX_OUTPUT_SEARCH * (MAX_GENERATION_SEARCH + 1)` scalar
- * multiplications, paid only for an output this seed did not create. The
- * search is self-verifying: a wrong candidate never matches the public point,
- * so it can only cost time, never produce a false key. Duplicate candidates
- * are skipped.
+ * Order: the first candidate completely — generation 0, the legacy layout,
+ * then generations 1 and up — and then, for the fallbacks, generation 0 and
+ * the legacy layout of each before any of their higher generations. So an
+ * output built once on its canonical anchor (nearly all of them) costs at most
+ * `2 * MAX_OUTPUT_SEARCH` checks whichever layout built it, and a fallback
+ * match does not wait behind 31 unused generations of every other input.
+ *
+ * The worst case, paid only for an output this seed did not create, is
+ * `|candidates| * MAX_OUTPUT_SEARCH * (generations + 1)` scalar
+ * multiplications, with `generations` from
+ * {@link BlindingKeySearchOptions.generationLimit} (default
+ * {@link MAX_GENERATION_SEARCH}). The search is self-verifying: a wrong
+ * candidate never matches the public point, so it can only cost time, never
+ * produce a false key. Duplicate candidates are skipped.
  *
  * @param seed - The wallet's HD seed scalar
  * @param candidateOutids - Anchors to try, in order, display (reversed) hex
  * @param targetPublicKeyHex - The output's on-chain ephemeral key (`k * G`)
+ * @param options - Optional per-anchor generation bounds
  * @returns The match, or null if this seed did not create the output
  */
 export function searchBlindingKey(
   seed: InstanceType<typeof Scalar>,
   candidateOutids: string[],
-  targetPublicKeyHex: string
+  targetPublicKeyHex: string,
+  options: BlindingKeySearchOptions = {}
 ): BlindingKeySearchResult | null {
   const seedBytes = seedScalarToBytes(seed);
   const target = targetPublicKeyHex.toLowerCase();
-  const tried = new Set<string>();
 
   const check = (scalarHex: string): InstanceType<typeof Scalar> | null => {
     const scalar = Scalar.deserialize(scalarHex);
     return blindingPublicKeyHex(scalar) === target ? scalar : null;
   };
 
+  const anchors: Array<{ outid: string; bytes: Uint8Array; generations: number }> = [];
+  const seen = new Set<string>();
   for (const outid of candidateOutids) {
-    if (tried.has(outid)) continue;
-    tried.add(outid);
-
-    let outidBytes: Uint8Array;
+    if (seen.has(outid)) continue;
+    seen.add(outid);
+    let bytes: Uint8Array;
     try {
-      outidBytes = outidDisplayHexToBytes(outid);
+      bytes = outidDisplayHexToBytes(outid);
     } catch {
       // A malformed input hash is simply not a candidate anchor.
       continue;
     }
-
-    for (let generation = 0; generation < MAX_GENERATION_SEARCH; generation++) {
-      for (let counter = 0; counter < MAX_OUTPUT_SEARCH; counter++) {
-        const scalar = check(deriveBlindingScalarHex(seedBytes, outidBytes, counter, generation));
-        if (scalar) {
-          return { scalar, outid, counter, generation };
-        }
-      }
-    }
-
-    for (let counter = 0; counter < MAX_OUTPUT_SEARCH; counter++) {
-      const scalar = check(deriveLegacyBlindingScalarHex(seedBytes, outidBytes, counter));
-      if (scalar) {
-        return { scalar, outid, counter, generation: null };
-      }
-    }
+    const limit = options.generationLimit?.(outid);
+    const generations =
+      limit === undefined || !Number.isFinite(limit)
+        ? MAX_GENERATION_SEARCH
+        : Math.max(0, Math.min(MAX_GENERATION_SEARCH, Math.floor(limit)));
+    anchors.push({ outid, bytes, generations });
   }
 
-  return null;
+  const tryGeneration = (
+    anchor: (typeof anchors)[number],
+    generation: number
+  ): BlindingKeySearchResult | null => {
+    for (let counter = 0; counter < MAX_OUTPUT_SEARCH; counter++) {
+      const scalar = check(deriveBlindingScalarHex(seedBytes, anchor.bytes, counter, generation));
+      if (scalar) return { scalar, outid: anchor.outid, counter, generation };
+    }
+    return null;
+  };
+
+  const tryLegacy = (anchor: (typeof anchors)[number]): BlindingKeySearchResult | null => {
+    for (let counter = 0; counter < MAX_OUTPUT_SEARCH; counter++) {
+      const scalar = check(deriveLegacyBlindingScalarHex(seedBytes, anchor.bytes, counter));
+      if (scalar) return { scalar, outid: anchor.outid, counter, generation: null };
+    }
+    return null;
+  };
+
+  /** Generations 1 and up, generation as the outer loop. */
+  const searchGenerations = (
+    list: Array<(typeof anchors)[number]>
+  ): BlindingKeySearchResult | null => {
+    for (let generation = 1; generation < MAX_GENERATION_SEARCH; generation++) {
+      for (const anchor of list) {
+        if (generation >= anchor.generations) continue;
+        const match = tryGeneration(anchor, generation);
+        if (match) return match;
+      }
+    }
+    return null;
+  };
+
+  const [primary, ...fallbacks] = anchors;
+  if (primary) {
+    // The first candidate is the canonical anchor, right in the normal case:
+    // search it completely before any fallback.
+    const match =
+      (primary.generations > 0 ? tryGeneration(primary, 0) : null) ??
+      tryLegacy(primary) ??
+      searchGenerations([primary]);
+    if (match) return match;
+  }
+
+  // Fallbacks: the layouts nearly every output uses first, for every one of
+  // them, and only then rebuild generations.
+  for (const anchor of fallbacks) {
+    const match = (anchor.generations > 0 ? tryGeneration(anchor, 0) : null) ?? tryLegacy(anchor);
+    if (match) return match;
+  }
+  return searchGenerations(fallbacks);
 }
 
 /**
@@ -620,14 +689,6 @@ function writeUint32BE(target: Uint8Array, offset: number, value: number): void 
   target[offset + 1] = (value >>> 16) & 0xff;
   target[offset + 2] = (value >>> 8) & 0xff;
   target[offset + 3] = value & 0xff;
-}
-
-function hexToBytes(hex: string): Uint8Array {
-  const out = new Uint8Array(hex.length / 2);
-  for (let i = 0; i < out.length; i++) {
-    out[i] = parseInt(hex.slice(i * 2, i * 2 + 2), 16);
-  }
-  return out;
 }
 
 function compareBytes(a: Uint8Array, b: Uint8Array): number {

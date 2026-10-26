@@ -31,6 +31,8 @@ import {
   searchBlindingKey,
 } from './blinding-key';
 import {
+  ensureOutputBlindingKeysSealed,
+  markOutputBlindingKeysSealed,
   openOutputBlindingKey,
   sealOutputBlindingKey,
   sealPlaintextOutputBlindingKeys,
@@ -1020,8 +1022,8 @@ export class NavioClient {
   private keyManager: KeyManager | null = null;
   private config: NavioClientConfig;
   private initialized = false;
-  /** Whether sealStoredBlindingKeys has run while the wallet was encrypted. */
-  private blindingKeysSealed = false;
+  /** Reasons already warned about by warnRandomBlindingFallbackOnce. */
+  private readonly randomBlindingFallbackWarnings = new Set<string>();
 
   // Legacy: keep electrumClient reference for backwards compatibility
   private electrumClient: ElectrumClient | null = null;
@@ -4950,7 +4952,11 @@ export class NavioClient {
    *
    * Falls back to random, unrecoverable keys when the generation cannot be
    * persisted or the anchor's generations are used up — never to a derived
-   * key that might repeat or that recovery could not find.
+   * key that might repeat or that recovery could not find — and warns once
+   * per reason when it does. A build that fails after this call (say, the
+   * inputs do not cover the fee) still uses up its generation: the client
+   * cannot prove its keys never left the process, so it never hands one out
+   * again.
    *
    * @param inputs - The selected inputs (all of them this wallet's own)
    * @param useRandom - Caller opted out of recoverable keys
@@ -4985,18 +4991,46 @@ export class NavioClient {
     let generation: number;
     try {
       generation = await this.walletDB.reserveBlindingGeneration(anchor);
-    } catch {
+    } catch (error) {
       // Without a persisted bump the next build could claim the same
       // generation, which is the reuse this exists to prevent.
+      this.warnRandomBlindingFallbackOnce(
+        'reserve',
+        'Could not persist a blinding-key generation; this and any further such builds use ' +
+          'random blinding keys, which cannot be recovered from the seed.',
+        error,
+      );
       return BlindingKeyAllocator.random();
     }
     if (generation >= MAX_GENERATION_SEARCH) {
       // Recovery never searches this far, so a derived key would only look
       // recoverable.
+      this.warnRandomBlindingFallbackOnce(
+        `exhausted:${anchor}`,
+        `Input ${anchor} has been built on ${MAX_GENERATION_SEARCH} times (failed or abandoned ` +
+          'sends included); further transactions spending it use random blinding keys, which ' +
+          'cannot be recovered from the seed. Spending a different set of inputs avoids this.',
+      );
       return BlindingKeyAllocator.random();
     }
 
     return new BlindingKeyAllocator(seed, [anchor], generation);
+  }
+
+  /**
+   * Warn, once per client and reason, that a build which asked for
+   * recoverable blinding keys is getting random ones.
+   */
+  private warnRandomBlindingFallbackOnce(reason: string, message: string, error?: unknown): void {
+    if (this.randomBlindingFallbackWarnings.has(reason)) {
+      return;
+    }
+    this.randomBlindingFallbackWarnings.add(reason);
+    if (error === undefined) {
+      console.warn(message);
+    } else {
+      console.warn(message, error);
+    }
   }
 
   /**
@@ -5049,10 +5083,11 @@ export class NavioClient {
    * plaintext: rows written before the wallet was encrypted, or by navio-sdk
    * 0.4 and earlier, which never encrypted them.
    *
-   * Call it after `getKeyManager().unlock()` or `setPassword()`. The client
-   * also runs it on its own the first time it touches the table while the
-   * wallet is encrypted and unlocked, but calling it right away keeps the
-   * plaintext on disk for as short a time as possible. Does nothing for an
+   * Call it after `getKeyManager().unlock()` or `setPassword()`. Otherwise the
+   * plaintext stays on disk until the client next touches the table while the
+   * wallet is unlocked — recovering a blinding key, building a transaction,
+   * or sync storing one — which runs the same pass on its own (once per
+   * database, retried on failure with a `console.warn`). Does nothing for an
    * unencrypted or locked wallet; safe to call repeatedly.
    *
    * @returns How many rows were encrypted
@@ -5063,23 +5098,15 @@ export class NavioClient {
     }
     const sealed = await sealPlaintextOutputBlindingKeys(this.walletDB, this.keyManager);
     if (this.keyManager.isEncrypted() && this.keyManager.isUnlocked()) {
-      this.blindingKeysSealed = true;
+      markOutputBlindingKeysSealed(this.walletDB);
     }
     return sealed;
   }
 
-  /**
-   * {@link sealStoredBlindingKeys}, at most once per client while the wallet
-   * is encrypted and unlocked, and never failing the caller.
-   */
+  /** {@link sealStoredBlindingKeys} once per database, never throwing. */
   private async sealStoredBlindingKeysOnce(): Promise<void> {
-    if (this.blindingKeysSealed || !this.keyManager?.isEncrypted() || !this.keyManager.isUnlocked()) {
-      return;
-    }
-    try {
-      await this.sealStoredBlindingKeys();
-    } catch {
-      // Retried on the next call; plaintext rows stay readable meanwhile.
+    if (this.walletDB && this.keyManager) {
+      await ensureOutputBlindingKeysSealed(this.walletDB, this.keyManager);
     }
   }
 
