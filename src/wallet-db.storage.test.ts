@@ -51,6 +51,19 @@ describe('storage amount codec', () => {
     expect(decodeAmount('18446744073709551615')).toBe(MAX_STORED_AMOUNT);
     expect(decodeAmount(42)).toBe(42n);
     expect(decodeAmount(null)).toBe(0n);
+    // A legacy number above 2^53 already lost precision; it keeps what is left.
+    expect(decodeAmount(2 ** 60)).toBe(2n ** 60n);
+  });
+
+  it('range-checks stored amounts like writes', () => {
+    for (const bad of ['abc', '-1', '1.5', '0x10', ' 1', '1e3', 1.5, NaN, {}]) {
+      expect(() => decodeAmount(bad), String(bad)).toThrow(TypeError);
+    }
+    expect(() => decodeAmount('18446744073709551616')).toThrow(RangeError);
+    // Number(2^64 - 1) rounds to 2^64, past the u64 maximum.
+    expect(() => decodeAmount(Number(MAX_STORED_AMOUNT))).toThrow(RangeError);
+    expect(() => decodeAmount(-1)).toThrow(RangeError);
+    expect(() => decodeAmount(-1n)).toThrow(RangeError);
   });
 });
 
@@ -70,10 +83,16 @@ describe('WalletDB storage', () => {
     const big = 2n ** 53n + 1n;
     await walletDB.storeWalletOutput(output('01'.repeat(32), { amount: big }));
     await walletDB.storeWalletOutput(output('02'.repeat(32), { amount: MAX_STORED_AMOUNT }));
-    await walletDB.storeWalletOutput(output('03'.repeat(32), { amount: MAX_STORED_AMOUNT, isSpent: true, spentBlockHeight: 0 }));
-    await walletDB.storeWalletOutput(output('04'.repeat(32), { amount: MAX_STORED_AMOUNT, isSpent: true, spentBlockHeight: 0 }));
+    await walletDB.storeWalletOutput(
+      output('03'.repeat(32), { amount: MAX_STORED_AMOUNT, isSpent: true, spentBlockHeight: 0 })
+    );
+    await walletDB.storeWalletOutput(
+      output('04'.repeat(32), { amount: MAX_STORED_AMOUNT, isSpent: true, spentBlockHeight: 0 })
+    );
 
-    const amounts = Object.fromEntries((await walletDB.getAllOutputs()).map(o => [o.outputHash, o.amount]));
+    const amounts = Object.fromEntries(
+      (await walletDB.getAllOutputs()).map(o => [o.outputHash, o.amount])
+    );
     expect(amounts['01'.repeat(32)]).toBe(big);
     expect(amounts['02'.repeat(32)]).toBe(MAX_STORED_AMOUNT);
     expect(await walletDB.getBalance()).toBe(big + MAX_STORED_AMOUNT);
@@ -103,26 +122,99 @@ describe('WalletDB storage', () => {
   it('counts every spelling of the NAV token id as NAV in every query', async () => {
     await walletDB.storeWalletOutput(output('11'.repeat(32), { tokenId: null, amount: 1n }));
     await walletDB.storeWalletOutput(output('12'.repeat(32), { tokenId: NAV_ZERO, amount: 2n }));
-    await walletDB.storeWalletOutput(output('13'.repeat(32), { tokenId: NAV_SERIALIZED, amount: 4n }));
+    await walletDB.storeWalletOutput(
+      output('13'.repeat(32), { tokenId: NAV_SERIALIZED, amount: 4n })
+    );
     await walletDB.storeWalletOutput(output('14'.repeat(32), { tokenId: TOKEN_A, amount: 8n }));
-    for (const [hash, tokenId] of [['21', null], ['22', NAV_ZERO], ['23', NAV_SERIALIZED]] as const) {
+    for (const [hash, tokenId] of [
+      ['21', null],
+      ['22', NAV_ZERO],
+      ['23', NAV_SERIALIZED],
+    ] as const) {
       await walletDB.storeWalletOutput(
-        output(hash.repeat(32), { tokenId, amount: 16n, isSpent: true, spentTxHash: 'ff'.repeat(32), spentBlockHeight: 0 })
+        output(hash.repeat(32), {
+          tokenId,
+          amount: 16n,
+          isSpent: true,
+          spentTxHash: 'ff'.repeat(32),
+          spentBlockHeight: 0,
+        })
       );
     }
 
     expect(await walletDB.getBalance()).toBe(7n);
-    expect((await walletDB.getUnspentOutputs()).map(o => o.amount).sort((a, b) => (a < b ? -1 : 1))).toEqual([1n, 2n, 4n]);
+    expect(
+      (await walletDB.getUnspentOutputs()).map(o => o.amount).sort((a, b) => (a < b ? -1 : 1))
+    ).toEqual([1n, 2n, 4n]);
     expect(await walletDB.getPendingSpentAmount()).toBe(48n);
     expect(await walletDB.getBalance(TOKEN_A)).toBe(8n);
+
+    // An explicit NAV token id, in either spelling, selects NAV too.
+    for (const navId of [NAV_ZERO, NAV_SERIALIZED, NAV_ZERO.toUpperCase()]) {
+      expect(await walletDB.getBalance(navId)).toBe(7n);
+      expect((await walletDB.getUnspentOutputs(navId)).length).toBe(3);
+      expect(await walletDB.getPendingSpentAmount(navId)).toBe(48n);
+    }
+  });
+
+  it('leaves a row with a corrupt amount out of balances and listings, warning once', async () => {
+    const good = '41'.repeat(32);
+    const garbage = '42'.repeat(32);
+    const tooBig = '43'.repeat(32);
+    const pendingBad = '44'.repeat(32);
+    await walletDB.storeWalletOutput(output(good, { amount: 5n }));
+    await walletDB.storeWalletOutput(output(garbage));
+    await walletDB.storeWalletOutput(output(tooBig));
+    await walletDB.storeWalletOutput(
+      output(pendingBad, { isSpent: true, spentTxHash: 'ff'.repeat(32), spentBlockHeight: 0 })
+    );
+    await walletDB
+      .getAdapter()
+      .run(`UPDATE wallet_outputs SET amount = 'garbage' WHERE output_hash IN (?, ?)`, [
+        garbage,
+        pendingBad,
+      ]);
+    await walletDB
+      .getAdapter()
+      .run(`UPDATE wallet_outputs SET amount = '18446744073709551616' WHERE output_hash = ?`, [
+        tooBig,
+      ]);
+    await walletDB.saveCreatedCollection({
+      collectionTokenId: 'c2'.repeat(32),
+      kind: 'token',
+      tokenPublicKey: 'cd',
+      metadata: {},
+      totalSupply: 1n,
+      txId: 'ef',
+      createdAt: 1,
+    });
+    await walletDB.getAdapter().run(`UPDATE created_collections SET total_supply = 'x'`);
+
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    try {
+      expect(await walletDB.getBalance()).toBe(5n);
+      expect(await walletDB.getBalance()).toBe(5n);
+      expect(await walletDB.getPendingSpentAmount()).toBe(0n);
+      expect((await walletDB.getUnspentOutputs()).map(o => o.outputHash)).toEqual([good]);
+      expect((await walletDB.getAllOutputs()).map(o => o.outputHash)).toEqual([good]);
+      expect(await walletDB.getCreatedCollections()).toEqual([]);
+      const warned = warn.mock.calls.map(c => String(c[0]));
+      for (const hash of [garbage, tooBig, pendingBad]) {
+        expect(warned.filter(m => m.includes(hash))).toHaveLength(1);
+      }
+    } finally {
+      warn.mockRestore();
+    }
   });
 
   it('keeps the spent state and creation time when an output is stored again', async () => {
     const hash = '31'.repeat(32);
     await walletDB.storeWalletOutput(output(hash));
-    const createdAt = () => walletDB.getAdapter().exec(
-      `SELECT created_at FROM wallet_outputs WHERE output_hash = '${hash}'`
-    ).then(r => r[0].values[0][0]);
+    const createdAt = () =>
+      walletDB
+        .getAdapter()
+        .exec(`SELECT created_at FROM wallet_outputs WHERE output_hash = '${hash}'`)
+        .then(r => r[0].values[0][0]);
     const firstCreatedAt = await createdAt();
     await walletDB.markOutputSpent(hash, 'ee'.repeat(32), 12);
 
@@ -149,7 +241,9 @@ describe('WalletDB storage', () => {
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
     try {
       expect(await walletDB.getTxKeys('aa'.repeat(32))).toBeNull();
-      expect(await walletDB.getTxKeysByHeight(5)).toEqual([{ txHash: 'bb'.repeat(32), keys: { k: 1 } }]);
+      expect(await walletDB.getTxKeysByHeight(5)).toEqual([
+        { txHash: 'bb'.repeat(32), keys: { k: 1 } },
+      ]);
     } finally {
       warn.mockRestore();
     }
@@ -161,7 +255,13 @@ describe('WalletDB storage', () => {
   it('runs concurrent transactional writes one after the other', async () => {
     const keyManager = await walletDB.restoreWalletFromMnemonic(MNEMONIC_A);
     await walletDB.storeWalletOutput(output('41'.repeat(32), { blockHeight: 20 }));
-    const state = { lastSyncedHeight: 9, lastSyncedHash: 'ab'.repeat(32), totalTxKeysSynced: 0, lastSyncTime: 0, chainTipAtLastSync: 9 };
+    const state = {
+      lastSyncedHeight: 9,
+      lastSyncedHash: 'ab'.repeat(32),
+      totalTxKeysSynced: 0,
+      lastSyncTime: 0,
+      chainTipAtLastSync: 9,
+    };
 
     await Promise.all([
       walletDB.saveWallet(keyManager),
@@ -180,12 +280,18 @@ describe('WalletDB storage', () => {
     await walletDB.restoreWalletFromMnemonic(other.getMnemonic());
     await walletDB.storeWalletOutput(output('51'.repeat(32)));
     await walletDB.saveSyncState({
-      lastSyncedHeight: 10, lastSyncedHash: 'ab'.repeat(32), totalTxKeysSynced: 1, lastSyncTime: 0, chainTipAtLastSync: 10,
+      lastSyncedHeight: 10,
+      lastSyncedHash: 'ab'.repeat(32),
+      totalTxKeysSynced: 1,
+      lastSyncTime: 0,
+      chainTipAtLastSync: 10,
     });
 
     const failing = vi
       .spyOn(KeyManager.prototype, 'getSubAddressEntries')
-      .mockImplementationOnce(() => { throw new Error('disk full'); });
+      .mockImplementationOnce(() => {
+        throw new Error('disk full');
+      });
     try {
       await expect(walletDB.restoreWalletFromMnemonic(MNEMONIC_A)).rejects.toThrow('disk full');
     } finally {
@@ -233,7 +339,9 @@ describe('WalletDB legacy INTEGER amounts', () => {
     insert.run('61'.repeat(32), 2n ** 62n + 1n, null);
     insert.run('62'.repeat(32), 5n, NAV_SERIALIZED);
     insert.run('63'.repeat(32), 9n, TOKEN_A);
-    old.prepare(`INSERT INTO created_collections VALUES ('ab', 'token', 'cd', '{}', ?, 'ef', 1)`).run(2n ** 60n);
+    old
+      .prepare(`INSERT INTO created_collections VALUES ('ab', 'token', 'cd', '{}', ?, 'ef', 1)`)
+      .run(2n ** 60n);
     old.close();
 
     const walletDB = new WalletDB({ type: 'better-sqlite3' });
@@ -241,7 +349,9 @@ describe('WalletDB legacy INTEGER amounts', () => {
     try {
       expect(await walletDB.getBalance()).toBe(2n ** 62n + 6n);
       expect(await walletDB.getBalance(TOKEN_A)).toBe(9n);
-      const tokenIds = Object.fromEntries((await walletDB.getAllOutputs()).map(o => [o.outputHash, o.tokenId]));
+      const tokenIds = Object.fromEntries(
+        (await walletDB.getAllOutputs()).map(o => [o.outputHash, o.tokenId])
+      );
       expect(tokenIds['62'.repeat(32)]).toBeNull();
       expect((await walletDB.getCreatedCollections())[0].totalSupply).toBe(2n ** 60n);
 
@@ -335,6 +445,28 @@ describe('WalletDB import from bytes', () => {
     } finally {
       await source.close();
       await existing.close();
+    }
+  });
+
+  it('removes the target file when imported bytes do not open, so a retry works', async () => {
+    const path = join(dir, 'retry.db');
+    const failed = new WalletDB({ type: 'better-sqlite3' });
+    await expect(
+      failed.open(path, new TextEncoder().encode('not a sqlite database at all'))
+    ).rejects.toThrow();
+    for (const file of [path, `${path}-wal`, `${path}-shm`]) {
+      expect(existsSync(file), file).toBe(false);
+    }
+
+    const source = new WalletDB({ type: 'better-sqlite3' });
+    await source.open(':memory:');
+    await source.storeWalletOutput(output('75'.repeat(32), { amount: 6n }));
+    try {
+      const retried = await source.migrate(path);
+      expect(await retried.getBalance()).toBe(6n);
+      await retried.close();
+    } finally {
+      await source.close();
     }
   });
 

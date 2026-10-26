@@ -17,7 +17,14 @@ import { KeyManager } from '../key-manager';
 import type { HDChain, SubAddressIdentifier } from '../key-manager.types';
 import * as blsctModule from '@nav-io/navio-blsct';
 import { isStakedCommitmentOutputHex } from '../staking';
-import { decodeAmount, encodeAmount, isNavTokenId } from '../storage-codec';
+import {
+  WALLET_METADATA_KEY,
+  encodeAmount,
+  isNavTokenId,
+  parseTxKeys,
+  readStoredAmount,
+  walletMetadataRecord,
+} from '../storage-codec';
 import type {
   IWalletDB,
   SyncState,
@@ -274,8 +281,13 @@ export class IndexedDBWalletDB implements IWalletDB {
       }
       if (oldVersion < 8) {
         if (typeof rec.amount !== 'string') {
-          rec.amount = decodeAmount(rec.amount).toString();
-          changed = true;
+          // A corrupt amount stays as it is (reads leave the row out with a
+          // warning) rather than aborting the upgrade.
+          const amount = readStoredAmount(rec.amount, `output ${rec.outputHash}`);
+          if (amount !== null) {
+            rec.amount = amount.toString();
+            changed = true;
+          }
         }
         if (rec.tokenId != null && isNavTokenId(rec.tokenId)) {
           rec.tokenId = null;
@@ -292,7 +304,8 @@ export class IndexedDBWalletDB implements IWalletDB {
         const cursor = collectionsCursor.result;
         if (!cursor) return;
         if (typeof cursor.value.totalSupply !== 'string') {
-          cursor.update({ ...cursor.value, totalSupply: decodeAmount(cursor.value.totalSupply).toString() });
+          const supply = readStoredAmount(cursor.value.totalSupply, `collection ${cursor.value.collectionTokenId}`);
+          if (supply !== null) cursor.update({ ...cursor.value, totalSupply: supply.toString() });
         }
         cursor.continue();
       };
@@ -686,7 +699,7 @@ export class IndexedDBWalletDB implements IWalletDB {
         }
       }
       this.writeWallet(tx, km);
-      tx.objectStore('config').put({ key: 'walletMetadata', ...meta });
+      tx.objectStore('config').put(walletMetadataRecord(meta));
     });
   }
 
@@ -712,11 +725,11 @@ export class IndexedDBWalletDB implements IWalletDB {
   // -- metadata ---------------------------------------------------------
 
   private async saveWalletMetadata(meta: WalletMetadata): Promise<void> {
-    await this.put('config', { key: 'walletMetadata', ...meta });
+    await this.put('config', walletMetadataRecord(meta));
   }
 
   async getWalletMetadata(): Promise<WalletMetadata | null> {
-    const rec = await this.get<any>('config', 'walletMetadata');
+    const rec = await this.get<any>('config', WALLET_METADATA_KEY);
     if (!rec) return null;
     return {
       creationHeight: rec.creationHeight,
@@ -734,7 +747,7 @@ export class IndexedDBWalletDB implements IWalletDB {
   async setCreationHeight(height: number): Promise<void> {
     const existing = await this.getWalletMetadata();
     if (existing) {
-      await this.put('config', { key: 'walletMetadata', ...existing, creationHeight: height });
+      await this.put('config', walletMetadataRecord({ ...existing, creationHeight: height }));
     } else {
       await this.saveWalletMetadata({
         creationHeight: height,
@@ -760,7 +773,7 @@ export class IndexedDBWalletDB implements IWalletDB {
           const rec = cursor.value;
           // Spendable balance: staked commitments are locked for staking.
           if (rec.isStakedCommitment !== 1 && this.matchesTokenFilter(rec.tokenId, tokenId)) {
-            total += decodeAmount(rec.amount);
+            total += readStoredAmount(rec.amount, `output ${rec.outputHash}`) ?? 0n;
           }
           cursor.continue();
         } else {
@@ -776,28 +789,37 @@ export class IndexedDBWalletDB implements IWalletDB {
     return recs
       .filter((r) => r.isStakedCommitment !== 1 && this.matchesTokenFilter(r.tokenId, tokenId))
       .sort((a, b) => a.blockHeight - b.blockHeight)
-      .map(this.recordToOutput);
+      .map(this.recordToOutput)
+      .filter((o): o is WalletOutput => o !== null);
   }
 
   async getAllOutputs(): Promise<WalletOutput[]> {
     const recs = await this.getAll<any>('walletOutputs');
-    return recs.sort((a, b) => a.blockHeight - b.blockHeight).map(this.recordToOutput);
+    return recs
+      .sort((a, b) => a.blockHeight - b.blockHeight)
+      .map(this.recordToOutput)
+      .filter((o): o is WalletOutput => o !== null);
   }
 
   private matchesTokenFilter(recTokenId: string | null, filterTokenId: string | null): boolean {
-    if (filterTokenId === null) {
+    // NAV is stored as null since v8, so an explicit NAV id selects NAV too.
+    if (isNavTokenId(filterTokenId)) {
       // NAV: no token id, or the NAV token id in any stored spelling
       return isNavTokenId(recTokenId);
     }
     return recTokenId === filterTokenId;
   }
 
-  private recordToOutput = (r: any): WalletOutput => ({
+  /** Map a stored record to a WalletOutput, or null (with a warning) when its amount is corrupt. */
+  private recordToOutput = (r: any): WalletOutput | null => {
+    const amount = readStoredAmount(r.amount, `output ${r.outputHash}`);
+    if (amount === null) return null;
+    return {
     outputHash: r.outputHash,
     txHash: r.txHash,
     outputIndex: r.outputIndex,
     blockHeight: r.blockHeight,
-    amount: decodeAmount(r.amount),
+    amount,
     gamma: r.gamma ?? '0',
     memo: r.memo ?? null,
     tokenId: r.tokenId ?? null,
@@ -810,7 +832,8 @@ export class IndexedDBWalletDB implements IWalletDB {
     txType: (r.txType ?? 'received') as TxType,
     timestamp: r.timestamp ?? 0,
     isStakedCommitment: r.isStakedCommitment === 1,
-  });
+    };
+  };
 
   // -- sync state -------------------------------------------------------
 
@@ -879,29 +902,19 @@ export class IndexedDBWalletDB implements IWalletDB {
   async getTxKeys(txHash: string): Promise<any | null> {
     const rec = await this.get<any>('txKeys', txHash);
     if (!rec) return null;
-    return this.parseTxKeys(txHash, rec.keysData);
+    return parseTxKeys(txHash, rec.keysData);
   }
 
   async getTxKeysByHeight(height: number): Promise<{ txHash: string; keys: any }[]> {
     const recs = await this.getAllByIndex<any>('txKeys', 'blockHeight', height);
     const results: { txHash: string; keys: any }[] = [];
     for (const r of recs) {
-      const keys = this.parseTxKeys(r.txHash, r.keysData);
+      const keys = parseTxKeys(r.txHash, r.keysData);
       if (keys !== null) {
         results.push({ txHash: r.txHash, keys });
       }
     }
     return results;
-  }
-
-  /** Parse stored tx keys JSON; corrupt rows read as absent (null), on every backend. */
-  private parseTxKeys(txHash: string, keysData: string): any | null {
-    try {
-      return JSON.parse(keysData);
-    } catch {
-      console.warn(`[IndexedDBWalletDB] Ignoring corrupt tx keys for ${txHash}`);
-      return null;
-    }
   }
 
   async deleteTxKeysByHeight(height: number): Promise<void> {
@@ -1087,7 +1100,11 @@ export class IndexedDBWalletDB implements IWalletDB {
     const recs = await this.getAll<any>('createdCollections');
     return recs
       .sort((a, b) => a.createdAt - b.createdAt)
-      .map((rec): CreatedCollectionRecord => ({ ...rec, totalSupply: decodeAmount(rec.totalSupply) }));
+      .flatMap((rec): CreatedCollectionRecord[] => {
+        // A corrupt supply leaves the record out, with a warning.
+        const totalSupply = readStoredAmount(rec.totalSupply, `collection ${rec.collectionTokenId}`);
+        return totalSupply === null ? [] : [{ ...rec, totalSupply }];
+      });
   }
 
   async getPendingSpentAmount(tokenId: string | null = null): Promise<bigint> {
@@ -1096,7 +1113,7 @@ export class IndexedDBWalletDB implements IWalletDB {
     for (const rec of recs) {
       if (rec.isSpent !== 1) continue;
       if (!this.matchesTokenFilter(rec.tokenId, tokenId)) continue;
-      total += decodeAmount(rec.amount);
+      total += readStoredAmount(rec.amount, `output ${rec.outputHash}`) ?? 0n;
     }
     return total;
   }

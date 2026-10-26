@@ -39,7 +39,13 @@ export type { SyncState, WalletOutput, WalletMetadata, StoreOutputParams, IWalle
 // WalletOutput is re-exported from wallet-db.interface.ts
 import type { WalletOutput } from './wallet-db.interface';
 import { isStakedCommitmentOutputHex } from './staking';
-import { NAV_TOKEN_ID_FORMS, decodeAmount, encodeAmount } from './storage-codec';
+import {
+  NAV_TOKEN_ID_FORMS,
+  encodeAmount,
+  isNavTokenId,
+  parseTxKeys,
+  readStoredAmount,
+} from './storage-codec';
 
 /**
  * SQL condition selecting NAV outputs: no token id, or the NAV token id in
@@ -48,9 +54,13 @@ import { NAV_TOKEN_ID_FORMS, decodeAmount, encodeAmount } from './storage-codec'
 const NAV_TOKEN_FILTER_SQL =
   `(token_id IS NULL OR lower(token_id) IN (${NAV_TOKEN_ID_FORMS.map((form) => `'${form}'`).join(', ')}))`;
 
-/** Token filter for a query on wallet_outputs: NAV for null, else a bound token id. */
+/**
+ * Token filter for a query on wallet_outputs: NAV for null or any spelling of
+ * the NAV token id (stored as null since the TEXT-amount upgrade), else a
+ * bound token id.
+ */
 function tokenFilter(tokenId: string | null): { sql: string; params: string[] } {
-  return tokenId === null
+  return tokenId === null || isNavTokenId(tokenId)
     ? { sql: NAV_TOKEN_FILTER_SQL, params: [] }
     : { sql: 'token_id = ?', params: [tokenId] };
 }
@@ -60,14 +70,19 @@ const WALLET_OUTPUT_COLUMNS = `output_hash, tx_hash, output_index, block_height,
              blinding_key, ephemeral_key, spending_key, is_spent, spent_tx_hash, spent_block_height,
              tx_type, timestamp, is_staked_commitment`;
 
-/** Map a wallet_outputs row (WALLET_OUTPUT_COLUMNS) to a WalletOutput. */
-function rowToWalletOutput(row: RowObject): WalletOutput {
+/**
+ * Map a wallet_outputs row (WALLET_OUTPUT_COLUMNS) to a WalletOutput, or
+ * null (with a warning) when its stored amount is corrupt.
+ */
+function rowToWalletOutput(row: RowObject): WalletOutput | null {
+  const amount = readStoredAmount(row.amount, `output ${row.output_hash as string}`);
+  if (amount === null) return null;
   return {
     outputHash: row.output_hash as string,
     txHash: row.tx_hash as string,
     outputIndex: row.output_index as number,
     blockHeight: row.block_height as number,
-    amount: decodeAmount(row.amount),
+    amount,
     gamma: (row.gamma as string) || '0',
     memo: row.memo as string | null,
     tokenId: row.token_id as string | null,
@@ -81,16 +96,6 @@ function rowToWalletOutput(row: RowObject): WalletOutput {
     timestamp: (row.timestamp as number) || 0,
     isStakedCommitment: (row.is_staked_commitment as number) === 1,
   };
-}
-
-/** Parse stored tx keys JSON; corrupt rows read as absent (null), on every backend. */
-function parseTxKeys(txHash: string, keysData: unknown): any | null {
-  try {
-    return JSON.parse(keysData as string);
-  } catch {
-    console.warn(`[WalletDB] Ignoring corrupt tx keys for ${txHash}`);
-    return null;
-  }
 }
 
 /**
@@ -1446,22 +1451,25 @@ export class WalletDB {
     if (result.length === 0) {
       return [];
     }
-    return result[0].values.map((row) => {
+    return result[0].values.flatMap((row) => {
+      // A corrupt supply leaves the record out, with a warning.
+      const totalSupply = readStoredAmount(row[4], `collection ${row[0] as string}`);
+      if (totalSupply === null) return [];
       let metadata: Record<string, string> = {};
       try {
         metadata = JSON.parse(row[3] as string);
       } catch {
         // Corrupt metadata JSON is non-fatal; return the record without it.
       }
-      return {
+      return [{
         collectionTokenId: row[0] as string,
         kind: row[1] as 'token' | 'nft',
         tokenPublicKey: row[2] as string,
         metadata,
-        totalSupply: decodeAmount(row[4]),
+        totalSupply,
         txId: row[5] as string,
         createdAt: row[6] as number,
-      };
+      }];
     });
   }
 
@@ -1712,15 +1720,21 @@ export class WalletDB {
     // Summed in JS: SQL SUM over u64 amounts overflows (and the column is TEXT).
     const filter = tokenFilter(tokenId);
     return this.sumAmounts(
-      `SELECT amount FROM wallet_outputs WHERE is_spent = 1 AND spent_block_height = 0 AND ${filter.sql}`,
+      `SELECT output_hash, amount FROM wallet_outputs WHERE is_spent = 1 AND spent_block_height = 0 AND ${filter.sql}`,
       filter.params
     );
   }
 
-  /** Sum the amount column of a query's rows exactly. */
+  /**
+   * Sum the amount column of a query's rows (output_hash, amount) exactly.
+   * A row with a corrupt amount is left out with a warning.
+   */
   private async sumAmounts(sql: string, params: unknown[]): Promise<bigint> {
     const rows = await this.selectRows(sql, params);
-    return rows.reduce((total, row) => total + decodeAmount(row.amount), 0n);
+    return rows.reduce(
+      (total, row) => total + (readStoredAmount(row.amount, `output ${row.output_hash as string}`) ?? 0n),
+      0n
+    );
   }
 
   async deleteUnconfirmedOutputsByTxHash(txHash: string): Promise<void> {
@@ -1793,7 +1807,7 @@ export class WalletDB {
 
   /**
    * Get wallet balance (sum of unspent output amounts)
-   * @param tokenId - Optional token ID to filter by (null for NAV)
+   * @param tokenId - Optional token ID to filter by (null, or the NAV token id in either spelling, for NAV)
    * @returns Balance in satoshis
    */
   async getBalance(tokenId: string | null = null): Promise<bigint> {
@@ -1806,14 +1820,14 @@ export class WalletDB {
     // Summed in JS: SQL SUM over u64 amounts overflows (and the column is TEXT).
     const filter = tokenFilter(tokenId);
     return this.sumAmounts(
-      `SELECT amount FROM wallet_outputs WHERE is_spent = 0 AND is_staked_commitment = 0 AND ${filter.sql}`,
+      `SELECT output_hash, amount FROM wallet_outputs WHERE is_spent = 0 AND is_staked_commitment = 0 AND ${filter.sql}`,
       filter.params
     );
   }
 
   /**
    * Get unspent outputs (UTXOs)
-   * @param tokenId - Optional token ID to filter by (null for NAV)
+   * @param tokenId - Optional token ID to filter by (null, or the NAV token id in either spelling, for NAV)
    * @returns Array of unspent outputs
    */
   async getUnspentOutputs(tokenId: string | null = null): Promise<WalletOutput[]> {
@@ -1829,7 +1843,7 @@ export class WalletDB {
        ORDER BY block_height ASC`,
       filter.params
     );
-    return rows.map(rowToWalletOutput);
+    return rows.map(rowToWalletOutput).filter((o): o is WalletOutput => o !== null);
   }
 
   /**
@@ -1844,7 +1858,7 @@ export class WalletDB {
     const rows = await this.selectRows(
       `SELECT ${WALLET_OUTPUT_COLUMNS} FROM wallet_outputs ORDER BY block_height ASC`
     );
-    return rows.map(rowToWalletOutput);
+    return rows.map(rowToWalletOutput).filter((o): o is WalletOutput => o !== null);
   }
 
   // ============================================================================

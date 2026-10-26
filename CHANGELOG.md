@@ -32,6 +32,8 @@ Format follows [Keep a Changelog](https://keepachangelog.com/); versions follow 
   imports are now deserialized in memory; a file import writes `path` with
   owner-only (0600) permissions, refusing to overwrite an existing file. New
   database files are created owner-only too.
+  If the imported bytes do not open, the file (and any `-wal` / `-shm` it
+  produced) is removed again, so a retry is not refused.
 
 ### Changed
 
@@ -47,6 +49,11 @@ Format follows [Keep a Changelog](https://keepachangelog.com/); versions follow 
   overflowed keep what was left of them. Custom `IWalletDB` implementations
   and callers of `storeWalletOutput()` / `saveCreatedCollection()` must pass
   `bigint`.
+- Stored amounts are range-checked when read, like writes: a value that is
+  not a decimal integer, or is outside [0, 2^64 - 1] (for example a legacy
+  IndexedDB number that rounded to 2^64), leaves its output or collection
+  out of balances and listings, with one `console.warn` per row, instead of
+  making the whole balance query throw.
 - `storeWalletOutput()` (both backends) updates an output that is already
   stored instead of replacing it: an output already marked spent stays spent,
   with its spending transaction and height, and the original creation time is
@@ -57,8 +64,8 @@ Format follows [Keep a Changelog](https://keepachangelog.com/); versions follow 
   failure halfway could leave the old data gone and the new wallet unsaved.
 - SQLite transactions (`saveWallet()`, `revertBlocksFrom()`, wallet creation
   and restore, schema migrations) are serialized on the shared connection;
-  overlapping calls failed with `cannot start a transaction within a
-  transaction`.
+  overlapping calls failed with
+  `cannot start a transaction within a transaction`.
 - `IndexedDBWalletDB` closes its connection when another tab upgrades or
   deletes the database (later calls fail with a clear error), and `open()`
   rejects after `blockedTimeoutMs` (new constructor option, default 10 s)
@@ -81,6 +88,9 @@ Format follows [Keep a Changelog](https://keepachangelog.com/); versions follow 
   NAV outputs stored with the serialized NAV token id (zero hash + `ffff…`),
   which `getBalance()` did. All three now use one filter, and the upgrade
   stores those outputs with `token_id` NULL.
+  Passing the NAV token id explicitly (either spelling) to `getBalance()`,
+  `getUnspentOutputs()` or `getPendingSpentAmount()` selects NAV too, on
+  both backends, so it keeps matching after the upgrade.
 - `getTxKeys()` / `getTxKeysByHeight()` treat a corrupt stored entry as
   missing on both backends (SQLite threw, IndexedDB's `getTxKeys` did not).
   A SQLite read that threw mid-query no longer leaves its statement open,

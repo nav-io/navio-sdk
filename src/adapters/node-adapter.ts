@@ -167,9 +167,17 @@ export class NodeAdapter implements IDatabaseAdapter {
       // wallet, so they never touch the disk.
       this.db = new this.Database(toInMemoryImage(data));
     } else if (data) {
-      // Import into the file at `path`, so later writes persist there.
+      // Import into the file at `path`, so later writes persist there. If
+      // the bytes do not open, remove what the import created (none of it
+      // existed before), so a retry is not refused as an existing file.
       writeNewDatabaseFile(path, data);
-      this.db = new this.Database(path);
+      try {
+        this.db = new this.Database(path);
+        this.db.pragma('journal_mode = WAL');
+      } catch (error) {
+        this.discardImportedFile(path);
+        throw error;
+      }
     } else if (path === ':memory:') {
       this.db = new this.Database(':memory:');
     } else {
@@ -178,7 +186,7 @@ export class NodeAdapter implements IDatabaseAdapter {
     }
 
     // Enable WAL mode for better concurrent access
-    if (!isMemoryPath(path)) {
+    if (!isMemoryPath(path) && !data) {
       this.db.pragma('journal_mode = WAL');
     }
 
@@ -192,6 +200,20 @@ export class NodeAdapter implements IDatabaseAdapter {
 
     if (this.debug) {
       console.log('[NodeAdapter] Opened database:', path);
+    }
+  }
+
+  /** Close and delete a database file this adapter just imported, with its -wal / -shm files. */
+  private discardImportedFile(path: string): void {
+    const fs = require('fs');
+    try {
+      this.db?.close();
+    } catch {
+      // Already unusable; the files go either way.
+    }
+    this.db = null;
+    for (const file of [path, `${path}-wal`, `${path}-shm`]) {
+      fs.rmSync(file, { force: true });
     }
   }
 
