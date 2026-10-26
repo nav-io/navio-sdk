@@ -3655,6 +3655,10 @@ export class NavioClient {
     try {
       seed = this.keyManager.getMasterSeedKey();
     } catch {
+      // lock() can run while the stored-key lookup above is pending
+      if (!this.keyManager.isUnlocked()) {
+        throw new Error('Wallet is locked. Unlock it before recovering blinding keys.');
+      }
       throw new Error(
         'This wallet has no HD seed (view-key-only wallets cannot recover blinding keys).'
       );

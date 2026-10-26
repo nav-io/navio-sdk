@@ -1,5 +1,9 @@
 import 'fake-indexeddb/auto';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import Database from 'better-sqlite3';
+import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { KeyManager } from './key-manager';
 import { WalletDB } from './wallet-db';
 import { IndexedDBWalletDB } from './adapters/indexeddb-wallet-db';
@@ -74,6 +78,134 @@ describe('KeyManager lock', () => {
     km.lock();
     expect(await km.unlock(PASSWORD)).toBe(false);
     expect(await km.unlock('new password')).toBe(true);
+    expect(km.getMnemonic()).toBe(MNEMONIC);
+  });
+
+  it('keeps the old password when lock() runs during a password change', async () => {
+    const km = wallet();
+    await km.setPassword(PASSWORD);
+    km.lock();
+
+    // lock() after the old password unlocked the wallet, while the keys are
+    // being re-encrypted (an auto-lock timer, say)
+    const reEncrypt = (km as any).reEncryptAllKeys.bind(km);
+    const spy = vi
+      .spyOn(km as any, 'reEncryptAllKeys')
+      .mockImplementationOnce((...args: unknown[]) => {
+        const result = reEncrypt(...args);
+        km.lock();
+        return result;
+      });
+    await expect(km.changePassword(PASSWORD, 'new password')).rejects.toThrow(
+      'Wallet was locked during changePassword'
+    );
+    spy.mockRestore();
+
+    expect(km.isUnlocked()).toBe(false);
+    expectSeedLocked(km);
+    expect(await km.unlock('new password')).toBe(false);
+    expect(await km.unlock(PASSWORD)).toBe(true);
+    expect(km.getMnemonic()).toBe(MNEMONIC);
+  });
+
+  it('names the password change when lock() runs during its unlock', async () => {
+    const km = wallet();
+    await km.setPassword(PASSWORD);
+    km.lock();
+
+    const pending = km.changePassword(PASSWORD, 'new password');
+    km.lock();
+    await expect(pending).rejects.toThrow('Wallet was locked during changePassword');
+    expect(await km.unlock(PASSWORD)).toBe(true);
+    expect(km.getMnemonic()).toBe(MNEMONIC);
+  });
+
+  it('stays locked when lock() runs during unlock()', async () => {
+    const km = wallet();
+    await km.setPassword(PASSWORD);
+    km.lock();
+
+    const pending = km.unlock(PASSWORD);
+    km.lock();
+    await expect(pending).rejects.toThrow('Wallet was locked during unlock');
+
+    expect(km.isUnlocked()).toBe(false);
+    expectSeedLocked(km);
+    expect((km as any).masterSeed).toBeNull();
+    expect(km.getKeyStats().plainKeys).toBe(0);
+
+    expect(await km.unlock(PASSWORD)).toBe(true);
+    expect(km.getMnemonic()).toBe(MNEMONIC);
+  });
+
+  it('stays locked when lock() runs while unlock() first encrypts a legacy seed', async () => {
+    const source = wallet();
+    await source.setPassword(PASSWORD);
+    const params = source.getEncryptionParams()!;
+    const km = wallet();
+    km.setEncryptionParams(params.salt, params.verificationHash);
+
+    const encryptSeedWith = (km as any).encryptSeedWith.bind(km);
+    vi.spyOn(km as any, 'encryptSeedWith').mockImplementationOnce(async (...args: unknown[]) => {
+      const crypted = await encryptSeedWith(...args);
+      km.lock();
+      return crypted;
+    });
+    await expect(km.unlock(PASSWORD)).rejects.toThrow('Wallet was locked during unlock');
+
+    expect(km.isUnlocked()).toBe(false);
+    expect((km as any).masterSeed).toBeNull();
+    expect(km.getSeedForStorage()).toHaveProperty('encryptedSeed');
+    expect(await km.unlock(PASSWORD)).toBe(true);
+    expect(km.getMnemonic()).toBe(MNEMONIC);
+  });
+
+  it('fails an unlock() a password change overtook', async () => {
+    const km = wallet();
+    await km.setPassword(PASSWORD);
+
+    // Hold the first unlock() after it derived the old-password key
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => (release = resolve));
+    const decryptKeys = (km as any).decryptKeys.bind(km);
+    vi.spyOn(km as any, 'decryptKeys').mockImplementationOnce(async (...args: unknown[]) => {
+      await gate;
+      return decryptKeys(...args);
+    });
+    const pending = km.unlock(PASSWORD);
+    expect(await km.changePassword(PASSWORD, 'new password')).toBe(true);
+    release();
+    await expect(pending).rejects.toThrow('Wallet password was changed during unlock');
+
+    // The cached key is still the new password's
+    expect(km.isUnlocked()).toBe(true);
+    expect(await km.changePassword('new password', 'third password')).toBe(true);
+    km.lock();
+    expect(await km.unlock('third password')).toBe(true);
+    expect(km.getMnemonic()).toBe(MNEMONIC);
+  });
+
+  it('refuses to replace the seed of an encrypted wallet', async () => {
+    const km = wallet();
+    await km.setPassword(PASSWORD);
+    const stored = km.getSeedForStorage();
+
+    expect(() => km.setHDSeedFromMnemonic(OTHER_MNEMONIC)).toThrow(
+      'Cannot replace the seed of an encrypted wallet'
+    );
+    expect(() => km.generateNewMnemonic()).toThrow(
+      'Cannot replace the seed of an encrypted wallet'
+    );
+    expect(() => km.setHDSeed(km.generateNewSeed())).toThrow(
+      'Cannot replace the seed of an encrypted wallet'
+    );
+    km.lock();
+    expect(() => km.setHDSeedFromMnemonic(OTHER_MNEMONIC)).toThrow(
+      'Cannot replace the seed of an encrypted wallet'
+    );
+
+    expect(km.getSeedForStorage()).toEqual(stored);
+    expect(await km.unlock(PASSWORD)).toBe(true);
     expect(km.getMnemonic()).toBe(MNEMONIC);
   });
 
@@ -279,7 +411,11 @@ const backends: Backend[] = [
     async rawSeed(db) {
       const rec = await (db as any).get('config', 'mnemonic');
       if (!rec) return null;
-      return { mnemonic: rec.mnemonic ?? null, seedHex: rec.seedHex ?? null, encryptedSeed: rec.encryptedSeed ?? null };
+      return {
+        mnemonic: rec.mnemonic ?? null,
+        seedHex: rec.seedHex ?? null,
+        encryptedSeed: rec.encryptedSeed ?? null,
+      };
     },
     async writePlaintextSeed(db, mnemonic) {
       await (db as any).put('config', { key: 'mnemonic', mnemonic });
@@ -290,7 +426,7 @@ const backends: Backend[] = [
   },
 ];
 
-describe.each(backends)('$name encrypted seed', (backend) => {
+describe.each(backends)('$name encrypted seed', backend => {
   let db: WalletDB | IndexedDBWalletDB | null = null;
 
   afterEach(async () => {
@@ -363,5 +499,60 @@ describe.each(backends)('$name encrypted seed', (backend) => {
     const reloaded = await db.loadWallet();
     expect(reloaded.isEncrypted()).toBe(false);
     expect(reloaded.getMnemonic()).toBe(OTHER_MNEMONIC);
+  });
+});
+
+describe('WalletDB (SQLite file) plaintext seed migration', () => {
+  let dir: string | null = null;
+
+  afterEach(async () => {
+    if (dir) {
+      await rm(dir, { recursive: true, force: true });
+      dir = null;
+    }
+  });
+
+  it('leaves no plaintext seed in the file once the encrypted seed replaces it', async () => {
+    dir = await mkdtemp(join(tmpdir(), 'navio-wallet-lock-'));
+    const path = join(dir, 'wallet.db');
+
+    let db = new WalletDB({ type: 'better-sqlite3' });
+    await db.open(path);
+    const km = await db.restoreWalletFromMnemonic(MNEMONIC, 0);
+    await km.setPassword(PASSWORD);
+    await db.saveWallet(km);
+    await db.close();
+
+    // What earlier versions left behind: the plaintext mnemonic stored, and
+    // stale copies of it in pages freed without secure_delete
+    const raw = new Database(path);
+    raw.pragma('secure_delete = OFF');
+    raw.exec('CREATE TABLE stale (data TEXT)');
+    const insert = raw.prepare('INSERT INTO stale (data) VALUES (?)');
+    for (let i = 0; i < 8; i++) {
+      insert.run(MNEMONIC + ' '.repeat(2000));
+    }
+    raw.exec('DROP TABLE stale');
+    raw
+      .prepare('UPDATE master_seed SET mnemonic = ?, encrypted_seed = NULL WHERE id = 0')
+      .run(MNEMONIC);
+    raw.close();
+    expect((await readFile(path)).includes(MNEMONIC)).toBe(true);
+
+    db = new WalletDB({ type: 'better-sqlite3' });
+    await db.open(path);
+    const reloaded = await db.loadWallet();
+    expect(await reloaded.unlock(PASSWORD)).toBe(true);
+    await db.saveWallet(reloaded);
+    await db.close();
+
+    expect((await readFile(path)).includes('vendor hand scale')).toBe(false);
+
+    db = new WalletDB({ type: 'better-sqlite3' });
+    await db.open(path);
+    const again = await db.loadWallet();
+    expect(await again.unlock(PASSWORD)).toBe(true);
+    expect(again.getMnemonic()).toBe(MNEMONIC);
+    await db.close();
   });
 });

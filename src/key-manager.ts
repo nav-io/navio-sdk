@@ -208,13 +208,23 @@ export class KeyManager {
    * This derives the encryption key and caches it for decrypting private keys
    * 
    * A `lock()` while this is still running wins: the wallet stays locked and
-   * the call throws `Wallet was locked during unlock`.
+   * the call throws `Wallet was locked during unlock`. A `changePassword()`
+   * that completes first makes it throw `Wallet password was changed during
+   * unlock` (the wallet stays unlocked with the new password).
    *
    * @param password - The wallet password
    * @returns True if the password is correct and wallet is unlocked
-   * @throws When `lock()` was called before the unlock completed
+   * @throws When `lock()` was called, or the password changed, before the
+   *   unlock completed
    */
   async unlock(password: string): Promise<boolean> {
+    return this.unlockFor(password, 'unlock');
+  }
+
+  /**
+   * {@link unlock}, naming `operation` in the error when a `lock()` wins.
+   */
+  private async unlockFor(password: string, operation: string): Promise<boolean> {
     if (!this.encrypted) {
       return true; // Not encrypted, always unlocked
     }
@@ -230,6 +240,7 @@ export class KeyManager {
     if (!isValid) {
       return false;
     }
+    this.assertNotLockedSince(epoch, operation);
 
     // Derive the encryption key, and decrypt the seed lock() dropped (or that
     // was loaded encrypted) and the private keys. Nothing is committed until
@@ -237,7 +248,7 @@ export class KeyManager {
     const encryptionKey = await deriveKey(password, salt);
     const seed = this.cryptedSeed ? await this.decryptSeed(encryptionKey) : null;
     const keys = await this.decryptKeys(encryptionKey);
-    this.assertNotLockedSince(epoch, 'unlock');
+    this.assertNotLockedSince(epoch, operation);
 
     if (seed) {
       this.masterSeed = seed.seed;
@@ -247,9 +258,7 @@ export class KeyManager {
     }
     this.encryptionKey = encryptionKey;
     for (const [keyIdHex, secretKey] of keys) {
-      if (!this.keys.has(keyIdHex)) {
-        this.keys.set(keyIdHex, secretKey);
-      }
+      this.keys.set(keyIdHex, secretKey);
     }
     this.addSeedKeys();
 
@@ -261,7 +270,7 @@ export class KeyManager {
         // lock() ran before there was an encrypted copy, so it kept the
         // seed: lock again now that it can be dropped
         this.lock();
-        this.assertNotLockedSince(epoch, 'unlock');
+        this.assertNotLockedSince(epoch, operation);
       }
     }
 
@@ -324,18 +333,22 @@ export class KeyManager {
       throw new Error('Wallet is not encrypted. Use setPassword() first.');
     }
 
+    // Read before the first await, so a lock() at any point fails the change
+    const epoch = this.lockEpoch;
+
     // Verify old password
-    const unlocked = await this.unlock(oldPassword);
+    const unlocked = await this.unlockFor(oldPassword, 'changePassword');
     if (!unlocked) {
       return false;
     }
-    const epoch = this.lockEpoch;
+    this.assertNotLockedSince(epoch, 'changePassword');
 
     // Generate new salt
     const newSalt = randomBytes(SALT_LENGTH);
 
     // Derive new encryption key
     const newKey = await deriveKey(newPassword, newSalt);
+    this.assertNotLockedSince(epoch, 'changePassword');
 
     // Re-encrypt all keys and the seed (unlock() above restored it) with the
     // new key. Nothing is committed until all of it is done, so a lock() in
@@ -354,6 +367,9 @@ export class KeyManager {
     this.encryptionSalt = newSalt;
     this.encryptionKey = newKey;
     this.passwordVerificationHash = verificationHash;
+    // An unlock() still running with the old password would cache the old
+    // key over the new one: make it fail instead.
+    this.lockEpoch++;
 
     return true;
   }
@@ -552,12 +568,16 @@ export class KeyManager {
   }
 
   /**
-   * Throw if lock() ran since `epoch` was read, so an operation that awaited
-   * in between does not undo it.
+   * Throw if lock() or a password change ran since `epoch` was read, so an
+   * operation that awaited in between does not undo it.
    */
   private assertNotLockedSince(epoch: number, operation: string): void {
     if (this.lockEpoch !== epoch) {
-      throw new Error(`Wallet was locked during ${operation}`);
+      throw new Error(
+        this.encryptionKey
+          ? `Wallet password was changed during ${operation}`
+          : `Wallet was locked during ${operation}`
+      );
     }
   }
 
@@ -619,8 +639,8 @@ export class KeyManager {
   }
 
   /**
-   * Decrypt the private keys in cryptedKeys. Does not change the wallet:
-   * unlock() commits the result.
+   * Decrypt the private keys in cryptedKeys that are not already in memory.
+   * Does not change the wallet: unlock() commits the result.
    * @returns keyId (hex) -> secret key, without keys that fail to decrypt
    */
   private async decryptKeys(
@@ -628,6 +648,9 @@ export class KeyManager {
   ): Promise<Map<string, ScalarType>> {
     const keys = new Map<string, ScalarType>();
     for (const [keyIdHex, cryptedData] of this.cryptedKeys) {
+      if (this.keys.has(keyIdHex)) {
+        continue;
+      }
       try {
         const encrypted = this.deserializeEncryptedFromBytes(cryptedData.encryptedSecret);
         const decrypted = await decryptWithKey(encrypted, encryptionKey);
@@ -735,9 +758,19 @@ export class KeyManager {
    * Set the HD seed and derive all master keys
    * This replicates SetHDSeed from keyman.cpp
    * Uses navio-blsct API: ChildKey(seed).toTxKey().toViewKey() etc.
+   *
+   * An encrypted wallet's seed cannot be replaced: its encrypted seed and
+   * keys would still be the old wallet's. Set up the new wallet in a new
+   * KeyManager instead.
    * @param seed - The master seed Scalar
+   * @throws When the wallet is encrypted
    */
   setHDSeed(seed: ScalarType): void {
+    if (this.encrypted) {
+      throw new Error(
+        'Cannot replace the seed of an encrypted wallet; set up the new wallet in a new KeyManager'
+      );
+    }
     // Store master seed. A seed set directly has no mnemonic;
     // setHDSeedFromMnemonic sets these after calling this.
     this.masterSeed = seed;
@@ -1013,6 +1046,7 @@ export class KeyManager {
    * @param options - Derivation (default `'core'`) and BIP39 passphrase. A
    *   new wallet's passphrase must be ASCII, as navio-core requires.
    * @returns The mnemonic phrase that can be used to recover this wallet
+   * @throws When the wallet is encrypted (see {@link setHDSeed})
    */
   generateNewMnemonic(
     strength: 128 | 160 | 192 | 224 | 256 = 256,
@@ -1035,6 +1069,7 @@ export class KeyManager {
    *
    * @param mnemonic - The mnemonic phrase
    * @param options - Derivation (default `'core'`) and BIP39 passphrase
+   * @throws When the wallet is encrypted (see {@link setHDSeed})
    */
   setHDSeedFromMnemonic(mnemonic: string, options: MnemonicOptions = {}): void {
     const seed = KeyManager.mnemonicToScalar(mnemonic, options);

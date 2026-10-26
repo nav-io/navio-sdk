@@ -118,8 +118,9 @@ export class WalletDB {
     // Open the database
     await this.adapter.open(path, data);
 
-    // Zero deleted content, so a plaintext mnemonic replaced by its encrypted
-    // form does not linger in free pages of the saved file.
+    // Zero deleted content from now on. Content freed before this (a
+    // plaintext seed saved by an earlier version) is removed by the VACUUM
+    // saveWallet() runs when it replaces that seed with the encrypted one.
     try {
       await this.adapter.run('PRAGMA secure_delete = ON');
     } catch {
@@ -990,6 +991,12 @@ export class WalletDB {
       throw new Error('No KeyManager instance to save');
     }
 
+    // A save that replaces a plaintext seed (stored by an earlier version)
+    // with the encrypted one vacuums afterwards, see below.
+    const seed = km.getSeedForStorage();
+    const replacesPlaintextSeed =
+      seed !== null && 'encryptedSeed' in seed && (await this.hasPlaintextSeed());
+
     // Start transaction
     await this.adapter.run('BEGIN TRANSACTION');
 
@@ -1033,7 +1040,6 @@ export class WalletDB {
       // encrypted wallet, otherwise the mnemonic (stored directly because
       // Scalar.deserialize/serialize may not roundtrip correctly).
       // None for a view-only wallet.
-      const seed = km.getSeedForStorage();
       if (seed) {
         const seedStmt = await this.adapter.prepare(
           `INSERT INTO master_seed (id, mnemonic, seed_hex, encrypted_seed, mnemonic_derivation, mnemonic_passphrase)
@@ -1088,12 +1094,41 @@ export class WalletDB {
 
       // Commit transaction
       await this.adapter.run('COMMIT');
-
-      // Persist to disk
-      await this.persistToDisk();
     } catch (error) {
       await this.adapter.run('ROLLBACK');
       throw error;
+    }
+
+    if (replacesPlaintextSeed) {
+      await this.vacuum();
+    }
+
+    // Persist to disk
+    await this.persistToDisk();
+  }
+
+  /**
+   * Whether the stored seed is a plaintext mnemonic or seed hex.
+   */
+  private async hasPlaintextSeed(): Promise<boolean> {
+    const result = await this.adapter!.exec(
+      'SELECT 1 FROM master_seed WHERE mnemonic IS NOT NULL OR seed_hex IS NOT NULL LIMIT 1'
+    );
+    return result.length > 0 && result[0].values.length > 0;
+  }
+
+  /**
+   * Rewrite the database file without free pages, and empty the WAL, so a
+   * plaintext seed an earlier version stored (before `secure_delete` was on)
+   * does not stay readable in the file. Best effort: a failure leaves the
+   * saved wallet intact and is only logged.
+   */
+  private async vacuum(): Promise<void> {
+    try {
+      await this.adapter!.run('VACUUM');
+      await this.adapter!.exec('PRAGMA wal_checkpoint(TRUNCATE)');
+    } catch (err) {
+      console.warn('[WalletDB] VACUUM after encrypting the seed failed:', err);
     }
   }
 

@@ -21,15 +21,41 @@ Format follows [Keep a Changelog](https://keepachangelog.com/); versions follow 
   `getSeedForStorage()`). A wallet saved by an earlier version is migrated on
   its first `unlock()` and the next `saveWallet()`; until then its plaintext
   is kept, so no save loses the seed. SQLite gains an `encrypted_seed` column
-  and turns on `secure_delete`, so the replaced plaintext does not linger in
-  free pages.
-- **`lock()` during a pending `unlock()` now wins.** `unlock()` awaited
-  Argon2 and then set the encryption key, so a `lock()` in between was
-  silently undone and the wallet ended up unlocked. `unlock()` now commits
-  nothing until it is done and then throws `Wallet was locked during unlock`
-  if `lock()` ran meanwhile, leaving the wallet locked. `changePassword()`
-  does the same (`Wallet was locked during changePassword`) and keeps the old
-  password; it also no longer leaves keys half re-encrypted when it fails.
+  and turns on `secure_delete`, which zeroes content deleted from then on;
+  the save that replaces a plaintext seed also runs `VACUUM`, which removes
+  the copies earlier versions left in freed space from the database file.
+  `IndexedDBWalletDB` cannot vacuum: the browser compacts IndexedDB storage
+  when it decides to, so plaintext an earlier version stored may remain on
+  disk until then.
+- **A `lock()` during `unlock()` or `changePassword()` wins.** An `unlock()`
+  still awaiting key derivation when `lock()` ran used to finish and leave the
+  wallet unlocked; a `lock()` during `changePassword()` left the seed
+  encrypted under the old password while the salt moved to the new one, so
+  the wallet could not be unlocked again. Both now throw
+  (`Wallet was locked during unlock`, or `... during changePassword`),
+  commit nothing and leave the wallet locked, under the old password for a
+  password change. An `unlock()` that a completed `changePassword()` overtook throws
+  `Wallet password was changed during unlock` instead of caching the old key.
+- **An encrypted wallet's seed can no longer be replaced.** `setHDSeed()`,
+  `setHDSeedFromMnemonic()` and `generateNewMnemonic()` on an encrypted
+  wallet replaced the seed but kept the old encrypted copy, which the next
+  save stored and the next `unlock()` refused. They now throw.
+
+### Breaking
+
+- `KeyManager.getMnemonic()`, `getMasterSeedHex()` and `getMasterSeedKey()`
+  throw `Wallet is locked` while an encrypted wallet is locked, as do
+  `getSpendingKey()` and `getMasterTokenKey()` when they would re-derive from
+  the seed. A wallet loaded from storage starts locked, so unlock it before
+  showing a backup phrase or signing.
+- `unlock()` and `changePassword()` throw when `lock()` runs before they
+  complete (see Security).
+- `setHDSeed()`, `setHDSeedFromMnemonic()` and `generateNewMnemonic()` throw
+  on an encrypted wallet.
+- A mnemonic now derives a different wallet than in 0.4.0 unless
+  `derivation: 'legacy'` is passed. Stored wallets are unaffected; restoring
+  a 0.4.0 phrase (`restoreFromMnemonic`, `restoreWalletFromMnemonic()`,
+  `setHDSeedFromMnemonic()`, `mnemonicToScalar()`) needs `'legacy'`.
 
 ### Fixed
 
@@ -48,6 +74,9 @@ Format follows [Keep a Changelog](https://keepachangelog.com/); versions follow 
   value. Keys are now encrypted as 32 bytes. The cache id of an output's
   spending key (`getSpendingKeyForOutputWithCacheBySubAddress`) used the same
   short encoding and now uses 32 bytes too.
+- `recoverBlindingKey()` reported a wallet locked while it ran as having no
+  HD seed ("view-key-only wallets cannot recover blinding keys"). It now
+  says the wallet is locked.
 
 ### Added
 
@@ -67,18 +96,12 @@ Format follows [Keep a Changelog](https://keepachangelog.com/); versions follow 
 
 ### Changed
 
-- `getMnemonic()`, `getMasterSeedHex()` and `getMasterSeedKey()` throw while
-  an encrypted wallet is locked. Unlock before showing a backup phrase.
 - `WalletDB.saveWallet()` / `loadWallet()` (SQLite) now save and restore the
   encryption metadata, as `IndexedDBWalletDB` already did, so an encrypted
   wallet reloads encrypted and locked. Both backends drop the metadata when
   an unencrypted wallet is saved over an encrypted one.
 - `KeyManager.setEncryptionParams()` clears private keys a plaintext seed had
   derived into memory, since the wallet it describes starts locked.
-- **Breaking:** a mnemonic now derives a different wallet than in 0.4.0 unless
-  `derivation: 'legacy'` is passed. Stored wallets are unaffected; restoring
-  a 0.4.0 phrase (`restoreFromMnemonic`, `restoreWalletFromMnemonic()`,
-  `setHDSeedFromMnemonic()`, `mnemonicToScalar()`) needs `'legacy'`.
 - The `'core'` derivation accepts only 24-word phrases (or 26 with the
   birthday words), like navio-core: `generateNewMnemonic()` with a strength
   below 256, or a shorter phrase, throws unless `derivation: 'legacy'`.

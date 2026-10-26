@@ -944,7 +944,20 @@ collector to reclaim.
 with the password (never the plaintext mnemonic), together with its encryption
 metadata, and `loadWallet()` returns it locked. A wallet saved by 0.4.0 or
 earlier still has its mnemonic stored in plaintext: it is encrypted on the
-first `unlock()`, and the next `saveWallet()` replaces the plaintext.
+first `unlock()`, and the next `saveWallet()` replaces the plaintext. With
+`WalletDB` (SQLite) that save also runs `VACUUM`, so copies of the plaintext
+that earlier saves left in freed space are removed from the database file
+(copies the operating system or disk kept elsewhere are beyond its reach).
+`IndexedDBWalletDB` cannot do that: the browser decides when IndexedDB storage
+is compacted, so data an earlier version stored there may remain on disk for
+a while.
+
+A `lock()` while `unlock()` or `changePassword()` is still running wins: the
+call throws `Wallet was locked during unlock` (or `... during changePassword`)
+and the wallet stays locked, under the old password for a password change.
+An encrypted wallet's seed cannot be replaced (`setHDSeed()`,
+`setHDSeedFromMnemonic()` and `generateNewMnemonic()` throw); set up the new
+wallet in a new `KeyManager`.
 
 ---
 
