@@ -10,12 +10,12 @@
  */
 
 import { WalletDB, WalletDBOptions } from './wallet-db';
-import { ElectrumClient, ElectrumOptions } from './electrum';
+import { ElectrumClient, ElectrumError, ElectrumOptions } from './electrum';
 import { TransactionKeysSync, SyncOptions, BackgroundSyncOptions } from './tx-keys-sync';
 import { KeyManager } from './key-manager';
 import { parseBirthdayMnemonic } from './crypto/birthday-mnemonic';
 import { randomBytes } from './crypto/encryption';
-import type { IWalletDB, WalletOutput, StandingOrderRow } from './wallet-db.interface';
+import type { IWalletDB, WalletOutput, StandingOrderRow, TokenRegistryEntry } from './wallet-db.interface';
 import { SyncProvider } from './sync-provider';
 import { P2PSyncProvider } from './p2p-sync';
 import { P2PConnectionOptions } from './p2p-protocol';
@@ -510,6 +510,15 @@ export interface AggregateTransactionsResult {
 }
 
 export type WalletAssetKind = 'token' | 'nft';
+
+/** A collection's on-chain info, as resolved for asset balances. */
+interface CollectionInfo {
+  metadata: TokenMetadata;
+  totalSupply: bigint;
+  kind: WalletAssetKind;
+  /** For NFT collections: minted per-NFT metadata keyed by nft id (decimal string). */
+  mintedNft: Record<string, TokenMetadata>;
+}
 
 /**
  * Current balance summary for a wallet-owned asset.
@@ -1013,24 +1022,25 @@ export class NavioClient {
   private electrumClient: ElectrumClient | null = null;
 
   /**
-   * Cache of collection info keyed by public token id. Token metadata and
-   * max supply are immutable once a collection is created, so entries never
-   * expire; `null` marks a failed lookup (unknown token or a server without
-   * the get_token bridge) so it is not retried every call.
+   * Cache of collection info keyed by public token id, backed by the wallet
+   * database so it survives restarts. Fungible collection info is immutable
+   * once created, so it never expires. `null` marks a lookup the server
+   * refused (unknown token, or a server without the get_token bridge) so it
+   * is not retried every call; a lookup that got no answer is not cached.
    */
   private tokenRegistryCache = new Map<string, {
-    info: {
-      metadata: TokenMetadata;
-      totalSupply: bigint;
-      kind: WalletAssetKind;
-      /** For NFT collections: minted per-NFT metadata keyed by nft id (decimal string). */
-      mintedNft: Record<string, TokenMetadata>;
-    } | null;
-    /** When the entry was written; misses (`info: null`) expire after a TTL. */
+    info: CollectionInfo | null;
+    /** When the info was fetched; NFT info and misses expire after a TTL. */
     at: number;
   }>();
 
-  /** How long a failed token-registry lookup is remembered before retrying. */
+  /** Token-registry lookups in flight, shared by concurrent balance calls. */
+  private tokenRegistryLookups = new Map<string, Promise<CollectionInfo | null>>();
+
+  /**
+   * How long a refused token-registry lookup, or an NFT collection's minted
+   * list, is used before asking the server again.
+   */
   private static readonly TOKEN_REGISTRY_MISS_TTL_MS = 5 * 60 * 1000;
 
   // Background sync state
@@ -1860,25 +1870,31 @@ export class NavioClient {
     const assets = [...balances.values()].sort((a, b) => a.tokenId.localeCompare(b.tokenId));
 
     if (options.includeMetadata ?? true) {
-      for (const asset of assets) {
+      // One lookup per collection, all at once: an NFT collection's items
+      // share it, and each lookup may wait on the server.
+      const collectionIds = [...new Set(
+        assets.map((asset) => asset.collectionTokenId).filter((id): id is string => id !== null),
+      )];
+      const infos = new Map(await Promise.all(collectionIds.map(async (id) => {
         try {
-          const publicId = asset.collectionTokenId ?? describeTokenId(asset.tokenId).collectionTokenId;
-          if (!publicId) {
-            continue;
-          }
-          const info = await this.resolveCollectionInfoByPublicId(publicId);
-          if (info) {
-            asset.metadata = info.metadata;
-            asset.totalSupply = info.totalSupply;
-            if (asset.kind === 'nft' && asset.nftId !== null) {
-              const nftMetadata = info.mintedNft[asset.nftId.toString()];
-              if (nftMetadata) {
-                asset.nftMetadata = nftMetadata;
-              }
-            }
-          }
+          return [id, await this.resolveCollectionInfoByPublicId(id)] as const;
         } catch {
           // Metadata resolution is best-effort; balances stay authoritative.
+          return [id, null] as const;
+        }
+      })));
+      for (const asset of assets) {
+        const info = asset.collectionTokenId === null ? null : infos.get(asset.collectionTokenId);
+        if (!info) {
+          continue;
+        }
+        asset.metadata = info.metadata;
+        asset.totalSupply = info.totalSupply;
+        if (asset.kind === 'nft' && asset.nftId !== null) {
+          const nftMetadata = info.mintedNft[asset.nftId.toString()];
+          if (nftMetadata) {
+            asset.nftMetadata = nftMetadata;
+          }
         }
       }
     }
@@ -1887,90 +1903,171 @@ export class NavioClient {
   }
 
   /**
-   * Resolve collection metadata/supply by public token id: local creation
-   * records first (free), then the server's token registry, both cached for
-   * the client's lifetime.
+   * Resolve collection metadata/supply by public token id. Known info comes
+   * first, from memory or the wallet database, so it shows as soon as the
+   * wallet opens; then this wallet's own creation records; then the server's
+   * token registry. Stale NFT info is returned at once and refreshed in the
+   * background, since an NFT collection only gains minted entries.
    */
-  private async resolveCollectionInfoByPublicId(publicTokenId: string): Promise<{
-    metadata: TokenMetadata;
-    totalSupply: bigint;
-    kind: WalletAssetKind;
-    mintedNft: Record<string, TokenMetadata>;
-  } | null> {
-    const cached = this.tokenRegistryCache.get(publicTokenId);
-    if (cached !== undefined) {
-      const fresh = Date.now() - cached.at < NavioClient.TOKEN_REGISTRY_MISS_TTL_MS;
-      // Fungible collection info is immutable — serve it forever. NFT
-      // collections gain minted entries over time and misses may have been
-      // transient server errors, so both refresh after the TTL.
-      if (cached.info !== null && cached.info.kind === 'token') {
-        return cached.info;
+  private async resolveCollectionInfoByPublicId(publicTokenId: string): Promise<CollectionInfo | null> {
+    const known = await this.knownCollectionInfo(publicTokenId);
+    if (known !== undefined) {
+      const fresh = Date.now() - known.at < NavioClient.TOKEN_REGISTRY_MISS_TTL_MS;
+      if (known.info?.kind === 'token' || fresh) {
+        return known.info;
       }
-      if (fresh) {
-        return cached.info;
+      if (known.info !== null) {
+        void this.lookUpCollectionInfo(publicTokenId, known.info);
+        return known.info;
       }
     }
 
-    // Local creation records: compute each record's public id and match.
     // Registry lookup still runs for NFT collections to pick up minted
     // per-NFT metadata, which local records do not carry.
-    let localInfo: {
-      metadata: TokenMetadata; totalSupply: bigint; kind: WalletAssetKind;
-      mintedNft: Record<string, TokenMetadata>;
-    } | null = null;
-    if (this.walletDB) {
-      try {
-        for (const record of await this.walletDB.getCreatedCollections()) {
-          if (publicTokenIdFromPublicKeyHex(record.tokenPublicKey) === publicTokenId) {
-            localInfo = {
-              metadata: record.metadata,
-              totalSupply: BigInt(record.totalSupply),
-              kind: record.kind,
-              mintedNft: {},
-            };
-            break;
-          }
-        }
-      } catch {
-        // Fall through to the registry lookup.
-      }
-    }
+    const localInfo = await this.createdCollectionInfo(publicTokenId);
     if (localInfo && localInfo.kind === 'token') {
       this.tokenRegistryCache.set(publicTokenId, { info: localInfo, at: Date.now() });
       return localInfo;
     }
+    return this.lookUpCollectionInfo(publicTokenId, localInfo);
+  }
 
+  /** Collection info held in memory, else in the wallet database. */
+  private async knownCollectionInfo(
+    publicTokenId: string,
+  ): Promise<{ info: CollectionInfo | null; at: number } | undefined> {
+    const cached = this.tokenRegistryCache.get(publicTokenId);
+    if (cached !== undefined || !this.walletDB) {
+      return cached;
+    }
+    let entry: TokenRegistryEntry | null;
+    try {
+      entry = await this.walletDB.getTokenRegistryEntry(publicTokenId);
+    } catch (error) {
+      console.warn(`[NavioClient] Could not read stored info for token ${publicTokenId.slice(0, 16)}…:`, error);
+      return undefined;
+    }
+    if (entry === null) {
+      return undefined;
+    }
+    const stored = {
+      info: {
+        metadata: entry.metadata,
+        totalSupply: BigInt(entry.totalSupply),
+        kind: entry.kind,
+        mintedNft: entry.mintedNft,
+      },
+      at: entry.fetchedAt,
+    };
+    this.tokenRegistryCache.set(publicTokenId, stored);
+    return stored;
+  }
+
+  /** Collection info from this wallet's own creation records, if it made it. */
+  private async createdCollectionInfo(publicTokenId: string): Promise<CollectionInfo | null> {
+    if (!this.walletDB) {
+      return null;
+    }
+    try {
+      for (const record of await this.walletDB.getCreatedCollections()) {
+        if (publicTokenIdFromPublicKeyHex(record.tokenPublicKey) === publicTokenId) {
+          return {
+            metadata: record.metadata,
+            totalSupply: BigInt(record.totalSupply),
+            kind: record.kind,
+            mintedNft: {},
+          };
+        }
+      }
+    } catch {
+      // Fall through to the registry lookup.
+    }
+    return null;
+  }
+
+  /**
+   * Ask the server's token registry, once at a time per collection: callers
+   * arriving while a lookup is in flight share it. Resolves to `fallback`
+   * when the registry has nothing better; never rejects.
+   */
+  private lookUpCollectionInfo(
+    publicTokenId: string,
+    fallback: CollectionInfo | null,
+  ): Promise<CollectionInfo | null> {
+    const inFlight = this.tokenRegistryLookups.get(publicTokenId);
+    if (inFlight) {
+      return inFlight;
+    }
+    const lookup = this.fetchCollectionInfo(publicTokenId, fallback).finally(() => {
+      this.tokenRegistryLookups.delete(publicTokenId);
+    });
+    this.tokenRegistryLookups.set(publicTokenId, lookup);
+    return lookup;
+  }
+
+  private async fetchCollectionInfo(
+    publicTokenId: string,
+    fallback: CollectionInfo | null,
+  ): Promise<CollectionInfo | null> {
     if (!this.electrumClient) {
-      return localInfo; // not cached: a later connection may resolve more
+      return fallback; // not cached: a later connection may resolve more
     }
 
+    let onChainToken: any;
     try {
-      const onChainToken: any = await this.electrumClient.getToken(publicTokenId);
-      if (onChainToken && typeof onChainToken === 'object' && onChainToken.publicKey) {
-        const mintedNft: Record<string, TokenMetadata> = {};
-        if (Array.isArray(onChainToken.mintedNft)) {
-          for (const entry of onChainToken.mintedNft) {
-            if (entry && entry.index !== undefined) {
-              mintedNft[String(entry.index)] = tokenMetadataFromChainRecord(entry.metadata);
-            }
+      onChainToken = await this.electrumClient.getToken(publicTokenId);
+    } catch (error) {
+      // Remember a refusal (unknown token, or no get_token bridge) for the
+      // TTL. A request that got no answer (connection lost, timeout) says
+      // nothing about the token, so the next call asks again.
+      if (error instanceof ElectrumError) {
+        this.tokenRegistryCache.set(publicTokenId, { info: fallback, at: Date.now() });
+      }
+      return fallback;
+    }
+
+    let info: CollectionInfo;
+    try {
+      if (!onChainToken || typeof onChainToken !== 'object' || !onChainToken.publicKey) {
+        throw new Error('no token record');
+      }
+      const mintedNft: Record<string, TokenMetadata> = {};
+      if (Array.isArray(onChainToken.mintedNft)) {
+        for (const entry of onChainToken.mintedNft) {
+          if (entry && entry.index !== undefined) {
+            mintedNft[String(entry.index)] = tokenMetadataFromChainRecord(entry.metadata);
           }
         }
-        const info = {
-          metadata: tokenMetadataFromChainRecord(onChainToken.metadata),
-          totalSupply: BigInt(onChainToken.maxSupply ?? 0),
-          kind: (onChainToken.type === 'nft' ? 'nft' : 'token') as WalletAssetKind,
-          mintedNft,
-        };
-        this.tokenRegistryCache.set(publicTokenId, { info, at: Date.now() });
-        return info;
       }
-      this.tokenRegistryCache.set(publicTokenId, { info: localInfo, at: Date.now() });
+      info = {
+        metadata: tokenMetadataFromChainRecord(onChainToken.metadata),
+        totalSupply: BigInt(onChainToken.maxSupply ?? 0),
+        kind: onChainToken.type === 'nft' ? 'nft' : 'token',
+        mintedNft,
+      };
     } catch {
-      // Unknown token or server without the bridge — remember the miss
-      // (with a TTL) so it is not retried on every balance call.
-      this.tokenRegistryCache.set(publicTokenId, { info: localInfo, at: Date.now() });
+      // A reply we can't read is a miss, remembered like a refusal.
+      this.tokenRegistryCache.set(publicTokenId, { info: fallback, at: Date.now() });
+      return fallback;
     }
-    return localInfo;
+    const fetchedAt = Date.now();
+    this.tokenRegistryCache.set(publicTokenId, { info, at: fetchedAt });
+    if (this.walletDB) {
+      try {
+        await this.walletDB.saveTokenRegistryEntry({
+          publicTokenId,
+          kind: info.kind,
+          metadata: info.metadata,
+          totalSupply: info.totalSupply.toString(),
+          mintedNft: info.mintedNft,
+          fetchedAt,
+        });
+      } catch (error) {
+        // Still served from memory; the next open asks the server again.
+        console.warn(`[NavioClient] Could not store info for token ${publicTokenId.slice(0, 16)}…:`, error);
+      }
+    }
+    return info;
   }
 
   /**

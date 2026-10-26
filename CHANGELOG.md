@@ -3,6 +3,43 @@
 All notable changes to navio-sdk are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/); versions follow [SemVer](https://semver.org/).
 
+## [Unreleased]
+
+### Changed
+
+- **Token and NFT collection names show as soon as the wallet opens.** The
+  collection info `getAssetBalances()` (and `getTokenBalances()` /
+  `getNftBalances()`) resolves from the server's token registry is now stored
+  in the wallet database, so later opens read it without asking the server.
+  Fungible collection info is kept for good; NFT collection info, which gains
+  minted entries, is shown at once and refreshed in the background after five
+  minutes. Collections are looked up in parallel, once each, and concurrent
+  balance calls share a lookup in flight. SQLite gains a `token_registry`
+  table and the IndexedDB database moves to version 9. Like the wallet's
+  other data, the stored entries are cleared when a different wallet is
+  written into the database, since they show which collections it held.
+
+### Breaking
+
+- `IWalletDB` gains `saveTokenRegistryEntry(entry)` and
+  `getTokenRegistryEntry(publicTokenId)` (with the `TokenRegistryEntry`
+  type), which implementations outside this repo must add.
+
+### Fixed
+
+- **A token-registry lookup that got no answer is retried on the next call.**
+  Every failed lookup was remembered for five minutes, including a timeout or
+  a dropped connection, so a collection whose first lookup failed for such a
+  reason showed no name for that long. Only a lookup the server refused
+  (unknown token, or no `get_token` bridge) or answered with a record that
+  can't be read is remembered now.
+- **Concurrent first requests on an `ElectrumClient` share one connection.**
+  The client connects on its first request; two requests made before the
+  connection was up each opened a socket, and those sent on the socket still
+  connecting failed with `WebSocket is not open`. Loading token and NFT
+  balances together hit this on the client's token-registry connection, so a
+  collection's name could fail to load.
+
 ## [0.4.0] - 2026-10-17
 
 ### Added

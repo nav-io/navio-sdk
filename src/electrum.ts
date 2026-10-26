@@ -247,6 +247,8 @@ export class ElectrumClient {
     { resolve: (value: any) => void; reject: (error: Error) => void; timeout: NodeJS.Timeout }
   >();
   private connected = false;
+  /** The connection attempt in flight, shared by every caller that needs it. */
+  private connecting: Promise<void> | null = null;
   private options: Required<ElectrumOptions>;
   private reconnectAttempts = 0;
 
@@ -288,13 +290,23 @@ export class ElectrumClient {
   }
 
   /**
-   * Connect to the Electrum server
+   * Connect to the Electrum server. Concurrent calls share one connection
+   * attempt: each opening its own socket would leave all but the last
+   * orphaned, and requests sent on a socket still connecting fail.
    */
   async connect(): Promise<void> {
     if (this.connected && this.ws) {
       return;
     }
+    if (!this.connecting) {
+      this.connecting = this.openConnection().finally(() => {
+        this.connecting = null;
+      });
+    }
+    return this.connecting;
+  }
 
+  private async openConnection(): Promise<void> {
     // Ensure WebSocket is loaded (handles async loading for ESM)
     await ensureWebSocketLoaded();
 

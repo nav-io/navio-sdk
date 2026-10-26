@@ -123,6 +123,26 @@ export interface CreatedCollectionRecord {
 }
 
 /**
+ * A collection's on-chain info as the token registry served it
+ * (`blockchain.token.get_token`), kept so balances show names as soon as the
+ * wallet opens. Public chain data, not secret to this wallet.
+ */
+export interface TokenRegistryEntry {
+  /** Public token id (display hex), as explorers and balances report it. */
+  publicTokenId: string;
+  /** Collection type. */
+  kind: 'token' | 'nft';
+  /** The collection's metadata. */
+  metadata: Record<string, string>;
+  /** Maximum total supply, as a decimal string. */
+  totalSupply: string;
+  /** For NFT collections: minted per-NFT metadata keyed by nft id (decimal string). */
+  mintedNft: Record<string, Record<string, string>>;
+  /** When the registry served this, in milliseconds since the epoch. */
+  fetchedAt: number;
+}
+
+/**
  * A standing swap order published by this wallet, as persisted (bigints as
  * decimal strings, inputs as outputHashes). See StandingOrderRecord.
  */
@@ -285,6 +305,12 @@ export interface IWalletDB {
   /** Drop a tracked standing order by localId. */
   deleteStandingOrder(localId: string): Promise<void>;
   getCreatedCollections(): Promise<CreatedCollectionRecord[]>;
+
+  // -- token registry cache ---------------------------------------------
+  /** Insert or replace a collection's registry info (keyed by publicTokenId). */
+  saveTokenRegistryEntry(entry: TokenRegistryEntry): Promise<void>;
+  /** The stored registry info for a public token id, or null if none. */
+  getTokenRegistryEntry(publicTokenId: string): Promise<TokenRegistryEntry | null>;
 
   // -- persistence ------------------------------------------------------
   /** Flush to durable storage.  No-op for backends with immediate persistence. */

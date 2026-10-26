@@ -24,13 +24,16 @@ import type {
   WalletMetadata,
   StoreOutputParams,
   TxType,
-  CreatedCollectionRecord, SubAddressEntry, StandingOrderRow } from '../wallet-db.interface';
+  CreatedCollectionRecord, SubAddressEntry, StandingOrderRow, TokenRegistryEntry } from '../wallet-db.interface';
 
 // v2: adds the createdCollections store
 // v3: adds the standingOrders store
 // v4: adds the outputBlindingKeys store
 // v5: walletOutputs records carry isStakedCommitment (backfilled on upgrade)
-const IDB_VERSION = 5;
+// v6-v8: taken by changes in review (blinding generations, swap intents,
+// amount records)
+// v9: adds the tokenRegistry store
+const IDB_VERSION = 9;
 const DEFAULT_TOKEN_ID = '0000000000000000000000000000000000000000000000000000000000000000';
 
 function idbReq<T>(req: IDBRequest<T>): Promise<T> {
@@ -129,6 +132,7 @@ export class IndexedDBWalletDB implements IWalletDB {
       ['createdCollections', { keyPath: 'collectionTokenId' }],
       ['standingOrders', { keyPath: 'localId' }],
       ['outputBlindingKeys', { keyPath: 'outputHash' }],
+      ['tokenRegistry', { keyPath: 'publicTokenId' }],
     ];
     for (const [name, opts] of stores) {
       if (!db.objectStoreNames.contains(name)) db.createObjectStore(name, opts);
@@ -500,13 +504,15 @@ export class IndexedDBWalletDB implements IWalletDB {
    * created collections and sync progress are tied to the keys that detected
    * them; kept across a restore with another seed they are selected as inputs
    * and the spend fails with "does not map to a known sub-address in this
-   * wallet". Restoring the same seed keeps everything.
+   * wallet". The token registry entries go too: the token data is public,
+   * but which collections are cached says which ones the previous wallet
+   * held. Restoring the same seed keeps everything.
    */
   private async discardForeignWalletData(incoming: KeyManager): Promise<void> {
     if (!(await this.holdsDifferentWallet(incoming))) return;
     const db = this.ensureOpen();
     const tx = db.transaction(
-      ['walletOutputs', 'createdCollections', 'standingOrders', 'outputBlindingKeys'],
+      ['walletOutputs', 'createdCollections', 'standingOrders', 'outputBlindingKeys', 'tokenRegistry'],
       'readwrite',
     );
     tx.objectStore('walletOutputs').clear();
@@ -514,6 +520,7 @@ export class IndexedDBWalletDB implements IWalletDB {
     tx.objectStore('standingOrders').clear();
     // Another seed's blinding scalars are not ours and can never verify.
     tx.objectStore('outputBlindingKeys').clear();
+    tx.objectStore('tokenRegistry').clear();
     await idbTx(tx);
     await this.clearSyncData();
   }
@@ -850,6 +857,14 @@ export class IndexedDBWalletDB implements IWalletDB {
 
   async saveCreatedCollection(record: CreatedCollectionRecord): Promise<void> {
     await this.put('createdCollections', { ...record });
+  }
+
+  async saveTokenRegistryEntry(entry: TokenRegistryEntry): Promise<void> {
+    await this.put('tokenRegistry', { ...entry });
+  }
+
+  async getTokenRegistryEntry(publicTokenId: string): Promise<TokenRegistryEntry | null> {
+    return (await this.get<TokenRegistryEntry>('tokenRegistry', publicTokenId)) ?? null;
   }
 
   async saveOutputBlindingKey(outputHash: string, blindingKeyPrivate: string): Promise<void> {

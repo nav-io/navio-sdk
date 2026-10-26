@@ -111,3 +111,96 @@ describe('IndexedDBWalletDB.getOutputData', () => {
     }
   });
 });
+
+describe('IndexedDBWalletDB token registry cache', () => {
+  afterEach(async () => {
+    await IndexedDBWalletDB.deleteDatabase(PATH);
+  });
+
+  it('stores an entry and replaces it by public token id', async () => {
+    const entry = {
+      publicTokenId: 'ab'.repeat(32),
+      kind: 'nft' as const,
+      metadata: { name: 'Collection' },
+      totalSupply: '18446744073709551615',
+      mintedNft: { '1': { name: 'First' } },
+      fetchedAt: 1_700_000_000_000,
+    };
+    const walletDB = new IndexedDBWalletDB();
+    await walletDB.open(PATH);
+    try {
+      expect(await walletDB.getTokenRegistryEntry(entry.publicTokenId)).toBeNull();
+
+      await walletDB.saveTokenRegistryEntry(entry);
+      expect(await walletDB.getTokenRegistryEntry(entry.publicTokenId)).toEqual(entry);
+
+      const updated = { ...entry, mintedNft: { ...entry.mintedNft, '2': { name: 'Second' } } };
+      await walletDB.saveTokenRegistryEntry(updated);
+      expect(await walletDB.getTokenRegistryEntry(entry.publicTokenId)).toEqual(updated);
+      expect(await walletDB.getTokenRegistryEntry('cd'.repeat(32))).toBeNull();
+    } finally {
+      await walletDB.close();
+    }
+  });
+
+  it('keeps entries for the same wallet and drops them for another', async () => {
+    const entry = {
+      publicTokenId: 'ab'.repeat(32),
+      kind: 'token' as const,
+      metadata: { name: 'Token' },
+      totalSupply: '1000',
+      mintedNft: {},
+      fetchedAt: 1_700_000_000_000,
+    };
+    const walletDB = new IndexedDBWalletDB();
+    await walletDB.open(PATH);
+    try {
+      const mnemonic = (await walletDB.createWallet()).getMnemonic();
+      await walletDB.storeWalletOutput({
+        ...oldRecord('07'.repeat(32), '', 1_000),
+        isSpent: false,
+        txType: 'received',
+      });
+      await walletDB.saveTokenRegistryEntry(entry);
+
+      await walletDB.restoreWalletFromMnemonic(mnemonic);
+      expect(await walletDB.getTokenRegistryEntry(entry.publicTokenId)).toEqual(entry);
+
+      await walletDB.createWallet();
+      expect(await walletDB.getTokenRegistryEntry(entry.publicTokenId)).toBeNull();
+    } finally {
+      await walletDB.close();
+    }
+  });
+
+  it('adds the store to a database from 0.4.0 (version 5)', async () => {
+    await new Promise<void>((resolve, reject) => {
+      const req = indexedDB.open(IndexedDBWalletDB.getDatabaseName(PATH), 5);
+      req.onerror = () => reject(req.error);
+      req.onupgradeneeded = () => {
+        req.result.createObjectStore('walletOutputs', { keyPath: 'outputHash' });
+      };
+      req.onsuccess = () => {
+        req.result.close();
+        resolve();
+      };
+    });
+
+    const walletDB = new IndexedDBWalletDB();
+    await walletDB.open(PATH);
+    try {
+      const entry = {
+        publicTokenId: 'ab'.repeat(32),
+        kind: 'token' as const,
+        metadata: { name: 'Token' },
+        totalSupply: '1000',
+        mintedNft: {},
+        fetchedAt: 1_700_000_000_000,
+      };
+      await walletDB.saveTokenRegistryEntry(entry);
+      expect(await walletDB.getTokenRegistryEntry(entry.publicTokenId)).toEqual(entry);
+    } finally {
+      await walletDB.close();
+    }
+  });
+});

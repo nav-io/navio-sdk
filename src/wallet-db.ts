@@ -33,7 +33,7 @@ import type { HDChain, SubAddressIdentifier } from './key-manager.types';
 import * as blsctModule from '@nav-io/navio-blsct';
 import type { IDatabaseAdapter, DatabaseAdapterOptions } from './database-adapter';
 import { createDatabaseAdapter } from './database-adapter';
-import type { SyncState, StoreOutputParams, TxType, CreatedCollectionRecord, SubAddressEntry, StandingOrderRow } from './wallet-db.interface';
+import type { SyncState, StoreOutputParams, TxType, CreatedCollectionRecord, SubAddressEntry, StandingOrderRow, TokenRegistryEntry } from './wallet-db.interface';
 export type { SyncState, WalletOutput, WalletMetadata, StoreOutputParams, IWalletDB, TxType, CreatedCollectionRecord, SubAddressEntry } from './wallet-db.interface';
 
 // WalletOutput is re-exported from wallet-db.interface.ts
@@ -386,6 +386,20 @@ export class WalletDB {
         output_hash TEXT PRIMARY KEY,
         blinding_key TEXT NOT NULL,
         created_at INTEGER NOT NULL
+      )
+    `);
+
+    // Collection info from the token registry, so balances show names as soon
+    // as the wallet opens. Added by CREATE TABLE IF NOT EXISTS on existing
+    // databases; an empty table just means the first lookups go to the server.
+    await this.adapter.run(`
+      CREATE TABLE IF NOT EXISTS token_registry (
+        public_token_id TEXT PRIMARY KEY,
+        kind TEXT NOT NULL,
+        metadata TEXT NOT NULL,
+        total_supply TEXT NOT NULL,
+        minted_nft TEXT NOT NULL,
+        fetched_at INTEGER NOT NULL
       )
     `);
 
@@ -1053,6 +1067,8 @@ export class WalletDB {
    * detected them: kept across a restore with a different seed they show up
    * in the new wallet's balance and get selected as inputs, and the spend
    * then fails with "does not map to a known sub-address in this wallet".
+   * The token registry entries go too: the token data is public, but which
+   * collections are cached says which ones the previous wallet held.
    * Restoring the same seed again keeps everything (no re-sync needed).
    */
   private async discardForeignWalletData(incoming: KeyManager): Promise<void> {
@@ -1067,6 +1083,7 @@ export class WalletDB {
     await this.adapter.run('DELETE FROM standing_orders');
     // Another seed's blinding scalars are not ours and can never verify.
     await this.adapter.run('DELETE FROM output_blinding_keys');
+    await this.adapter.run('DELETE FROM token_registry');
     await this.clearSyncData();
   }
 
@@ -1152,6 +1169,47 @@ export class WalletDB {
     ]);
     await stmt.free();
     await this.persistToDisk();
+  }
+
+  async saveTokenRegistryEntry(entry: TokenRegistryEntry): Promise<void> {
+    if (!this.adapter) throw new Error('Database not open');
+    const stmt = await this.adapter.prepare(`
+      INSERT OR REPLACE INTO token_registry
+      (public_token_id, kind, metadata, total_supply, minted_nft, fetched_at)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `);
+    await stmt.run([
+      entry.publicTokenId,
+      entry.kind,
+      JSON.stringify(entry.metadata),
+      entry.totalSupply,
+      JSON.stringify(entry.mintedNft),
+      entry.fetchedAt,
+    ]);
+    await stmt.free();
+    await this.persistToDisk();
+  }
+
+  async getTokenRegistryEntry(publicTokenId: string): Promise<TokenRegistryEntry | null> {
+    if (!this.adapter) throw new Error('Database not open');
+    const stmt = await this.adapter.prepare(
+      'SELECT public_token_id, kind, metadata, total_supply, minted_nft, fetched_at FROM token_registry WHERE public_token_id = ?'
+    );
+    stmt.bind([publicTokenId]);
+    let entry: TokenRegistryEntry | null = null;
+    if (await stmt.step()) {
+      const row = await stmt.getAsObject();
+      entry = {
+        publicTokenId: String(row.public_token_id),
+        kind: String(row.kind) as TokenRegistryEntry['kind'],
+        metadata: JSON.parse(String(row.metadata)),
+        totalSupply: String(row.total_supply),
+        mintedNft: JSON.parse(String(row.minted_nft)),
+        fetchedAt: Number(row.fetched_at),
+      };
+    }
+    await stmt.free();
+    return entry;
   }
 
   async saveStandingOrder(row: StandingOrderRow): Promise<void> {
