@@ -109,8 +109,10 @@ describe.each(backends)('$name: restoring a mnemonic over a stored wallet', back
     await store.saveWallet(stored);
 
     const km = await store.restoreWalletFromMnemonic(MNEMONIC, 0);
-    expect(km.getMnemonicDerivation()).toBe('legacy');
+    expect(km.isEncrypted()).toBe(true);
     expect(await store.loadSyncState()).toMatchObject({ lastSyncedHeight: 1234 });
+    expect(await km.unlock(PASSWORD)).toBe(true);
+    expect(km.getMnemonicDerivation()).toBe('legacy');
   });
 
   it('uses the stored passphrase for the stored phrase', async () => {
@@ -164,6 +166,29 @@ describe.each(backends)('$name: restoring a mnemonic over a stored wallet', back
     // With it, the stored wallet matches and keeps its data
     await store.restoreWalletFromMnemonic(MNEMONIC, 0, { passphrase: PASSPHRASE });
     expect(await store.loadSyncState()).toMatchObject({ lastSyncedHeight: 1234 });
+  });
+
+  it('keeps an encrypted stored wallet encrypted when its phrase is restored', async () => {
+    const store = await storedWallet({ passphrase: PASSPHRASE });
+    const stored = await store.loadWallet();
+    await stored.setPassword(PASSWORD);
+    await store.saveWallet(stored);
+    const before = stored.getSeedForStorage() as { encryptedSeed: string };
+
+    const km = await store.restoreWalletFromMnemonic(MNEMONIC, 0, { passphrase: PASSPHRASE });
+    expect(km.isEncrypted()).toBe(true);
+    expect(km.isUnlocked()).toBe(false);
+    expect(() => km.getMnemonic()).toThrow('Wallet is locked');
+    expect(await store.loadSyncState()).toMatchObject({ lastSyncedHeight: 1234 });
+
+    // Storage still holds only the encrypted seed, with the encryption metadata
+    const reloaded = await store.loadWallet();
+    expect(reloaded.isEncrypted()).toBe(true);
+    expect(reloaded.getSeedForStorage()).toEqual(before);
+    expect(await reloaded.unlock(PASSWORD)).toBe(true);
+    expect(reloaded.getMasterSeedHex()).toBe(masterOf(MNEMONIC, { passphrase: PASSPHRASE }));
+    expect(await km.unlock(PASSWORD)).toBe(true);
+    expect(km.getMnemonic()).toBe(MNEMONIC);
   });
 
   it('replaces a stored wallet with a different plaintext phrase', async () => {

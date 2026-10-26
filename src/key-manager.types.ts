@@ -93,7 +93,8 @@ export interface MnemonicOptions {
  * phrase restores it: with the stored derivation and passphrase when the
  * database stores this phrase in plaintext, otherwise with whichever
  * derivation (`'core'`, then `'legacy'`) matches its keys. Its outputs and
- * sync state are kept. A restore that does not match the stored wallet
+ * sync state are kept, and an encrypted wallet stays encrypted: the restore
+ * returns it as stored, locked until `unlock()` with its password. A restore that does not match the stored wallet
  * replaces it, and deletes its outputs and sync state, only when the stored
  * plaintext phrase shows it is a different wallet, or with
  * `replaceExisting: true`; otherwise it throws, since the phrase might be

@@ -940,7 +940,9 @@ export interface NavioClientConfig {
    *
    * When the database already holds the wallet this phrase restores (with
    * either derivation), it is kept with its derivation, passphrase, outputs
-   * and sync state, so passing the phrase on every start is safe. When it
+   * and sync state, so passing the phrase on every start is safe. An
+   * encrypted wallet stays encrypted and loads locked: call
+   * `getKeyManager().unlock(password)` before spending. When it
    * holds a wallet the phrase does not restore, `initialize()` throws unless
    * the stored plaintext phrase shows it is a different wallet or
    * `replaceExistingWallet` is set. See {@link RestoreMnemonicOptions}.

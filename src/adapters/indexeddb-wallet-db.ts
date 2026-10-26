@@ -412,7 +412,9 @@ export class IndexedDBWalletDB implements IWalletDB {
 
   /**
    * Restore a wallet from a mnemonic phrase. A wallet already stored keeps
-   * its derivation and data; see {@link RestoreMnemonicOptions}.
+   * its derivation and data; see {@link RestoreMnemonicOptions}. When the
+   * phrase restores a stored encrypted wallet, that wallet is returned as
+   * stored: still encrypted, and locked until `unlock()` with its password.
    * @throws When the database holds a wallet this phrase does not restore and
    *   that may be this phrase's with another derivation or passphrase,
    *   unless `options.replaceExisting` is set
@@ -422,12 +424,21 @@ export class IndexedDBWalletDB implements IWalletDB {
     creationHeight?: number,
     options: RestoreMnemonicOptions = {}
   ): Promise<KeyManager> {
-    const km = keyManagerForMnemonicRestore(
+    const { keyManager: km, matchesStored } = keyManagerForMnemonicRestore(
       mnemonic,
       options,
       await this.storedWalletIdentity(),
       k => this.serializePublicKey(k.getPublicSpendingKey())
     );
+    if (matchesStored) {
+      // The phrase restores the stored wallet. An encrypted one is kept as
+      // stored (locked, seed encrypted): saving the plaintext KeyManager
+      // would drop its encryption.
+      const storedWallet = await this.loadWallet();
+      if (storedWallet.isEncrypted()) {
+        return storedWallet;
+      }
+    }
     km.newSubAddressPool(0);
     km.newSubAddressPool(-1);
     km.newSubAddressPool(-2);

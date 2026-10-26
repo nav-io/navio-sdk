@@ -859,8 +859,10 @@ wallet imported from a seed, give a phrase that restores it only with
 over a database that already holds a wallet keeps that wallet when the phrase
 restores it: with the stored derivation and passphrase when the database
 stores this phrase in plaintext, otherwise with whichever derivation matches
-its keys. Its outputs and sync state are kept, so an app may pass the phrase
-on every start, including for a wallet created by 0.4.0. A phrase that does
+its keys. Its outputs and sync state are kept, and an encrypted wallet stays
+encrypted (it is returned as stored, locked until `unlock()` with its
+password), so an app may pass the phrase on every start, including for a
+wallet created by 0.4.0. A phrase that does
 not restore the stored wallet replaces it (deleting its outputs and sync
 state) only when the stored plaintext phrase is a different one, or with
 `replaceExisting: true` (`replaceExistingWallet` in `NavioClient`); otherwise

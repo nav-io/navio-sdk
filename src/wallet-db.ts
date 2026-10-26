@@ -789,7 +789,9 @@ export class WalletDB {
    *   earlier), BIP39 passphrase, and whether to replace a stored wallet the
    *   phrase does not restore. A wallet already stored keeps its derivation
    *   and data; see {@link RestoreMnemonicOptions}.
-   * @returns The restored KeyManager instance
+   * @returns The restored KeyManager instance. When the phrase restores a
+   *   stored encrypted wallet, that wallet as stored: still encrypted, and
+   *   locked until `unlock()` with its password.
    * @throws When the database holds a wallet this phrase does not restore and
    *   that may be this phrase's with another derivation or passphrase,
    *   unless `options.replaceExisting` is set
@@ -805,12 +807,21 @@ export class WalletDB {
 
     // Set seed from mnemonic, with the stored wallet's derivation when this
     // phrase restores it
-    const keyManager = keyManagerForMnemonicRestore(
+    const { keyManager, matchesStored } = keyManagerForMnemonicRestore(
       mnemonic,
       options,
       await this.storedWalletIdentity(),
       km => this.serializePublicKey(km.getPublicSpendingKey())
     );
+    if (matchesStored) {
+      // The phrase restores the stored wallet. An encrypted one is kept as
+      // stored (locked, seed encrypted): saving the plaintext KeyManager
+      // would drop its encryption.
+      const storedWallet = await this.loadWallet();
+      if (storedWallet.isEncrypted()) {
+        return storedWallet;
+      }
+    }
 
     // Initialize sub-address pools
     keyManager.newSubAddressPool(0);

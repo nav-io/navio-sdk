@@ -55,7 +55,9 @@ Format follows [Keep a Changelog](https://keepachangelog.com/); versions follow 
 - A mnemonic now derives a different wallet than in 0.4.0 unless
   `derivation: 'legacy'` is passed. Stored wallets are unaffected, also when
   restored over: `restoreWalletFromMnemonic()` and `restoreFromMnemonic` keep
-  a stored wallet the phrase restores with either derivation. Restoring a
+  a stored wallet the phrase restores with either derivation. An encrypted
+  stored wallet is returned as stored, encrypted and locked, where a restore
+  used to save it again without its password. Restoring a
   0.4.0 phrase into an empty database, or with `setHDSeedFromMnemonic()` and
   `mnemonicToScalar()`, needs `'legacy'`.
 - `restoreWalletFromMnemonic()` (both backends) and `restoreFromMnemonic`

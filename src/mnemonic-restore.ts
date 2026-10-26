@@ -27,6 +27,8 @@ export interface StoredWalletIdentity {
 /**
  * Build the KeyManager a mnemonic restore writes into a database holding
  * `stored` (see {@link RestoreMnemonicOptions}).
+ * @returns The KeyManager, and whether it is the stored wallet (the phrase
+ *   restores it) rather than a new or replacing one
  * @param spendKeyOf - Serialize a KeyManager's public spending key as the
  *   database stores it
  * @throws When the restore would replace a stored wallet that might be this
@@ -39,7 +41,7 @@ export function keyManagerForMnemonicRestore(
   options: RestoreMnemonicOptions,
   stored: StoredWalletIdentity,
   spendKeyOf: (km: KeyManager) => string
-): KeyManager {
+): { keyManager: KeyManager; matchesStored: boolean } {
   const { replaceExisting, ...mnemonicOptions } = options;
   const build = (o: MnemonicOptions): KeyManager => {
     const km = new KeyManager();
@@ -47,7 +49,7 @@ export function keyManagerForMnemonicRestore(
     return km;
   };
   if (!stored.spendPublicKey) {
-    return build(mnemonicOptions);
+    return { keyManager: build(mnemonicOptions), matchesStored: false };
   }
 
   const storedPhrase = stored.mnemonic;
@@ -75,13 +77,13 @@ export function keyManagerForMnemonicRestore(
       continue; // e.g. a 12-word phrase with 'core'
     }
     if (spendKeyOf(km) === stored.spendPublicKey) {
-      return km;
+      return { keyManager: km, matchesStored: true };
     }
   }
 
   // The stored wallet is not the one this phrase restores
   if (replaceExisting || (storedPhrase !== null && !samePhrase)) {
-    return build(mnemonicOptions);
+    return { keyManager: build(mnemonicOptions), matchesStored: false };
   }
   throw new Error(
     (samePhrase
