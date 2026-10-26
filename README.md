@@ -875,10 +875,11 @@ const isUnlocked = keyManager.isUnlocked();
 // Set a password (encrypts the wallet)
 await keyManager.setPassword('my-secure-password');
 
-// Lock the wallet (clears cached encryption key)
+// Lock the wallet (clears the cached encryption key, private keys and seed)
 keyManager.lock();
+keyManager.getMnemonic(); // throws 'Wallet is locked'
 
-// Unlock the wallet
+// Unlock the wallet (decrypts the seed again)
 const success = await keyManager.unlock('my-secure-password');
 if (!success) {
   console.log('Wrong password');
@@ -891,9 +892,35 @@ const changed = await keyManager.changePassword('old-password', 'new-password');
 const params = keyManager.getEncryptionParams();
 // { salt: 'hex...', verificationHash: 'hex...' }
 
-// Restore encryption state from database
+// Restore encryption state from database (the wallet starts locked)
 keyManager.setEncryptionParams(params.salt, params.verificationHash);
 ```
+
+While an encrypted wallet is locked, `getMnemonic()`, `getMasterSeedHex()`,
+`getMasterSeedKey()`, `getSpendingKey()` and `getMasterTokenKey()` throw, and
+the seed is not held in memory. The view key and public keys stay loaded, so
+sync, balances and receive addresses keep working. JavaScript cannot overwrite
+memory, so `lock()` drops the references and leaves the values for the garbage
+collector to reclaim.
+
+`WalletDB` and `IndexedDBWalletDB` store an encrypted wallet's seed encrypted
+with the password (never the plaintext mnemonic), together with its encryption
+metadata, and `loadWallet()` returns it locked. A wallet saved by 0.4.0 or
+earlier still has its mnemonic stored in plaintext: it is encrypted on the
+first `unlock()`, and the next `saveWallet()` replaces the plaintext. With
+`WalletDB` (SQLite) that save also runs `VACUUM`, so copies of the plaintext
+that earlier saves left in freed space are removed from the database file
+(copies the operating system or disk kept elsewhere are beyond its reach).
+`IndexedDBWalletDB` cannot do that: the browser decides when IndexedDB storage
+is compacted, so data an earlier version stored there may remain on disk for
+a while.
+
+A `lock()` while `unlock()` or `changePassword()` is still running wins: the
+call throws `Wallet was locked during unlock` (or `... during changePassword`)
+and the wallet stays locked, under the old password for a password change.
+An encrypted wallet's seed cannot be replaced (`setHDSeed()`,
+`setHDSeedFromMnemonic()` and `generateNewMnemonic()` throw); set up the new
+wallet in a new `KeyManager`.
 
 ---
 
