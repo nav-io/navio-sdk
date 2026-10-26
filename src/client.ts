@@ -2026,24 +2026,30 @@ export class NavioClient {
       return fallback;
     }
 
-    if (!onChainToken || typeof onChainToken !== 'object' || !onChainToken.publicKey) {
+    let info: CollectionInfo;
+    try {
+      if (!onChainToken || typeof onChainToken !== 'object' || !onChainToken.publicKey) {
+        throw new Error('no token record');
+      }
+      const mintedNft: Record<string, TokenMetadata> = {};
+      if (Array.isArray(onChainToken.mintedNft)) {
+        for (const entry of onChainToken.mintedNft) {
+          if (entry && entry.index !== undefined) {
+            mintedNft[String(entry.index)] = tokenMetadataFromChainRecord(entry.metadata);
+          }
+        }
+      }
+      info = {
+        metadata: tokenMetadataFromChainRecord(onChainToken.metadata),
+        totalSupply: BigInt(onChainToken.maxSupply ?? 0),
+        kind: onChainToken.type === 'nft' ? 'nft' : 'token',
+        mintedNft,
+      };
+    } catch {
+      // A reply we can't read is a miss, remembered like a refusal.
       this.tokenRegistryCache.set(publicTokenId, { info: fallback, at: Date.now() });
       return fallback;
     }
-    const mintedNft: Record<string, TokenMetadata> = {};
-    if (Array.isArray(onChainToken.mintedNft)) {
-      for (const entry of onChainToken.mintedNft) {
-        if (entry && entry.index !== undefined) {
-          mintedNft[String(entry.index)] = tokenMetadataFromChainRecord(entry.metadata);
-        }
-      }
-    }
-    const info: CollectionInfo = {
-      metadata: tokenMetadataFromChainRecord(onChainToken.metadata),
-      totalSupply: BigInt(onChainToken.maxSupply ?? 0),
-      kind: onChainToken.type === 'nft' ? 'nft' : 'token',
-      mintedNft,
-    };
     const fetchedAt = Date.now();
     this.tokenRegistryCache.set(publicTokenId, { info, at: fetchedAt });
     if (this.walletDB) {

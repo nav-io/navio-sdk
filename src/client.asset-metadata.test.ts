@@ -188,6 +188,48 @@ describe('NavioClient asset metadata', () => {
     expect((await client.getNftBalances())[0].nftMetadata).toEqual({ name: 'First' });
   });
 
+  it('keeps stale NFT info when the refresh gets a reply it cannot read', async () => {
+    await walletDB.saveTokenRegistryEntry({
+      publicTokenId: NFT_COLLECTION,
+      kind: 'nft',
+      metadata: { name: 'Collection' },
+      totalSupply: '1000',
+      mintedNft: {},
+      fetchedAt: Date.now() - 60 * 60 * 1000,
+    });
+    registry.registry.set(NFT_COLLECTION, {
+      ...record('nft', 'Collection'),
+      metadata: { name: 1 },
+    });
+    const rejections: unknown[] = [];
+    const onRejection = (reason: unknown) => rejections.push(reason);
+    process.on('unhandledRejection', onRejection);
+    try {
+      const client = await openClient();
+
+      expect(names(await client.getNftBalances())).toEqual({ [NFT_TOKEN_ID]: 'Collection' });
+      const nftRequests = () => registry.requests.filter(id => id === NFT_COLLECTION);
+      await vi.waitFor(() => expect(nftRequests()).toHaveLength(1));
+      await new Promise(resolve => setTimeout(resolve, 100));
+
+      expect(rejections).toEqual([]);
+      // The unreadable reply is remembered as a miss, not asked for again.
+      expect(names(await client.getNftBalances())).toEqual({ [NFT_TOKEN_ID]: 'Collection' });
+      expect(nftRequests()).toHaveLength(1);
+    } finally {
+      process.off('unhandledRejection', onRejection);
+    }
+  });
+
+  it('remembers a lookup whose reply cannot be read', async () => {
+    registry.registry.set(TOKEN_COLLECTION, { ...record('token', 'Token'), maxSupply: 'lots' });
+    const client = await openClient();
+
+    expect(names(await client.getTokenBalances())).toEqual({ [TOKEN_COLLECTION]: undefined });
+    expect(names(await client.getTokenBalances())).toEqual({ [TOKEN_COLLECTION]: undefined });
+    expect(registry.requests.filter(id => id === TOKEN_COLLECTION)).toHaveLength(1);
+  });
+
   it('asks again after a lookup that got no answer', async () => {
     registry.replies.set(TOKEN_COLLECTION, ['ignore']);
     const client = await openClient(200);

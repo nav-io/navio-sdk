@@ -29,7 +29,8 @@ Format follows [Keep a Changelog](https://keepachangelog.com/); versions follow 
   Every failed lookup was remembered for five minutes, including a timeout or
   a dropped connection, so a collection whose first lookup failed for such a
   reason showed no name for that long. Only a lookup the server refused
-  (unknown token, or no `get_token` bridge) is remembered now.
+  (unknown token, or no `get_token` bridge) or answered with a record that
+  can't be read is remembered now.
 - **Concurrent first requests on an `ElectrumClient` share one connection.**
   The client connects on its first request; two requests made before the
   connection was up each opened a socket, and those sent on the socket still
