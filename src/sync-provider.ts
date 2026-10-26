@@ -189,9 +189,14 @@ export interface SyncProvider {
    * (optional). Used to release the inputs of a broadcast transaction that
    * never confirmed.
    *
+   * The answer is three-valued, and only `false` releases anything: return
+   * `false` only when the backend's "not found" is definitive (it would
+   * return the transaction if it held it). Whenever a negative answer could
+   * also mean "held, but not served to this client", return `null`.
+   *
    * @param txHash - Transaction hash (hex string)
-   * @returns true if found, false if the backend says it does not have it,
-   *   null if it cannot tell (an error other than "not found")
+   * @returns true if found; false if the backend definitively does not have
+   *   it; null if it cannot tell
    */
   hasTransaction?(txHash: string): Promise<boolean | null>;
 

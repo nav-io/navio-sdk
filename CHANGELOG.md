@@ -31,17 +31,22 @@ Format follows [Keep a Changelog](https://keepachangelog.com/); versions follow 
   and its unconfirmed change in the balance. Spends are now timestamped
   (SQLite `spent_at` column, IndexedDB `spentAt` field), and `sync()`, once
   at the tip, asks the backend about transactions unconfirmed for longer than
-  `pendingSpendTimeoutMs` (default 30 minutes, 0 disables). If the backend no
-  longer has one, its inputs are marked unspent and its unconfirmed outputs
-  deleted; if the backend cannot answer, nothing changes.
+  `pendingSpendTimeoutMs` (default 30 minutes, 0 disables), provided the
+  wallet is still at the tip when the sync ends. If the backend definitively
+  no longer has one, its inputs are marked unspent and its unconfirmed outputs
+  deleted; if the backend cannot answer, nothing changes. On the P2P backend
+  the answer is never definitive, so nothing is released automatically there.
   `TransactionKeysSync.checkPendingSpends()` runs the check on its own.
 - `NavioClient.getPendingSpends()` and `releasePendingSpend(txId)`, the
   manual override, which does not ask the backend.
 - `IWalletDB.getPendingSpends()` and `releasePendingSpend(spentTxHash)`.
 - `SyncProvider.hasTransaction(txHash)` (optional), implemented by the
   Electrum provider (`blockchain.transaction.get`, `ElectrumClient.hasTransaction`)
-  and the P2P provider (getdata): `true` found, `false` not found, `null`
-  unknown. `isTransactionNotFoundError()` tells the Electrum "not found" error
+  and the P2P provider (getdata): `true` found, `false` definitively not
+  found, `null` unknown. The P2P provider returns `null` instead of `false`:
+  a node's `notfound` also covers a transaction it holds but withholds under
+  its relay rules (stem phase, or not yet in an inventory pass to this
+  connection), which includes this wallet's own just-sent transactions. `isTransactionNotFoundError()` tells the Electrum "not found" error
   apart from others.
 
 ### Fixed

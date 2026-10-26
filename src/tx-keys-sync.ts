@@ -567,7 +567,8 @@ export class TransactionKeysSync {
     }
 
     // Only at the tip: a spend that confirmed in a block not yet scanned
-    // would otherwise look abandoned.
+    // would otherwise look abandoned. The tip is read again, since blocks
+    // may have arrived during a long sync.
     if (syncEndHeight >= chainTip) {
       await this.checkPendingSpendsQuietly(pendingSpendTimeoutMs);
     }
@@ -645,12 +646,18 @@ export class TransactionKeysSync {
     return result;
   }
 
-  /** {@link checkPendingSpends} from sync(): never fails the sync. */
+  /**
+   * {@link checkPendingSpends} from sync(), when the wallet is still at the
+   * provider's current tip: never fails the sync.
+   */
   private async checkPendingSpendsQuietly(olderThanMs: number): Promise<void> {
     if (!(olderThanMs > 0)) {
       return;
     }
     try {
+      if (this.getLastSyncedHeight() < (await this.syncProvider.getChainTipHeight())) {
+        return;
+      }
       const { released } = await this.checkPendingSpends(olderThanMs);
       if (released.length > 0) {
         await this.walletDB.saveDatabase();

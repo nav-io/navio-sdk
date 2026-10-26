@@ -221,6 +221,21 @@ describe('TransactionKeysSync pending spends', () => {
       expect(await walletDB.isOutputUnspent('a1')).toBe(false);
     });
 
+    it('does not check when the tip moved during the sync', async () => {
+      await spendAgo('a1', 'dropped', 31 * MINUTE);
+      const hasTransaction = vi.fn().mockResolvedValue(false);
+      const sync = await syncedTo(10, hasTransaction);
+      // Tip 10 when the sync starts, 11 by the time it finishes.
+      vi.mocked(sync.getSyncProvider().getChainTipHeight)
+        .mockResolvedValueOnce(10)
+        .mockResolvedValue(11);
+
+      await sync.sync({ verifyHashes: false });
+
+      expect(hasTransaction).not.toHaveBeenCalled();
+      expect(await walletDB.isOutputUnspent('a1')).toBe(false);
+    });
+
     it('honours a custom threshold', async () => {
       await spendAgo('a1', 'dropped', 2 * MINUTE);
       const sync = await syncedTo(10, async () => false);
@@ -277,23 +292,46 @@ describe('hasTransaction', () => {
     expect(isTransactionNotFoundError(undefined)).toBe(false);
   });
 
-  it('P2P: found, not found, unknown', async () => {
+  // getdata's notfound is what the node answers for the wallet's own pending
+  // transaction before it has sent this connection an inventory since the
+  // transaction entered its mempool (e.g. right after a reconnect).
+  const P2P_NOT_FOUND = new Error(
+    `Transaction ${'ab'.repeat(32)} not found: not in the node's mempool or most recent block, ` +
+      'and not in a block scanned by this provider'
+  );
+
+  it('P2P: found, or unknown (a notfound is not definitive)', async () => {
     const p2p = new P2PSyncProvider({ host: 'localhost', network: 'regtest' });
     const fetch = vi.spyOn(p2p as any, 'fetchTransaction');
 
     fetch.mockResolvedValueOnce({});
     expect(await p2p.hasTransaction('ab'.repeat(32))).toBe(true);
 
-    fetch.mockRejectedValueOnce(
-      new Error(
-        `Transaction ${'ab'.repeat(32)} not found: not in the node's mempool or most recent block, ` +
-          'and not in a block scanned by this provider'
-      )
-    );
-    expect(await p2p.hasTransaction('ab'.repeat(32))).toBe(false);
+    fetch.mockRejectedValueOnce(P2P_NOT_FOUND);
+    expect(await p2p.hasTransaction('ab'.repeat(32))).toBeNull();
 
     fetch.mockRejectedValueOnce(new Error('Request timeout: getdata'));
     expect(await p2p.hasTransaction('ab'.repeat(32))).toBeNull();
+  });
+
+  it('P2P: a pending spend the node does not serve is kept', async () => {
+    const walletDB = new WalletDB({ type: 'better-sqlite3' });
+    await walletDB.open(':memory:');
+    try {
+      await walletDB.storeWalletOutput(output('a1', 'funding-a1', 10));
+      vi.useFakeTimers({ now: Date.now() - 31 * MINUTE, toFake: ['Date'] });
+      await walletDB.markOutputSpent('a1', 'pending', 0);
+      vi.useRealTimers();
+      const p2p = new P2PSyncProvider({ host: 'localhost', network: 'regtest' });
+      vi.spyOn(p2p as any, 'fetchTransaction').mockRejectedValue(P2P_NOT_FOUND);
+
+      const result = await new TransactionKeysSync(walletDB, p2p).checkPendingSpends();
+
+      expect(result).toEqual({ released: [], stillPending: [], unknown: ['pending'] });
+      expect(await walletDB.isOutputUnspent('a1')).toBe(false);
+    } finally {
+      await walletDB.close();
+    }
   });
 });
 

@@ -185,11 +185,16 @@ Once synced to the tip, `sync()` also checks this wallet's unconfirmed
 spends. A broadcast transaction marks its inputs spent until a block confirms
 it; for one still unconfirmed after `pendingSpendTimeoutMs`, sync asks the
 backend whether it still has the transaction (in its mempool or on chain). If
-the backend says it does not, the inputs become spendable again and the
-transaction's unconfirmed outputs are dropped from the balance. If the
-backend cannot answer, nothing changes. Should a released transaction confirm
-after all, the next sync marks its inputs spent again. The check is also
-available on its own as `client.getSyncManager().checkPendingSpends(olderThanMs)`.
+the backend definitively says it does not, the inputs become spendable again
+and the transaction's unconfirmed outputs are dropped from the balance. If the
+backend cannot answer, nothing changes. The Electrum backend answers
+definitively; the P2P backend never does (a node's `notfound` also covers
+transactions it holds but does not yet serve to this connection, including
+this wallet's own), so on P2P a stuck spend is only released by
+`releasePendingSpend`. The check runs only if the wallet is still at the tip
+when the sync ends. Should a released transaction confirm after all, the next
+sync marks its inputs spent again. The check is also available on its own as
+`client.getSyncManager().checkPendingSpends(olderThanMs)`.
 
 On a chain reorganization, `sync()` reverts the orphaned blocks (their
 outputs, spends and block hashes) and re-syncs from the fork point, calling
