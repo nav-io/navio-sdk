@@ -21,7 +21,7 @@ import { SyncProvider } from './sync-provider';
 import { P2PSyncProvider } from './p2p-sync';
 import { P2PConnectionOptions } from './p2p-protocol';
 import { ElectrumSyncProvider } from './electrum-sync';
-import { parseOutputHex, parseTransaction } from './p2p-block-parser';
+import { hash256Display, parseOutputHex, parseTransaction } from './p2p-block-parser';
 import { recoverStakeDelegation, type StakeDelegation } from './staking';
 import {
   BlindingKeyAllocator,
@@ -31,7 +31,6 @@ import {
 } from './blinding-key';
 import * as blsctModule from '@nav-io/navio-blsct';
 import { BlsctChain, setChain } from '@nav-io/navio-blsct';
-import { sha256 } from '@noble/hashes/sha256';
 import type { DatabaseAdapterType } from './database-adapter';
 import type {
   RequestQuoteOptions,
@@ -753,7 +752,7 @@ function publicTokenIdFromPublicKeyHex(tokenPublicKeyHex: string): string {
     throw new Error('Unexpected token public key length');
   }
   const prefixed = Buffer.concat([Buffer.from([keyBytes.length]), keyBytes]);
-  return Buffer.from(sha256(sha256(prefixed))).reverse().toString('hex');
+  return hash256Display(prefixed);
 }
 
 /**
@@ -1740,9 +1739,7 @@ export class NavioClient {
    * Hash a block header to get block hash
    */
   private hashBlockHeader(headerHex: string): string {
-    const headerBytes = Buffer.from(headerHex, 'hex');
-    const hash = sha256(sha256(headerBytes));
-    return Buffer.from(hash).reverse().toString('hex');
+    return hash256Display(Buffer.from(headerHex, 'hex'));
   }
 
   // ============================================================
@@ -4551,9 +4548,7 @@ export class NavioClient {
       return;
     }
 
-    const headerHash = Buffer.from(sha256(sha256(Buffer.from(headerHex, 'hex'))))
-      .reverse()
-      .toString('hex');
+    const headerHash = hash256Display(Buffer.from(headerHex, 'hex'));
     if (headerHash !== state.lastSyncedHash.toLowerCase()) {
       throw new Error(
         `Wallet state does not match the connected ${this.getNetwork()} chain: block ${state.lastSyncedHeight} ` +

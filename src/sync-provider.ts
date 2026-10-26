@@ -6,7 +6,7 @@
  */
 
 import type { BlockTransactionKeys, TransactionKeys } from './electrum';
-import { sha256 } from '@noble/hashes/sha256';
+import { hash256Display } from './p2p-block-parser';
 
 /**
  * Block header information (for sync provider)
@@ -88,7 +88,7 @@ export interface SyncProviderOptions {
  * - Fetching transaction keys for wallet scanning
  * - Fetching transaction outputs by hash
  * - Broadcasting transactions
- * 
+ *
  * @category Sync
  */
 export interface SyncProvider {
@@ -191,7 +191,7 @@ export interface SyncProvider {
   /**
    * Subscribe to new block headers (optional)
    * Not all providers support real-time subscriptions.
-   * 
+   *
    * @param callback - Callback invoked for each new block
    * @returns The initial/current block header
    */
@@ -199,7 +199,7 @@ export interface SyncProvider {
 
   /**
    * Unsubscribe a specific block header callback (optional)
-   * 
+   *
    * @param callback - The callback to remove (same reference as subscribeBlockHeaders)
    * @returns True if callback was found and removed
    */
@@ -218,7 +218,7 @@ export interface SyncProvider {
 
 /**
  * Base class for sync providers with common utility methods.
- * 
+ *
  * @category Sync
  */
 export abstract class BaseSyncProvider implements SyncProvider {
@@ -242,9 +242,7 @@ export abstract class BaseSyncProvider implements SyncProvider {
    * Block hash is double SHA256 of header, reversed for display
    */
   protected extractBlockHash(headerHex: string): string {
-    const headerBytes = Buffer.from(headerHex, 'hex');
-    const hash = sha256(sha256(headerBytes));
-    return Buffer.from(hash).reverse().toString('hex');
+    return hash256Display(Buffer.from(headerHex, 'hex'));
   }
 
   /**
@@ -286,4 +284,3 @@ export abstract class BaseSyncProvider implements SyncProvider {
   abstract broadcastTransaction(rawTx: string): Promise<string>;
   abstract getRawTransaction(txHash: string, verbose?: boolean): Promise<string | unknown>;
 }
-

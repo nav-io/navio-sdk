@@ -14,9 +14,13 @@ import { KeyManager } from './key-manager';
 import type { BlockTransactionKeys, TransactionKeys } from './electrum';
 import type { IWalletDB, SyncState, TxType } from './wallet-db.interface';
 import * as blsctModule from '@nav-io/navio-blsct';
-import { sha256 } from '@noble/hashes/sha256';
 import { canonicalAnchorOutid, searchBlindingKey } from './blinding-key';
-import { parseOutputHex, parseTransaction, type ParsedOutput } from './p2p-block-parser';
+import {
+  hash256Display,
+  parseOutputHex,
+  parseTransaction,
+  type ParsedOutput,
+} from './p2p-block-parser';
 import { isStakedCommitmentOutput, isStakedCommitmentOutputHex } from './staking';
 
 /**
@@ -286,11 +290,6 @@ function observed<T>(promise: Promise<T>): Promise<T> {
   return promise;
 }
 
-/** Display-hex double SHA-256, as block, transaction and output hashes are shown. */
-function hash256Display(data: Uint8Array): string {
-  return Buffer.from(sha256(sha256(data))).reverse().toString('hex');
-}
-
 /**
  * Transaction Keys Sync Manager
  *
@@ -340,7 +339,7 @@ export class TransactionKeysSync {
       getChainTip: async () => {
         const height = await client.getChainTipHeight();
         const header = await client.getBlockHeader(height);
-        const hash = Buffer.from(sha256(sha256(Buffer.from(header, 'hex')))).reverse().toString('hex');
+        const hash = hash256Display(Buffer.from(header, 'hex'));
         return { height, hash };
       },
       getBlockHeader: (height: number) => client.getBlockHeader(height),
@@ -1765,9 +1764,7 @@ export class TransactionKeysSync {
    */
   private extractBlockHash(headerHex: string): string {
     // Block hash is double SHA256 of header, reversed for display
-    const headerBytes = Buffer.from(headerHex, 'hex');
-    const hash = sha256(sha256(headerBytes));
-    return Buffer.from(hash).reverse().toString('hex');
+    return hash256Display(Buffer.from(headerHex, 'hex'));
   }
 
   private static readonly HEADER_CHUNK_SIZE = 2016;

@@ -139,6 +139,16 @@ function toDisplay(hash: Buffer): string {
   return Buffer.from(hash).reverse().toString('hex');
 }
 
+/**
+ * Double SHA-256 in display hex (byte-reversed), the form block, transaction
+ * and output hashes are shown in.
+ * @param data - Bytes to hash
+ * @returns The display-hex hash
+ */
+export function hash256Display(data: Uint8Array): string {
+  return toDisplay(hash256(data));
+}
+
 class Cursor {
   constructor(
     public readonly data: Buffer,
@@ -312,7 +322,7 @@ function parseOutput(c: Cursor, index: number): ParsedOutput {
   }
 
   const serialized = c.data.subarray(start, c.offset);
-  const outputHash = toDisplay(hash256(serialized));
+  const outputHash = hash256Display(serialized);
   if (keys) {
     keys.outputHash = outputHash;
   }
@@ -420,7 +430,7 @@ export function parseTransaction(data: Buffer, offset = 0): ParsedTransaction {
     txidBytes = hash256(full);
   }
   const txid = toDisplay(txidBytes);
-  const wtxid = hasWitness ? toDisplay(hash256(full)) : txid;
+  const wtxid = hasWitness ? hash256Display(full) : txid;
 
   return {
     txid,
@@ -472,7 +482,7 @@ export function parseBlock(data: Buffer): ParsedBlock {
   }
 
   return {
-    hash: toDisplay(hash256(header)),
+    hash: hash256Display(header),
     headerHex: header.toString('hex'),
     version,
     timestamp,
