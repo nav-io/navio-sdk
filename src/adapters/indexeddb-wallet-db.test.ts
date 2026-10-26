@@ -111,3 +111,45 @@ describe('IndexedDBWalletDB.getOutputData', () => {
     }
   });
 });
+
+describe('IndexedDBWalletDB swap intents', () => {
+  const INTENT_PATH = 'swap-intents';
+  afterEach(async () => {
+    await IndexedDBWalletDB.deleteDatabase(INTENT_PATH);
+  });
+
+  /** A version-5 database: standing orders but no swapIntents store. */
+  function writeVersion5Database(): Promise<void> {
+    return new Promise((resolve, reject) => {
+      const req = indexedDB.open(IndexedDBWalletDB.getDatabaseName(INTENT_PATH), 5);
+      req.onerror = () => reject(req.error);
+      req.onupgradeneeded = () => {
+        req.result.createObjectStore('standingOrders', { keyPath: 'localId' });
+      };
+      req.onsuccess = () => {
+        req.result.close();
+        resolve();
+      };
+    });
+  }
+
+  it('adds the store on upgrade and round-trips intents', async () => {
+    await writeVersion5Database();
+    const walletDB = new IndexedDBWalletDB();
+    await walletDB.open(INTENT_PATH);
+    try {
+      const row = {
+        localId: 'i1', intentId: 3, tokenInId: 'ab'.repeat(32), tokenOutId: null,
+        minSize: '100', maxSize: '1000', priceMin: '10000000', expiry: 2_000_000_000, createdAt: 2,
+      };
+      await walletDB.saveSwapIntent(row);
+      await walletDB.saveSwapIntent({ ...row, localId: 'i0', createdAt: 1 });
+      expect((await walletDB.getSwapIntents()).map((r) => r.localId)).toEqual(['i0', 'i1']);
+      expect((await walletDB.getSwapIntents())[1]).toEqual(row);
+      await walletDB.deleteSwapIntent('i0');
+      expect(await walletDB.getSwapIntents()).toEqual([row]);
+    } finally {
+      await walletDB.close();
+    }
+  });
+});

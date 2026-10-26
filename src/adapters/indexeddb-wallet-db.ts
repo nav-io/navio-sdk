@@ -24,13 +24,14 @@ import type {
   WalletMetadata,
   StoreOutputParams,
   TxType,
-  CreatedCollectionRecord, SubAddressEntry, StandingOrderRow } from '../wallet-db.interface';
+  CreatedCollectionRecord, SubAddressEntry, StandingOrderRow, SwapIntentRow } from '../wallet-db.interface';
 
 // v2: adds the createdCollections store
 // v3: adds the standingOrders store
 // v4: adds the outputBlindingKeys store
 // v5: walletOutputs records carry isStakedCommitment (backfilled on upgrade)
-const IDB_VERSION = 5;
+// v7: adds the swapIntents store
+const IDB_VERSION = 7;
 const DEFAULT_TOKEN_ID = '0000000000000000000000000000000000000000000000000000000000000000';
 
 function idbReq<T>(req: IDBRequest<T>): Promise<T> {
@@ -129,6 +130,7 @@ export class IndexedDBWalletDB implements IWalletDB {
       ['createdCollections', { keyPath: 'collectionTokenId' }],
       ['standingOrders', { keyPath: 'localId' }],
       ['outputBlindingKeys', { keyPath: 'outputHash' }],
+      ['swapIntents', { keyPath: 'localId' }],
     ];
     for (const [name, opts] of stores) {
       if (!db.objectStoreNames.contains(name)) db.createObjectStore(name, opts);
@@ -520,12 +522,13 @@ export class IndexedDBWalletDB implements IWalletDB {
     if (!(await this.holdsDifferentWallet(incoming))) return;
     const db = this.ensureOpen();
     const tx = db.transaction(
-      ['walletOutputs', 'createdCollections', 'standingOrders', 'outputBlindingKeys'],
+      ['walletOutputs', 'createdCollections', 'standingOrders', 'swapIntents', 'outputBlindingKeys'],
       'readwrite',
     );
     tx.objectStore('walletOutputs').clear();
     tx.objectStore('createdCollections').clear();
     tx.objectStore('standingOrders').clear();
+    tx.objectStore('swapIntents').clear();
     // Another seed's blinding scalars are not ours and can never verify.
     tx.objectStore('outputBlindingKeys').clear();
     await idbTx(tx);
@@ -888,6 +891,22 @@ export class IndexedDBWalletDB implements IWalletDB {
     const db = this.ensureOpen();
     const tx = db.transaction('standingOrders', 'readwrite');
     tx.objectStore('standingOrders').delete(localId);
+    await idbTx(tx);
+  }
+
+  async saveSwapIntent(row: SwapIntentRow): Promise<void> {
+    await this.put('swapIntents', { ...row });
+  }
+
+  async getSwapIntents(): Promise<SwapIntentRow[]> {
+    const rows = await this.getAll<SwapIntentRow>('swapIntents');
+    return rows.sort((a, b) => a.createdAt - b.createdAt);
+  }
+
+  async deleteSwapIntent(localId: string): Promise<void> {
+    const db = this.ensureOpen();
+    const tx = db.transaction('swapIntents', 'readwrite');
+    tx.objectStore('swapIntents').delete(localId);
     await idbTx(tx);
   }
 

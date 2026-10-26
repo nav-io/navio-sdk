@@ -1476,7 +1476,11 @@ const result = await client.acceptQuote({
 console.log('Swap tx:', result.txId);
 
 // ---- Maker: advertise liquidity and answer matching requests ----
-await client.setSwapIntent({
+// The intent is set on the daemon (which routes matching requests here) AND
+// stored in the wallet. replyQuote signs only for requests within one of the
+// wallet's own unexpired intents: the daemon's intents are shared by every
+// client of the server, so a pending request alone proves nothing.
+const intentId = await client.setSwapIntent({
   tokenInId: tokenId, // we deliver this
   tokenOutId: null, // we want NAV
   minSize: 1n,
@@ -1487,30 +1491,54 @@ await client.setSwapIntent({
 
 await client.subscribePendingQuoteRequests(async pending => {
   for (const request of pending) {
+    // Throws unless the request is within a local intent (token pair and
+    // direction, size band, sellCost * 1e8 >= fill * priceMin, not expired).
     await client.replyQuote({ request }); // builds + signs the maker half
   }
 });
 
+// Apps that manage intents elsewhere pass the terms explicitly instead:
+// await client.replyQuote({ request, bounds: { tokenInId, tokenOutId, minSize, maxSize, priceMin } });
+
+// Clear by localId: daemon ids are not unique across daemons or restarts.
+const [mine] = (await client.listLocalSwapIntents()).filter(i => i.intentId === intentId);
+await client.clearSwapIntent(mine.localId); // stops replyQuote answering under it, then clears the daemon's copy
+
 // ---- Maker: standing order that peers can fill while you're offline ----
-await client.broadcastOrder({
+const order = await client.broadcastOrder({
   offerTokenId: tokenId,
   offerAmount: 100n,
   wantTokenId: null,
   wantAmount: 10n,
   expiry: Math.floor(Date.now() / 1000) + 86400,
 });
-```
 
 // Standing orders are tracked locally: the coins an order commits are not
-// offered again by the next broadcastOrder (the network's order cache
-// rejects a second order spending an input of a stored order). A timed-out
-// broadcast keeps the reservation — the daemon may still have published it.
+// offered again by the next broadcastOrder, replyQuote or acceptQuote (the
+// network's order cache rejects a second order spending an input of a stored
+// order). A timed-out broadcast keeps the reservation — the daemon may still
+// have published it. A quote sent with replyQuote reserves its coins the same
+// way until its orderExpiry (in memory only), and an acceptQuote reserves its
+// coins until they are marked spent.
 const orders = await client.listStandingOrders(); // live + unconfirmed, pruned on expiry / spent inputs
-await client.forgetStandingOrder(orders[0].localId); // release the coins locally (network keeps the order until expiry)
 
-Maker halves spend wallet coins that are **not locked** while a quote or
-order is outstanding — don't spend them manually until it expires, or the
-swap will fail to confirm.
+// Withdraw an order, or a quote sent with replyQuote, by spending its inputs
+// back to the wallet. Costs a normal transaction fee.
+await client.cancelSwapHalf({ orderId: order.localId! });
+await client.cancelSwapHalf({ inputs: sentQuote.inputs }); // sentQuote: a replyQuote result
+```
+
+**Signed halves do not expire.** A quote's `orderExpiry` and a standing
+order's `expiry` are daemon metadata: daemons stop relaying the half after
+them, but the chain enforces no expiry on a transaction (Navio has only
+`nLockTime`, a not-before). Whoever saw the half — the taker and server for a
+quote, every peer that cached a standing order — can complete the swap at its
+terms until one of its inputs is spent. The wallet keeps a standing order's
+coins out of its other trades while it tracks the order, and a sent quote's
+coins until `orderExpiry` (in memory, so not across a restart); plain sends
+do not check these reservations. To withdraw a half, call `cancelSwapHalf`; `forgetStandingOrder` only drops
+the local record. `acceptQuote` refuses a quote past its `orderExpiry` (with
+30 seconds of clock-skew allowance).
 
 ### Cold Staking
 

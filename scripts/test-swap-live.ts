@@ -27,7 +27,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { NavioClient } from '../src/client';
-import { Address, AddressEncoding, DoublePublicKey } from 'navio-blsct';
+import { Address, AddressEncoding, DoublePublicKey } from '@nav-io/navio-blsct';
 
 const NAVIOD = process.env.NAVIOD ?? '../navio-core/build/bin/naviod';
 const CHAIN = 'blsctregtest';

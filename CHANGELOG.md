@@ -23,6 +23,51 @@ Format follows [Keep a Changelog](https://keepachangelog.com/); versions follow 
   is kept, so no save loses the seed. SQLite gains an `encrypted_seed` column
   and turns on `secure_delete`, so the replaced plaintext does not linger in
   free pages.
+- **`replyQuote` signs only within the maker's own terms.** It built and
+  signed a maker half from whatever pending request the server returned. The
+  daemon's swap intents are shared by every client of the ElectrumX server,
+  which can add or clear them, so a request was no proof the maker agreed to
+  its pair, size or price. `setSwapIntent` now also stores the intent in the
+  wallet, `clearSwapIntent` drops it there first, and `replyQuote` refuses a
+  request outside every unexpired local intent: the taker must buy
+  `tokenInId` and sell `tokenOutId`, the fill must lie in
+  `[minSize, maxSize]`, and `sellCost * 1e8 >= fill * priceMin`, checked
+  exactly in bigint (the daemon quotes `ceil(fill * priceMin / 1e8)`). Pass
+  `ReplyQuoteOptions.bounds` to answer under terms managed elsewhere. Pending
+  requests are validated (64-hex uuid and token hashes, positive integer
+  amounts, 96-hex reply key); `getPendingQuoteRequests` and the subscription
+  drop malformed entries. SQLite gains a `swap_intents` table and the
+  IndexedDB database moves to version 7 (`swapIntents` store).
+- **Signed swap halves can be withdrawn.** A quote's `orderExpiry` and a
+  standing order's `expiry` only tell daemons when to stop relaying the half;
+  the half itself stays valid until one of its inputs is spent, and the docs
+  wrongly said an unaccepted quote's coins were free once it expired. The new
+  `cancelSwapHalf({ orderId } | { inputs })` spends the half's inputs back to
+  the wallet (sweeping its NAV inputs, fee taken from them; otherwise sending
+  its token inputs, fee from other NAV), which invalidates it, and drops the
+  tracked standing order. The docs now say plainly that halves do not expire.
+- **`acceptQuote` refuses an expired quote** (past `orderExpiry` by more than
+  30 seconds of clock skew) before signing, and no longer marks its inputs
+  spent under a transaction id the server returned that is not 64 hex chars.
+- **Swap coins stay reserved.** `replyQuote` and `acceptQuote` now
+  skip coins committed to the wallet's live standing orders when selecting
+  inputs, and `broadcastOrder` reserves its coins atomically: concurrent calls
+  no longer read the reservations before either has recorded its order and
+  commit the same coins twice. `acceptQuote` reserves the coins it selected
+  until they are marked spent (released if the submission fails), so a
+  second accept cannot sign over them while the first is with the server.
+  `replyQuote` reserves its coins until the quote's `orderExpiry` plus the
+  30-second skew allowance (kept on a timed-out send, released on any other
+  failure), so a later `broadcastOrder`, `acceptQuote` or reply does not
+  commit them again; these quote reservations are in memory only.
+  `broadcastOrder({ reserveInputs: false })` still honours them.
+- **`cancelSwapHalf` runs under the trading lock** and never picks a NAV fee
+  coin that another standing order, sent quote or in-flight accept commits.
+- **`setSwapIntent` checks the daemon's reply** and throws on anything but a
+  non-negative integer id instead of storing `NaN`. If storing the intent
+  locally fails, it clears the daemon's copy again before throwing.
+- `getPendingQuoteRequests` and the pending-request subscription log a
+  `console.warn` for each malformed entry they drop.
 
 ### Changed
 
@@ -34,6 +79,16 @@ Format follows [Keep a Changelog](https://keepachangelog.com/); versions follow 
   an unencrypted wallet is saved over an encrypted one.
 - `KeyManager.setEncryptionParams()` clears private keys a plaintext seed had
   derived into memory, since the wallet it describes starts locked.
+- `replyQuote` throws unless the request is within a swap intent set with
+  this wallet's `setSwapIntent` (or within `bounds`). Intents set before this
+  version, or directly on the daemon, are not stored locally: set them again,
+  or pass `bounds`. `setSwapIntent` now needs an initialized client.
+- `clearSwapIntent` also takes a stored intent's `localId` (from
+  `listLocalSwapIntents`) and then drops exactly that intent. With a daemon
+  id it now drops only the newest stored intent under that id, not every one.
+- `IWalletDB` gains `saveSwapIntent` / `getSwapIntents` / `deleteSwapIntent`;
+  custom implementations must add them. New `listLocalSwapIntents()` lists
+  the wallet's own intents; `listSwapIntents()` still lists the daemon's.
 
 ## [0.4.0] - 2026-10-17
 
