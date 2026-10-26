@@ -1,5 +1,9 @@
 import 'fake-indexeddb/auto';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import Database from 'better-sqlite3';
+import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { KeyManager } from './key-manager';
 import { WalletDB } from './wallet-db';
 import { IndexedDBWalletDB } from './adapters/indexeddb-wallet-db';
@@ -401,5 +405,60 @@ describe.each(backends)('$name encrypted seed', backend => {
     const reloaded = await db.loadWallet();
     expect(reloaded.isEncrypted()).toBe(false);
     expect(reloaded.getMnemonic()).toBe(OTHER_MNEMONIC);
+  });
+});
+
+describe('WalletDB (SQLite file) plaintext seed migration', () => {
+  let dir: string | null = null;
+
+  afterEach(async () => {
+    if (dir) {
+      await rm(dir, { recursive: true, force: true });
+      dir = null;
+    }
+  });
+
+  it('leaves no plaintext seed in the file once the encrypted seed replaces it', async () => {
+    dir = await mkdtemp(join(tmpdir(), 'navio-wallet-lock-'));
+    const path = join(dir, 'wallet.db');
+
+    let db = new WalletDB({ type: 'better-sqlite3' });
+    await db.open(path);
+    const km = await db.restoreWalletFromMnemonic(MNEMONIC, 0);
+    await km.setPassword(PASSWORD);
+    await db.saveWallet(km);
+    await db.close();
+
+    // What earlier versions left behind: the plaintext mnemonic stored, and
+    // stale copies of it in pages freed without secure_delete
+    const raw = new Database(path);
+    raw.pragma('secure_delete = OFF');
+    raw.exec('CREATE TABLE stale (data TEXT)');
+    const insert = raw.prepare('INSERT INTO stale (data) VALUES (?)');
+    for (let i = 0; i < 8; i++) {
+      insert.run(MNEMONIC + ' '.repeat(2000));
+    }
+    raw.exec('DROP TABLE stale');
+    raw
+      .prepare('UPDATE master_seed SET mnemonic = ?, encrypted_seed = NULL WHERE id = 0')
+      .run(MNEMONIC);
+    raw.close();
+    expect((await readFile(path)).includes(MNEMONIC)).toBe(true);
+
+    db = new WalletDB({ type: 'better-sqlite3' });
+    await db.open(path);
+    const reloaded = await db.loadWallet();
+    expect(await reloaded.unlock(PASSWORD)).toBe(true);
+    await db.saveWallet(reloaded);
+    await db.close();
+
+    expect((await readFile(path)).includes('vendor hand scale')).toBe(false);
+
+    db = new WalletDB({ type: 'better-sqlite3' });
+    await db.open(path);
+    const again = await db.loadWallet();
+    expect(await again.unlock(PASSWORD)).toBe(true);
+    expect(again.getMnemonic()).toBe(MNEMONIC);
+    await db.close();
   });
 });
