@@ -98,7 +98,8 @@ Format follows [Keep a Changelog](https://keepachangelog.com/); versions follow 
 - `sync()` stops at the chain tip it saw when it started, even when
   `endHeight` is higher; blocks found since are left for the next sync. With
   `verifyHashes` (the default) each pass reads one more header, the anchor
-  block, at the start and after every batch, and a batch's headers and
+  block, at the start and after every batch (a wallet already at the tip
+  reads it once, as the reorg check's block), and a batch's headers and
   wallet outputs are all fetched before any of it is written.
 - A wallet restored from a birthday mnemonic connects to the backend before
   it is created, to read the headers.

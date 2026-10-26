@@ -524,6 +524,18 @@ describe('TransactionKeysSync', () => {
       expect(onProgress).toHaveBeenCalledWith(59, 61, 0, 0, true);
     });
 
+    it('polls an up-to-date wallet with a single header request', async () => {
+      const { provider } = await syncedWallet(60);
+      vi.mocked(provider.getBlockHeader).mockClear();
+      vi.mocked(provider.getBlockHeaders).mockClear();
+
+      expect(await syncManager.sync()).toBe(0);
+
+      // The anchor and the reorg check are the same block, fetched once.
+      expect(provider.getBlockHeader).toHaveBeenCalledTimes(1);
+      expect(provider.getBlockHeaders).not.toHaveBeenCalled();
+    });
+
     it('detects a reorg that replaces the tip block at the same height', async () => {
       const { provider, blockHeaders } = await syncedWallet(60);
       expect(await syncManager.isSyncNeeded()).toBe(false);
@@ -583,9 +595,9 @@ describe('TransactionKeysSync', () => {
         lastSyncedHeight: tip,
         searchedDownTo: tip - MAX_REORG_DEPTH,
       });
-      // One header for the sync's anchor, one for the reorg check, and one
-      // batched request for the walk down.
-      expect(provider.getBlockHeader).toHaveBeenCalledTimes(2);
+      // One header for the sync's anchor, which the reorg check reuses (the
+      // wallet is at the tip), and one batched request for the walk down.
+      expect(provider.getBlockHeader).toHaveBeenCalledTimes(1);
       expect(provider.getBlockHeaders).toHaveBeenCalledTimes(1);
       expect(syncManager.getLastSyncedHeight()).toBe(tip);
       expect(await walletDB.getBlockHash(tip)).toBe(hashHeader(defaultHeader(tip)));
@@ -606,9 +618,9 @@ describe('TransactionKeysSync', () => {
         lastSyncedHeight: 60,
         searchedDownTo: 57,
       });
-      // One header for the sync's anchor, one for the reorg check, and one
-      // batched request for the walk down.
-      expect(provider.getBlockHeader).toHaveBeenCalledTimes(2);
+      // One header for the sync's anchor, which the reorg check reuses (the
+      // wallet is at the tip), and one batched request for the walk down.
+      expect(provider.getBlockHeader).toHaveBeenCalledTimes(1);
       expect(provider.getBlockHeaders).toHaveBeenCalledTimes(1);
       expect(syncManager.getLastSyncedHeight()).toBe(60);
     });

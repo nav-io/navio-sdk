@@ -539,7 +539,13 @@ export class TransactionKeysSync {
 
     let reorgInfo: ReorganizationInfo | null = null;
     if (this.syncState && verifyHashes) {
-      reorgInfo = await this.checkReorganization(this.syncState.lastSyncedHeight, chainTip);
+      // When already synced the anchor is the block the check compares, so
+      // it is not fetched twice.
+      reorgInfo = await this.checkReorganization(
+        this.syncState.lastSyncedHeight,
+        chainTip,
+        anchor ?? undefined
+      );
       if (reorgInfo) {
         if (stopOnReorg) {
           throw new ReorgError(reorgInfo);
@@ -848,13 +854,16 @@ export class TransactionKeysSync {
    *
    * @param lastSynced - Last synced height
    * @param chainTip - Server chain tip height
+   * @param known - A block hash just fetched from the server, used instead of
+   *   fetching it again when it is the block compared
    * @returns Reorganization info if detected, null otherwise
    * @throws DeepReorgError if no matching block is found within the depth
    *   limit, or the walk reaches a height with no stored hash
    */
   private async checkReorganization(
     lastSynced: number,
-    chainTip: number
+    chainTip: number,
+    known?: { height: number; hash: string }
   ): Promise<ReorganizationInfo | null> {
     if (!this.syncState || lastSynced < 0) {
       return null;
@@ -867,9 +876,8 @@ export class TransactionKeysSync {
     if (!heldTop) {
       return null; // nothing recorded to compare against
     }
-    const serverTop = this.extractBlockHash(
-      await this.withRetry(() => this.syncProvider.getBlockHeader(top))
-    );
+    const serverTop =
+      known && known.height === top ? known.hash : await this.fetchBlockHash(top);
     if (serverTop === heldTop) {
       return null;
     }
