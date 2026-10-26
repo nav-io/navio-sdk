@@ -49,11 +49,25 @@ Format follows [Keep a Changelog](https://keepachangelog.com/); versions follow 
 - **`acceptQuote` refuses an expired quote** (past `orderExpiry` by more than
   30 seconds of clock skew) before signing, and no longer marks its inputs
   spent under a transaction id the server returned that is not 64 hex chars.
-- **Standing-order coins stay reserved.** `replyQuote` and `acceptQuote` now
+- **Swap coins stay reserved.** `replyQuote` and `acceptQuote` now
   skip coins committed to the wallet's live standing orders when selecting
   inputs, and `broadcastOrder` reserves its coins atomically: concurrent calls
   no longer read the reservations before either has recorded its order and
-  commit the same coins twice.
+  commit the same coins twice. `acceptQuote` reserves the coins it selected
+  until they are marked spent (released if the submission fails), so a
+  second accept cannot sign over them while the first is with the server.
+  `replyQuote` reserves its coins until the quote's `orderExpiry` plus the
+  30-second skew allowance (kept on a timed-out send, released on any other
+  failure), so a later `broadcastOrder`, `acceptQuote` or reply does not
+  commit them again; these quote reservations are in memory only.
+  `broadcastOrder({ reserveInputs: false })` still honours them.
+- **`cancelSwapHalf` runs under the trading lock** and never picks a NAV fee
+  coin that another standing order, sent quote or in-flight accept commits.
+- **`setSwapIntent` checks the daemon's reply** and throws on anything but a
+  non-negative integer id instead of storing `NaN`. If storing the intent
+  locally fails, it clears the daemon's copy again before throwing.
+- `getPendingQuoteRequests` and the pending-request subscription log a
+  `console.warn` for each malformed entry they drop.
 
 ### Changed
 
@@ -69,6 +83,9 @@ Format follows [Keep a Changelog](https://keepachangelog.com/); versions follow 
   this wallet's `setSwapIntent` (or within `bounds`). Intents set before this
   version, or directly on the daemon, are not stored locally: set them again,
   or pass `bounds`. `setSwapIntent` now needs an initialized client.
+- `clearSwapIntent` also takes a stored intent's `localId` (from
+  `listLocalSwapIntents`) and then drops exactly that intent. With a daemon
+  id it now drops only the newest stored intent under that id, not every one.
 - `IWalletDB` gains `saveSwapIntent` / `getSwapIntents` / `deleteSwapIntent`;
   custom implementations must add them. New `listLocalSwapIntents()` lists
   the wallet's own intents; `listSwapIntents()` still lists the daemon's.

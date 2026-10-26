@@ -2457,6 +2457,17 @@ export class NavioClient {
    * ```
    */
   async sendTransaction(options: SendTransactionOptions): Promise<SendTransactionResult> {
+    return this.sendTransactionExcluding(options, new Set());
+  }
+
+  /**
+   * {@link sendTransaction}, never selecting a coin in `excludeUtxos`
+   * automatically (a manual `selectedUtxos` choice is taken as given).
+   */
+  private async sendTransactionExcluding(
+    options: SendTransactionOptions,
+    excludeUtxos: ReadonlySet<string>,
+  ): Promise<SendTransactionResult> {
     const { walletDB } = await this.ensureSpendReady();
 
     const {
@@ -2490,6 +2501,8 @@ export class NavioClient {
       );
       const confirmedAssetOutputs = requestedAssetOutputs.filter((output) => output.blockHeight > 0);
       const confirmedNavOutputs = navOutputs.filter((output) => output.blockHeight > 0);
+      const autoAssetOutputs = confirmedAssetOutputs.filter((output) => !excludeUtxos.has(output.outputHash));
+      const autoNavOutputs = confirmedNavOutputs.filter((output) => !excludeUtxos.has(output.outputHash));
 
       const manualHashes = selectedUtxos ?? [];
       const manualAssetByHash = new Map(confirmedAssetOutputs.map((output) => [output.outputHash, output]));
@@ -2537,7 +2550,7 @@ export class NavioClient {
           throw new Error('No unspent outputs available for the requested asset.');
         }
         ({ selected: selectedAssetOutputs, totalIn: totalAssetIn } = NavioClient.selectInputsByAmount(
-          confirmedAssetOutputs,
+          autoAssetOutputs,
           amount,
         ));
       }
@@ -2556,15 +2569,15 @@ export class NavioClient {
 
       for (let attempt = 0; attempt < 6; attempt++) {
         if (manualNavOutputs.length === 0 && selectedNavOutputs.length === 0) {
-          if (confirmedNavOutputs.length === 0) {
-            if (navOutputs.length > 0) {
+          if (autoNavOutputs.length === 0) {
+            if (navOutputs.length > 0 && confirmedNavOutputs.length === 0) {
               throw new Error('All NAV outputs available for fees are unconfirmed. Wait for block confirmation before spending.');
             }
             throw new Error('No unspent NAV outputs available to fund the transaction fee.');
           }
 
           ({ selected: selectedNavOutputs, totalIn: totalNavIn } = NavioClient.selectInputsByAmount(
-            confirmedNavOutputs,
+            autoNavOutputs,
             1n,
           ));
         }
@@ -2592,7 +2605,7 @@ export class NavioClient {
           }
         } else if (totalNavIn < estimatedFee) {
           ({ selected: selectedNavOutputs, totalIn: totalNavIn } = NavioClient.selectInputsByAmount(
-            confirmedNavOutputs,
+            autoNavOutputs,
             estimatedFee,
           ));
           if (totalNavIn < estimatedFee) {
@@ -2697,7 +2710,11 @@ export class NavioClient {
         }
         throw new Error('No unspent outputs available');
       }
-      ({ selected, totalIn } = NavioClient.selectInputs(this.selectableUtxos(confirmedUtxos), amount, subtractFeeFromAmount));
+      ({ selected, totalIn } = NavioClient.selectInputs(
+        this.selectableUtxos(confirmedUtxos.filter((u) => !excludeUtxos.has(u.outputHash))),
+        amount,
+        subtractFeeFromAmount,
+      ));
     }
 
     // --- Build token ID ---
@@ -3850,9 +3867,19 @@ export class NavioClient {
     for (const entry of raw) {
       try {
         parsed.push(NavioClient.parsePendingQuoteRequest(entry));
-      } catch {
+      } catch (err) {
         // A malformed entry is never answerable; skip it rather than hide
-        // the well-formed requests behind it.
+        // the well-formed requests behind it, but say so, or a daemon format
+        // change would just show an empty list.
+        let shown: string;
+        try {
+          shown = JSON.stringify(entry) ?? String(entry);
+        } catch {
+          shown = String(entry);
+        }
+        console.warn(
+          `Skipping malformed pending quote request: ${(err as Error)?.message ?? String(err)}: ${shown.slice(0, 200)}`
+        );
       }
     }
     return parsed;
@@ -3971,7 +3998,10 @@ export class NavioClient {
    *
    * A quote past its `orderExpiry` (beyond a 30-second clock-skew
    * allowance) is refused. Automatic coin selection skips coins committed to
-   * this wallet's live standing orders.
+   * this wallet's live standing orders and sent quotes, and coins another
+   * acceptQuote is still submitting. The selected coins are reserved under
+   * the trading lock until they are marked spent, or until the submission
+   * fails.
    */
   async acceptQuote(options: AcceptQuoteOptions): Promise<AcceptQuoteResult> {
     const { uuid, quoteId, maxPay, minRecv } = options;
@@ -3999,34 +4029,45 @@ export class NavioClient {
     }
 
     // The taker half pays no fee: the maker half over-funds the combined fee.
-    const { halfHex, fee, spentInputs } = await this.withTradingLock(async () => this.buildSwapHalf({
-      payTokenId: options.sellTokenId,
-      payAmount: quote.sellCost,
-      recvTokenId: options.buyTokenId,
-      recvAmount: quote.fill,
-      makerFee: false,
-      selectedUtxos: options.selectedUtxos,
-      excludeUtxos: await this.reservedStandingOrderInputs(),
-    }));
+    // Select and reserve under the lock; the reservation keeps the coins out
+    // of every other trade until they are marked spent below.
+    const { halfHex, fee, spentInputs } = await this.withTradingLock(async () => {
+      const half = await this.buildSwapHalf({
+        payTokenId: options.sellTokenId,
+        payAmount: quote.sellCost,
+        recvTokenId: options.buyTokenId,
+        recvAmount: quote.fill,
+        makerFee: false,
+        selectedUtxos: options.selectedUtxos,
+        excludeUtxos: await this.reservedSwapInputs(),
+      });
+      this.reserveSwapInputs(half.spentInputs, Number.POSITIVE_INFINITY);
+      return half;
+    });
 
-    const rawTxId: unknown = await electrum.rfqAcceptQuote(uuid, quoteId, halfHex);
-    const txId = typeof rawTxId === 'string' ? rawTxId.toLowerCase() : '';
-    if (!HASH_HEX_RE.test(txId)) {
-      // Do not record a spend under an id that names no transaction. The
-      // half was submitted, so the swap may still confirm; the inputs show
-      // as spent once sync sees it.
-      throw new Error(
-        `Server returned an invalid transaction id for the accepted quote (${String(rawTxId).slice(0, 80)}). ` +
-        'The swap may still have been broadcast; its inputs are not marked spent locally.'
-      );
+    try {
+      const rawTxId: unknown = await electrum.rfqAcceptQuote(uuid, quoteId, halfHex);
+      const txId = typeof rawTxId === 'string' ? rawTxId.toLowerCase() : '';
+      if (!HASH_HEX_RE.test(txId)) {
+        // Do not record a spend under an id that names no transaction. The
+        // half was submitted, so the swap may still confirm; the inputs show
+        // as spent once sync sees it.
+        throw new Error(
+          `Server returned an invalid transaction id for the accepted quote (${String(rawTxId).slice(0, 80)}). ` +
+          'The swap may still have been broadcast; its inputs are not marked spent locally.'
+        );
+      }
+
+      const { walletDB } = await this.ensureSpendReady();
+      for (const outputHash of spentInputs) {
+        await walletDB.markOutputSpent(outputHash, txId, 0);
+      }
+
+      return { txId, quote, fee };
+    } finally {
+      // Marked spent (or the submission failed): the reservation has done its job.
+      this.releaseSwapInputs(spentInputs);
     }
-
-    const { walletDB } = await this.ensureSpendReady();
-    for (const outputHash of spentInputs) {
-      await walletDB.markOutputSpent(outputHash, txId, 0);
-    }
-
-    return { txId, quote, fee };
   }
 
   /**
@@ -4042,7 +4083,13 @@ export class NavioClient {
    * {@link replyQuote} signs only for requests within a stored, unexpired
    * intent; the daemon's copy only routes matching requests here.
    *
-   * @returns The daemon's id for the intent (pass it to {@link clearSwapIntent})
+   * The daemon registers the intent first. If the wallet then fails to
+   * store it, the daemon's copy is cleared again before the error is thrown,
+   * so no intent is left on the daemon that the caller has no id for.
+   *
+   * @returns The daemon's id for the intent. Clear it with
+   * {@link clearSwapIntent}, preferably by the `localId` that
+   * {@link listLocalSwapIntents} reports for it.
    */
   async setSwapIntent(options: SwapIntentOptions): Promise<number> {
     if (options.minSize < 0n || options.maxSize < options.minSize) {
@@ -4058,44 +4105,85 @@ export class NavioClient {
     if (!this.walletDB) {
       throw new Error('Client not initialized');
     }
-    const intentId = Number(await electrum.swapSetIntent(
+    const rawIntentId: unknown = await electrum.swapSetIntent(
       tokenIn,
       tokenOut,
       toSafeInteger(options.minSize, 'minSize'),
       toSafeInteger(options.maxSize, 'maxSize'),
       toSafeInteger(options.priceMin, 'priceMin'),
       options.expiry,
-    ));
-    await this.walletDB.saveSwapIntent({
-      localId: NavioClient.randomLocalId(),
-      intentId,
-      tokenInId: NavioClient.fromDaemonToken(tokenIn),
-      tokenOutId: NavioClient.fromDaemonToken(tokenOut),
-      minSize: options.minSize.toString(),
-      maxSize: options.maxSize.toString(),
-      priceMin: options.priceMin.toString(),
-      expiry: options.expiry,
-      createdAt: Math.floor(Date.now() / 1000),
-    });
+    );
+    const intentId = typeof rawIntentId === 'number' || typeof rawIntentId === 'string'
+      ? Number(rawIntentId)
+      : Number.NaN;
+    if (!Number.isSafeInteger(intentId) || intentId < 0
+        || (typeof rawIntentId === 'string' && !/^\d+$/.test(rawIntentId))) {
+      // Nothing to store or clear under: the result names no intent.
+      throw new Error(
+        `Daemon returned an invalid swap intent id (${String(rawIntentId).slice(0, 80)}); the intent was not stored`
+      );
+    }
+    try {
+      await this.walletDB.saveSwapIntent({
+        localId: NavioClient.randomLocalId(),
+        intentId,
+        tokenInId: NavioClient.fromDaemonToken(tokenIn),
+        tokenOutId: NavioClient.fromDaemonToken(tokenOut),
+        minSize: options.minSize.toString(),
+        maxSize: options.maxSize.toString(),
+        priceMin: options.priceMin.toString(),
+        expiry: options.expiry,
+        createdAt: Math.floor(Date.now() / 1000),
+      });
+    } catch (err) {
+      // Do not leave the daemon matching takers against an intent the caller
+      // never got an id for.
+      let cleared: string;
+      try {
+        await electrum.swapClearIntent(intentId);
+        cleared = 'cleared it on the daemon again';
+      } catch (clearErr) {
+        cleared = `could not clear daemon intent ${intentId} (${(clearErr as Error)?.message ?? String(clearErr)}); ` +
+          `clear it with clearSwapIntent(${intentId})`;
+      }
+      throw new Error(`Failed to store the swap intent locally (${(err as Error)?.message ?? String(err)}); ${cleared}`);
+    }
     return intentId;
   }
 
   /**
-   * Remove a maker swap intent by the daemon's id. The wallet's stored copy
-   * is dropped first, so {@link replyQuote} stops answering under it even if
-   * the daemon call fails (or another client of the server already cleared
-   * the daemon's copy).
+   * Remove a maker swap intent. The wallet's stored copy is dropped first,
+   * so {@link replyQuote} stops answering under it even if the daemon call
+   * fails (or another client of the server already cleared the daemon's
+   * copy); then the daemon's copy is cleared.
    *
+   * Pass the intent's `localId` (from {@link listLocalSwapIntents}): it names
+   * exactly one stored intent. A daemon id (the number
+   * {@link setSwapIntent} returned) is not unique across daemons or daemon
+   * restarts, so with a number only the newest stored intent under that id
+   * is dropped. If no stored intent has that id, only the daemon is asked.
+   *
+   * @param id - The intent's `localId`, or the daemon's intent id
    * @returns Whether the daemon still held the intent
+   * @throws If a `localId` names no stored intent
    */
-  async clearSwapIntent(intentId: number): Promise<boolean> {
+  async clearSwapIntent(id: string | number): Promise<boolean> {
     const electrum = this.getTradingClient();
-    for (const row of await this.walletDB?.getSwapIntents() ?? []) {
-      if (row.intentId === intentId) {
-        await this.walletDB!.deleteSwapIntent(row.localId);
+    const rows = await this.walletDB?.getSwapIntents() ?? [];
+    let row: SwapIntentRow | undefined;
+    if (typeof id === 'string') {
+      row = rows.find((r) => r.localId === id);
+      if (!row) {
+        throw new Error(`Swap intent ${id} is not stored in this wallet`);
       }
+    } else {
+      // getSwapIntents is oldest first.
+      row = rows.filter((r) => r.intentId === id).pop();
     }
-    return electrum.swapClearIntent(intentId);
+    if (row) {
+      await this.walletDB!.deleteSwapIntent(row.localId);
+    }
+    return electrum.swapClearIntent(row ? row.intentId : (id as number));
   }
 
   /**
@@ -4200,14 +4288,22 @@ export class NavioClient {
    *
    * The half over-funds the transaction fee so the taker can accept with a
    * fee-free half. Automatic coin selection skips coins committed to this
-   * wallet's live standing orders.
+   * wallet's live standing orders, other sent quotes and in-flight
+   * acceptQuote calls.
+   *
+   * The quote's coins are then reserved until `orderExpiry` (plus the
+   * 30-second skew allowance takers get), so {@link broadcastOrder},
+   * {@link acceptQuote} and further replies do not commit them again while
+   * the taker can still accept. {@link cancelSwapHalf} releases them early.
+   * This reservation is held in memory only: it does not survive a restart
+   * of the client, and plain sends ignore it.
    *
    * **The signed half does not expire.** `orderExpiry` is daemon metadata
    * only: the taker's daemon stops offering the quote after it, but the half
    * itself stays valid, and whoever holds it (the taker, the server) can
-   * complete the swap at these terms until one of its inputs is spent. Its
-   * coins are not locked either. To withdraw a quote that was not accepted,
-   * call {@link cancelSwapHalf} with the returned `inputs`.
+   * complete the swap at these terms until one of its inputs is spent. To
+   * withdraw a quote that was not accepted, call {@link cancelSwapHalf} with
+   * the returned `inputs`.
    */
   async replyQuote(options: ReplyQuoteOptions): Promise<MakerQuoteResult> {
     const { request } = options;
@@ -4217,26 +4313,42 @@ export class NavioClient {
     await this.assertQuoteRequestAuthorized(request, options.bounds);
 
     // The maker pays what the taker buys, and receives what the taker sells.
-    const { halfHex, fee, spentInputs } = await this.withTradingLock(async () => this.buildSwapHalf({
-      payTokenId: request.buyTokenId,
-      payAmount: request.fill,
-      recvTokenId: request.sellTokenId,
-      recvAmount: request.sellCost,
-      makerFee: true,
-      selectedUtxos: options.selectedUtxos,
-      excludeUtxos: await this.reservedStandingOrderInputs(),
-    }));
+    // Select and reserve under the lock, so no other trade picks the coins
+    // while the quote is open.
+    const { halfHex, fee, spentInputs } = await this.withTradingLock(async () => {
+      const half = await this.buildSwapHalf({
+        payTokenId: request.buyTokenId,
+        payAmount: request.fill,
+        recvTokenId: request.sellTokenId,
+        recvAmount: request.sellCost,
+        makerFee: true,
+        selectedUtxos: options.selectedUtxos,
+        excludeUtxos: await this.reservedSwapInputs(),
+      });
+      this.reserveSwapInputs(half.spentInputs, orderExpiry + QUOTE_EXPIRY_SKEW_SECONDS);
+      return half;
+    });
 
-    const quoteId = await electrum.swapSendQuote(
-      request.uuid,
-      request.replyKey,
-      halfHex,
-      NavioClient.toDaemonToken(request.buyTokenId),
-      NavioClient.toDaemonToken(request.sellTokenId),
-      toSafeInteger(request.fill, 'fill'),
-      toSafeInteger(request.sellCost, 'sellCost'),
-      orderExpiry,
-    );
+    let quoteId: string;
+    try {
+      quoteId = await electrum.swapSendQuote(
+        request.uuid,
+        request.replyKey,
+        halfHex,
+        NavioClient.toDaemonToken(request.buyTokenId),
+        NavioClient.toDaemonToken(request.sellTokenId),
+        toSafeInteger(request.fill, 'fill'),
+        toSafeInteger(request.sellCost, 'sellCost'),
+        orderExpiry,
+      );
+    } catch (err) {
+      // A timed-out call may still have sent the quote: keep the coins
+      // reserved until it expires. Any other failure sent nothing.
+      if (!NavioClient.isRequestTimeout(err)) {
+        this.releaseSwapInputs(spentInputs);
+      }
+      throw err;
+    }
 
     return { quoteId, fee, halfTxHex: halfHex, inputs: spentInputs };
   }
@@ -4285,8 +4397,9 @@ export class NavioClient {
    *
    * **The signed half does not expire.** `expiry` only tells peers when to
    * drop the order from their caches; every peer that cached the half can
-   * still complete the swap at these terms until one of its inputs is spent,
-   * and its coins are not locked. Withdraw an order with
+   * still complete the swap at these terms until one of its inputs is spent.
+   * Its coins stay reserved against this wallet's other trades while the
+   * order is tracked (see {@link listStandingOrders}). Withdraw an order with
    * {@link cancelSwapHalf} (`{ orderId: localId }`); forgetStandingOrder
    * alone does not.
    */
@@ -4304,9 +4417,10 @@ export class NavioClient {
       // Coins committed to other live standing orders are off limits: the
       // network's order cache refuses an order spending an input of a stored
       // order, and only evicts orders on expiry or when an input is spent.
+      // Coins of open quotes and in-flight accepts are off limits either way.
       const reserved = options.reserveInputs === false
-        ? new Set<string>()
-        : await this.reservedStandingOrderInputs();
+        ? this.reservedQuoteInputs()
+        : await this.reservedSwapInputs();
 
       const half = await this.buildSwapHalf({
         payTokenId: options.offerTokenId,
@@ -4424,13 +4538,20 @@ export class NavioClient {
    * Spending one input is enough. When the half has NAV inputs, they are
    * swept back to the wallet's primary address with the fee taken from them;
    * otherwise its token inputs are sent there, with the fee paid from other
-   * NAV. Either way the cancel costs a normal transaction fee. The tracked
-   * standing order, if any, is dropped.
+   * NAV. Either way the cancel costs a normal transaction fee. That fee coin
+   * is never one reserved by another standing order, sent quote or in-flight
+   * acceptQuote, and the cancel runs under the trading lock, so no other
+   * trade selects coins meanwhile. The tracked standing order, if any, is
+   * dropped, and the half's coins are released.
    *
    * Fails if an input is already spent (the half is then already unusable),
    * or is not a confirmed coin of this wallet.
    */
   async cancelSwapHalf(options: CancelSwapHalfOptions): Promise<CancelSwapHalfResult> {
+    return this.withTradingLock(() => this.cancelSwapHalfLocked(options));
+  }
+
+  private async cancelSwapHalfLocked(options: CancelSwapHalfOptions): Promise<CancelSwapHalfResult> {
     let inputs: string[];
     let orderRow: StandingOrderRow | undefined;
     if (options.orderId !== undefined) {
@@ -4470,14 +4591,20 @@ export class NavioClient {
       ? navCoins
       : coins.filter((coin) => coin.tokenId === coins[0].tokenId);
     const amount = spend.reduce((sum, coin) => sum + coin.amount, 0n);
-    const result = await this.sendTransaction({
+    // A token-only half needs a NAV fee coin from elsewhere in the wallet: it
+    // must not be a coin another live half (or in-flight accept) commits.
+    const ownInputs = new Set(inputs);
+    const reserved = new Set([...await this.reservedSwapInputs()].filter((hash) => !ownInputs.has(hash)));
+    const result = await this.sendTransactionExcluding({
       address,
       amount,
       subtractFeeFromAmount: navCoins.length > 0,
       tokenId: navCoins.length > 0 ? null : spend[0].tokenId,
       selectedUtxos: spend.map((coin) => coin.outputHash),
-    });
+    }, reserved);
 
+    // The half is invalid now: its other coins are free again.
+    this.releaseSwapInputs(inputs);
     const spentInputs = spend.map((coin) => coin.outputHash);
     const spentSet = new Set(spentInputs);
     for (const row of await this.walletDB?.getStandingOrders() ?? []) {
@@ -4489,8 +4616,11 @@ export class NavioClient {
   }
 
   /**
-   * Serialize trading steps that read standing-order reservations and pick
-   * coins, so concurrent calls do not select the same coins.
+   * Serialize trading steps that read the coin reservations, pick coins and
+   * record what they picked (a standing order row, or an entry in
+   * `swapInputReservations`), so concurrent calls do not select the
+   * same coins. The record is written before the lock is released, so it
+   * covers the network call that follows.
    *
    * TODO: fold into the client-wide spend lock once there is one, so plain
    * sends cannot interleave with swap coin selection either.
@@ -4501,6 +4631,45 @@ export class NavioClient {
     const run = this.tradingLock.then(fn, fn);
     this.tradingLock = run.catch(() => undefined);
     return run;
+  }
+
+  /**
+   * Coins committed by trades that have no standing-order row: sent quotes
+   * (until their `orderExpiry` plus skew) and acceptQuote calls in flight
+   * (no expiry; released when they finish). outputHash -> unix time the
+   * reservation lapses. In memory only.
+   */
+  private swapInputReservations = new Map<string, number>();
+
+  private reserveSwapInputs(hashes: readonly string[], until: number): void {
+    for (const hash of hashes) {
+      this.swapInputReservations.set(hash, Math.max(until, this.swapInputReservations.get(hash) ?? 0));
+    }
+  }
+
+  private releaseSwapInputs(hashes: readonly string[]): void {
+    for (const hash of hashes) this.swapInputReservations.delete(hash);
+  }
+
+  /** Inputs of sent quotes and in-flight accepts, pruning lapsed ones. */
+  private reservedQuoteInputs(): Set<string> {
+    const now = Math.floor(Date.now() / 1000);
+    const reserved = new Set<string>();
+    for (const [hash, until] of this.swapInputReservations) {
+      if (until <= now) {
+        this.swapInputReservations.delete(hash);
+      } else {
+        reserved.add(hash);
+      }
+    }
+    return reserved;
+  }
+
+  /** Every coin a trade must not select: standing orders, sent quotes, in-flight accepts. */
+  private async reservedSwapInputs(): Promise<Set<string>> {
+    const reserved = await this.reservedStandingOrderInputs();
+    for (const hash of this.reservedQuoteInputs()) reserved.add(hash);
+    return reserved;
   }
 
   private static isRequestTimeout(err: unknown): boolean {
@@ -4573,7 +4742,7 @@ export class NavioClient {
     recvAmount: bigint;
     makerFee: boolean;
     selectedUtxos?: string[];
-    /** outputHashes never to select automatically (reserved by standing orders) */
+    /** outputHashes never to select (reserved by standing orders, quotes or in-flight accepts) */
     excludeUtxos?: Set<string>;
   }): Promise<{ halfHex: string; fee: bigint; spentInputs: string[] }> {
     const { keyManager, walletDB } = await this.ensureSpendReady();
@@ -4631,8 +4800,8 @@ export class NavioClient {
       for (const hash of manualHashes) {
         if (exclude.has(hash)) {
           throw new Error(
-            `Selected UTXO ${hash.slice(0, 16)}... is reserved by one of this wallet's standing orders ` +
-            '(see listStandingOrders / forgetStandingOrder)'
+            `Selected UTXO ${hash.slice(0, 16)}... is reserved by one of this wallet's standing orders, ` +
+            'sent quotes or in-flight quote accepts (see listStandingOrders / forgetStandingOrder / cancelSwapHalf)'
           );
         }
         const payUtxo = payByHash.get(hash);

@@ -120,9 +120,9 @@ export interface ReplyQuoteBounds {
  * replyQuote answers only requests within one of these.
  */
 export interface LocalSwapIntent extends ReplyQuoteBounds {
-  /** Local id (stable for the intent's lifetime) */
+  /** Local id (stable for the intent's lifetime); pass it to clearSwapIntent */
   localId: string;
-  /** Id the daemon assigned; pass it to clearSwapIntent */
+  /** Id the daemon assigned (not unique across daemons or daemon restarts) */
   intentId: number;
   /** Unix time (seconds) the intent expires */
   expiry: number;

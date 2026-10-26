@@ -429,7 +429,11 @@ describe('pending quote request validation', () => {
         valid,
       ],
     });
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
     const pending = await client.getPendingQuoteRequests();
+    expect(warn).toHaveBeenCalledTimes(10);
+    expect(warn.mock.calls[0][0]).toMatch(/Skipping malformed pending quote request: .*uuid/);
+    warn.mockRestore();
     expect(pending).toEqual([
       { uuid: UUID, buyTokenId: TOKEN, sellTokenId: null, fill: 500n, sellCost: 50n, replyKey: REPLY_KEY },
     ]);
@@ -553,6 +557,38 @@ describe('replyQuote local intents', () => {
     await expect(client.replyQuote({ request: request() })).rejects.toThrow(/no unexpired swap intent/);
   });
 
+  it('clears exactly the stored intent named by its localId', async () => {
+    const { client, intents } = makeMakerClient();
+    const id = await client.setSwapIntent(intent());
+    // A row from another daemon (or before a daemon restart) under the same id.
+    intents.set('other', { ...[...intents.values()][0], localId: 'other', createdAt: 0 });
+    const mine = [...intents.values()].find((r) => r.localId !== 'other')!.localId;
+    await client.clearSwapIntent(mine);
+    expect([...intents.keys()]).toEqual(['other']);
+    await expect(client.clearSwapIntent('nope')).rejects.toThrow(/not stored/);
+    // By daemon id, only the newest stored intent under it is dropped.
+    intents.set('newest', { ...intents.get('other'), localId: 'newest', intentId: id, createdAt: 9e9 });
+    await client.clearSwapIntent(id);
+    expect(intents.has('newest')).toBe(false);
+    expect(intents.has('other')).toBe(true);
+  });
+
+  it('refuses a daemon result that is not an intent id', async () => {
+    for (const bad of [Number.NaN, 'abc', '1.5', -1, null, { id: 1 }, 2 ** 60]) {
+      const { client, intents } = makeMakerClient();
+      (client as any).electrumClient.swapSetIntent = async () => bad;
+      await expect(client.setSwapIntent(intent())).rejects.toThrow(/invalid swap intent id/);
+      expect(intents.size).toBe(0);
+    }
+  });
+
+  it('clears the daemon\'s copy when storing the intent fails', async () => {
+    const { client, walletDB } = makeMakerClient();
+    walletDB.saveSwapIntent.mockRejectedValueOnce(new Error('disk full'));
+    await expect(client.setSwapIntent(intent())).rejects.toThrow(/disk full.*cleared it on the daemon/);
+    expect((client as any).electrumClient.swapClearIntent).toHaveBeenCalledWith(1);
+  });
+
   it('answers within explicit bounds without a local intent', async () => {
     const { client } = makeMakerClient();
     const bounds = { tokenInId: TOKEN, tokenOutId: null, minSize: 1n, maxSize: 500n, priceMin: 10_000_000n };
@@ -671,6 +707,151 @@ describe('broadcastOrder concurrent reservations', () => {
   });
 });
 
+describe('acceptQuote input reservations', () => {
+  const now = () => Math.floor(Date.now() / 1000);
+  const accept = { uuid: 'u1', quoteId: 'q1', buyTokenId: TOKEN, sellTokenId: null, maxPay: 50n, minRecv: 500n };
+
+  // Two coins; buildSwapHalf picks the first one neither excluded nor marked
+  // spent, like real coin selection over the wallet DB.
+  function makeRacingTakerClient(rfqAcceptQuote: (...args: any[]) => Promise<unknown>) {
+    const client = makeClient();
+    const spent = new Set<string>();
+    const walletDB = {
+      markOutputSpent: vi.fn(async (hash: string) => { spent.add(hash); }),
+      getStandingOrders: async () => [],
+      deleteStandingOrder: async () => undefined,
+    };
+    (client as any).walletDB = walletDB;
+    (client as any).initialized = true;
+    (client as any).getAllOutputs = async () => [];
+    (client as any).ensureSpendReady = async () => ({ keyManager: {}, walletDB });
+    const coins = ['coin-a', 'coin-b'];
+    const buildSwapHalf = vi.fn(async (params: { excludeUtxos?: Set<string> }) => {
+      const pick = coins.find((c) => !spent.has(c) && !params.excludeUtxos?.has(c));
+      if (!pick) throw new Error('Insufficient funds');
+      return { halfHex: pick, fee: 0n, spentInputs: [pick] };
+    });
+    (client as any).buildSwapHalf = buildSwapHalf;
+    stubElectrum(client, {
+      rfqListQuotes: async () => [{ quote_id: 'q1', fill: 500, sell_cost: 50, price: 0.1, order_expiry: now() + 600 }],
+      rfqAcceptQuote,
+    });
+    return { client, walletDB };
+  }
+
+  it('never signs two concurrent accepts over the same coin', async () => {
+    let n = 0;
+    const rfqAcceptQuote = vi.fn(async () => {
+      // The server takes a while to combine and broadcast.
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      return String(++n).repeat(64);
+    });
+    const { client } = makeRacingTakerClient(rfqAcceptQuote);
+    const [a, b] = await Promise.all([client.acceptQuote(accept), client.acceptQuote(accept)]);
+    expect(a.txId).not.toBe(b.txId);
+    // halfHex is the coin the half spends.
+    expect(new Set(rfqAcceptQuote.mock.calls.map((c: any[]) => c[2]))).toEqual(new Set(['coin-a', 'coin-b']));
+    expect([...(client as any).reservedQuoteInputs()]).toEqual([]);
+  });
+
+  it('releases the reservation when the submission fails', async () => {
+    const rfqAcceptQuote = vi.fn(async (..._args: any[]) => { throw new Error('quote no longer available'); });
+    const { client } = makeRacingTakerClient(rfqAcceptQuote);
+    await expect(client.acceptQuote(accept)).rejects.toThrow(/no longer available/);
+    await expect(client.acceptQuote(accept)).rejects.toThrow(/no longer available/);
+    // Both attempts signed over coin-a: the failed one did not keep it.
+    expect(rfqAcceptQuote.mock.calls.map((c: any[]) => c[2])).toEqual(['coin-a', 'coin-a']);
+  });
+});
+
+describe('replyQuote input reservations', () => {
+  const now = () => Math.floor(Date.now() / 1000);
+  const request = { uuid: UUID, buyTokenId: TOKEN, sellTokenId: null, fill: 500n, sellCost: 50n, replyKey: REPLY_KEY } as any;
+  const bounds = { tokenInId: TOKEN, tokenOutId: null, minSize: 1n, maxSize: 1000n, priceMin: 10_000_000n };
+
+  function makeReplyClient(swapSendQuote: (...args: any[]) => Promise<unknown>) {
+    const client = makeClient();
+    const store = new Map<string, any>();
+    (client as any).walletDB = {
+      saveStandingOrder: async (row: any) => { store.set(row.localId, { ...row }); },
+      getStandingOrders: async () => [...store.values()],
+      deleteStandingOrder: async (id: string) => { store.delete(id); },
+    };
+    (client as any).initialized = true;
+    (client as any).getAllOutputs = async () => [];
+    const coins = ['coin-a', 'coin-b'];
+    const buildSwapHalf = vi.fn(async (params: { excludeUtxos?: Set<string> }) => {
+      const pick = coins.find((c) => !params.excludeUtxos?.has(c));
+      if (!pick) throw new Error('Insufficient funds');
+      return { halfHex: 'aa', fee: 7n, spentInputs: [pick] };
+    });
+    (client as any).buildSwapHalf = buildSwapHalf;
+    stubElectrum(client, { swapSendQuote, swapBroadcastOrder: async () => 'order-1' });
+    return { client, buildSwapHalf };
+  }
+
+  const order = () => ({ offerTokenId: TOKEN, offerAmount: 500n, wantTokenId: null, wantAmount: 50n, expiry: now() + 3600 });
+
+  it('keeps a sent quote\'s coins out of a later broadcastOrder until it expires', async () => {
+    const { client } = makeReplyClient(async () => 'quote-1');
+    const quote = await client.replyQuote({ request, bounds, orderExpiry: now() + 600 });
+    expect(quote.inputs).toEqual(['coin-a']);
+    const standing = await client.broadcastOrder(order());
+    expect(standing.inputs).toEqual(['coin-b']);
+    // Not even with reserveInputs: false, which only ignores other standing orders.
+    await expect(client.broadcastOrder({ ...order(), reserveInputs: false })).resolves.toMatchObject({ inputs: ['coin-b'] });
+    await expect(client.replyQuote({ request, bounds })).rejects.toThrow(/Insufficient funds/);
+  });
+
+  it('releases the coins once the quote (plus skew) has expired', async () => {
+    const { client } = makeReplyClient(async () => 'quote-1');
+    await client.replyQuote({ request, bounds, orderExpiry: now() - 31 });
+    await expect(client.replyQuote({ request, bounds })).resolves.toMatchObject({ inputs: ['coin-a'] });
+  });
+
+  it('releases the coins when the quote was not sent, keeps them on a timeout', async () => {
+    let fail: Error = new Error('daemon error: unknown request');
+    const { client } = makeReplyClient(async () => { throw fail; });
+    await expect(client.replyQuote({ request, bounds })).rejects.toThrow(/unknown request/);
+    expect([...(client as any).reservedQuoteInputs()]).toEqual([]);
+    fail = new Error('Request timeout for method: blockchain.swap.send_quote');
+    await expect(client.replyQuote({ request, bounds })).rejects.toThrow(/timeout/);
+    expect([...(client as any).reservedQuoteInputs()]).toEqual(['coin-a']);
+  });
+
+  it('refuses a manual selection of a sent quote\'s coin', async () => {
+    const client = makeClient();
+    (client as any).walletDB = { getStandingOrders: async () => [], deleteStandingOrder: async () => undefined };
+    (client as any).initialized = true;
+    (client as any).ensureSpendReady = async () => ({ keyManager: {}, walletDB: (client as any).walletDB });
+    (client as any).getAllOutputs = async () => [];
+    (client as any).reserveSwapInputs(['coin-a'], now() + 600);
+    stubElectrum(client, { swapBroadcastOrder: async () => 'q' });
+    await expect(client.broadcastOrder({ ...order(), selectedUtxos: ['coin-a'] })).rejects.toThrow(/sent quotes/);
+  });
+});
+
+describe('sendTransactionExcluding', () => {
+  it('never picks an excluded NAV coin to pay a token send\'s fee', async () => {
+    const client = makeClient();
+    const coin = (outputHash: string, tokenId: string | null, amount: bigint) => ({
+      outputHash, txHash: 't', outputIndex: 0, blockHeight: 5, amount, gamma: '01', memo: null, tokenId,
+      blindingKey: '02', spendingKey: '03', isSpent: false, spentTxHash: null, spentBlockHeight: null,
+      isStakedCommitment: false,
+    });
+    (client as any).initialized = true;
+    (client as any).ensureSpendReady = async () => ({ keyManager: {}, walletDB: {} });
+    (client as any).decodeDestinationAddress = () => ({});
+    (client as any).getAllOutputs = async () => [coin('tok-a', TOKEN, 500n), coin('nav-reserved', null, 300_000n)];
+    await expect(
+      (client as any).sendTransactionExcluding(
+        { address: 'x', amount: 500n, tokenId: TOKEN, selectedUtxos: ['tok-a'] },
+        new Set(['nav-reserved']),
+      ),
+    ).rejects.toThrow(/No unspent NAV outputs available to fund the transaction fee/);
+  });
+});
+
 describe('cancelSwapHalf', () => {
   const FUTURE = () => Math.floor(Date.now() / 1000) + 3600;
   const coin = (outputHash: string, tokenId: string | null, amount: bigint, extra: Record<string, unknown> = {}) => ({
@@ -693,8 +874,8 @@ describe('cancelSwapHalf', () => {
       walletDB,
     });
     (client as any).getAllOutputs = async () => outputs;
-    const sendTransaction = vi.fn(async () => ({ txId: 'cd'.repeat(32), rawTx: '00', fee: 9n, inputCount: 1, outputCount: 2 }));
-    (client as any).sendTransaction = sendTransaction;
+    const sendTransaction = vi.fn(async (_options: any, _exclude: Set<string>) => ({ txId: 'cd'.repeat(32), rawTx: '00', fee: 9n, inputCount: 1, outputCount: 2 }));
+    (client as any).sendTransactionExcluding = sendTransaction;
     return { client, store, sendTransaction };
   }
 
@@ -712,7 +893,7 @@ describe('cancelSwapHalf', () => {
     expect(res).toEqual({ txId: 'cd'.repeat(32), fee: 9n, spentInputs: ['nav-a', 'nav-b'] });
     expect(sendTransaction).toHaveBeenCalledWith({
       address: 'tnv1self', amount: 500_000n, subtractFeeFromAmount: true, tokenId: null, selectedUtxos: ['nav-a', 'nav-b'],
-    });
+    }, new Set());
     expect(store.size).toBe(0);
   });
 
@@ -721,7 +902,45 @@ describe('cancelSwapHalf', () => {
     await client.cancelSwapHalf({ inputs: ['tok-a'] });
     expect(sendTransaction).toHaveBeenCalledWith({
       address: 'tnv1self', amount: 500n, subtractFeeFromAmount: false, tokenId: TOKEN, selectedUtxos: ['tok-a'],
+    }, new Set());
+  });
+
+  it('keeps other halves\' coins out of the NAV fee selection', async () => {
+    const other = { ...orderRow(['nav-other']), localId: 'o2', quoteId: 'q2' };
+    const { client, sendTransaction } = makeCancelClient(
+      [coin('tok-a', TOKEN, 500n), coin('nav-other', null, 300_000n), coin('nav-quote', null, 300_000n), coin('nav-free', null, 300_000n)],
+      [orderRow(['tok-a']), other],
+    );
+    (client as any).reserveSwapInputs(['nav-quote'], Math.floor(Date.now() / 1000) + 600);
+    await client.cancelSwapHalf({ orderId: 'q1' });
+    // The half's own input is spent explicitly; the other order's and the
+    // open quote's coins must not pay the fee.
+    expect(sendTransaction.mock.calls[0][1]).toEqual(new Set(['nav-other', 'nav-quote']));
+  });
+
+  it('runs under the trading lock', async () => {
+    const { client, sendTransaction } = makeCancelClient([coin('nav-a', null, 300_000n)]);
+    const order: string[] = [];
+    let release!: () => void;
+    const held = (client as any).withTradingLock(() => new Promise<void>((resolve) => {
+      release = () => { order.push('lock released'); resolve(); };
+    }));
+    sendTransaction.mockImplementation(async () => {
+      order.push('cancel sends');
+      return { txId: 'cd'.repeat(32), rawTx: '00', fee: 9n, inputCount: 1, outputCount: 2 };
     });
+    const cancel = client.cancelSwapHalf({ inputs: ['nav-a'] });
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    release();
+    await Promise.all([held, cancel]);
+    expect(order).toEqual(['lock released', 'cancel sends']);
+  });
+
+  it('releases a sent quote\'s reserved coins', async () => {
+    const { client } = makeCancelClient([coin('nav-a', null, 300_000n), coin('tok-b', TOKEN, 5n)]);
+    (client as any).reserveSwapInputs(['nav-a', 'tok-b'], Math.floor(Date.now() / 1000) + 600);
+    await client.cancelSwapHalf({ inputs: ['nav-a', 'tok-b'] });
+    expect([...(client as any).reservedQuoteInputs()]).toEqual([]);
   });
 
   it('refuses inputs that are already spent or unknown', async () => {

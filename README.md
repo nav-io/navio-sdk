@@ -1500,7 +1500,9 @@ await client.subscribePendingQuoteRequests(async pending => {
 // Apps that manage intents elsewhere pass the terms explicitly instead:
 // await client.replyQuote({ request, bounds: { tokenInId, tokenOutId, minSize, maxSize, priceMin } });
 
-await client.clearSwapIntent(intentId); // stops replyQuote answering under it, then clears the daemon's copy
+// Clear by localId: daemon ids are not unique across daemons or restarts.
+const [mine] = (await client.listLocalSwapIntents()).filter(i => i.intentId === intentId);
+await client.clearSwapIntent(mine.localId); // stops replyQuote answering under it, then clears the daemon's copy
 
 // ---- Maker: standing order that peers can fill while you're offline ----
 const order = await client.broadcastOrder({
@@ -1515,7 +1517,9 @@ const order = await client.broadcastOrder({
 // offered again by the next broadcastOrder, replyQuote or acceptQuote (the
 // network's order cache rejects a second order spending an input of a stored
 // order). A timed-out broadcast keeps the reservation — the daemon may still
-// have published it.
+// have published it. A quote sent with replyQuote reserves its coins the same
+// way until its orderExpiry (in memory only), and an acceptQuote reserves its
+// coins until they are marked spent.
 const orders = await client.listStandingOrders(); // live + unconfirmed, pruned on expiry / spent inputs
 
 // Withdraw an order, or a quote sent with replyQuote, by spending its inputs
@@ -1529,8 +1533,10 @@ order's `expiry` are daemon metadata: daemons stop relaying the half after
 them, but the chain enforces no expiry on a transaction (Navio has only
 `nLockTime`, a not-before). Whoever saw the half — the taker and server for a
 quote, every peer that cached a standing order — can complete the swap at its
-terms until one of its inputs is spent. Its coins are not locked meanwhile.
-To withdraw a half, call `cancelSwapHalf`; `forgetStandingOrder` only drops
+terms until one of its inputs is spent. The wallet keeps a standing order's
+coins out of its other trades while it tracks the order, and a sent quote's
+coins until `orderExpiry` (in memory, so not across a restart); plain sends
+do not check these reservations. To withdraw a half, call `cancelSwapHalf`; `forgetStandingOrder` only drops
 the local record. `acceptQuote` refuses a quote past its `orderExpiry` (with
 30 seconds of clock-skew allowance).
 
