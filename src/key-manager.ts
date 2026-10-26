@@ -388,6 +388,45 @@ export class KeyManager {
   }
 
   /**
+   * Encrypt an arbitrary secret with the wallet key, for storing alongside the
+   * wallet (output blinding scalars, for one). The result is self-describing
+   * and decrypts with {@link decryptSecret} for as long as the password is
+   * unchanged; after `changePassword()` it no longer decrypts.
+   *
+   * @param plaintext - The secret
+   * @returns The encrypted secret
+   * @throws If the wallet is not encrypted, or is locked
+   */
+  async encryptSecret(plaintext: Uint8Array): Promise<Uint8Array> {
+    if (!this.encrypted) {
+      throw new Error('Wallet is not encrypted');
+    }
+    if (!this.encryptionKey || !this.encryptionSalt) {
+      throw new Error('Wallet is locked');
+    }
+    const encrypted = await encryptWithKey(plaintext, this.encryptionKey, this.encryptionSalt);
+    return this.serializeEncryptedToBytes(encrypted);
+  }
+
+  /**
+   * Decrypt a secret from {@link encryptSecret}.
+   *
+   * @param ciphertext - The encrypted secret
+   * @returns The secret
+   * @throws If the wallet is not encrypted or is locked, or the secret does not
+   *   decrypt with the current wallet key
+   */
+  async decryptSecret(ciphertext: Uint8Array): Promise<Uint8Array> {
+    if (!this.encrypted) {
+      throw new Error('Wallet is not encrypted');
+    }
+    if (!this.encryptionKey) {
+      throw new Error('Wallet is locked');
+    }
+    return decryptWithKey(this.deserializeEncryptedFromBytes(ciphertext), this.encryptionKey);
+  }
+
+  /**
    * Encrypt the in-memory seed into cryptedSeed. No-op without a seed or
    * encryption key.
    */

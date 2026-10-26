@@ -262,17 +262,75 @@ export interface IWalletDB {
    * (whose `blindingKey` is the public point) because that struct is handed to
    * callers by `getUnspentOutputs`, `getAllOutputs` and friends.
    *
+   * The record is stored as given. Callers pass what
+   * `sealOutputBlindingKey` returns: the scalar encrypted with the wallet key
+   * for an encrypted wallet, the 64-hex scalar otherwise. Existing rows for
+   * the same output are replaced.
+   *
    * @param outputHash - Output hash, display hex
-   * @param blindingKeyPrivate - The scalar, 64 hex characters
+   * @param blindingKeyPrivate - The record (see above)
    */
   saveOutputBlindingKey(outputHash: string, blindingKeyPrivate: string): Promise<void>;
   /**
-   * The stored private blinding scalar for an output, or null if this wallet
-   * did not create it (or created it before this feature existed).
+   * The stored blinding-key record for an output, or null if this wallet did
+   * not create it (or created it before this feature existed). Pass it
+   * through `openOutputBlindingKey` to get the scalar.
    *
    * @param outputHash - Output hash, display hex
    */
   getOutputBlindingKey(outputHash: string): Promise<string | null>;
+  /**
+   * The stored blinding-key records that are not encrypted (do not start with
+   * `SEALED_BLINDING_KEY_PREFIX`), as saved. Used to encrypt the plaintext rows
+   * of a wallet that has been encrypted since they were written.
+   */
+  getUnsealedOutputBlindingKeys(): Promise<Array<{ outputHash: string; blindingKey: string }>>;
+  /**
+   * Replace an output's blinding-key record in place, only if it still holds
+   * `expected`. Unlike {@link saveOutputBlindingKey} it keeps the row's
+   * creation time, and it never overwrites a record written concurrently.
+   *
+   * @param outputHash - Output hash, display hex
+   * @param expected - The record the caller read
+   * @param replacement - The record to store instead
+   * @returns Whether the row was replaced
+   */
+  replaceOutputBlindingKey(
+    outputHash: string,
+    expected: string,
+    replacement: string
+  ): Promise<boolean>;
+  /**
+   * Claim the next build generation for a blinding-key anchor, persisting the
+   * bump before returning.
+   *
+   * The deterministic blinding scalar is otherwise a pure function of
+   * (seed, anchor, ordinal), so two builds over the same inputs — a resend
+   * after an abandoned or failed send, say — would reuse it for different
+   * amounts, and two range proofs sharing it leak both amounts. Every build
+   * that derives keys claims a generation here first, so no two builds on one
+   * anchor share one. Concurrent claims on one anchor never return the same
+   * value, and the counter survives a restart.
+   *
+   * Generations count from 0 and are never handed out twice. A value at or past
+   * `MAX_GENERATION_SEARCH` means the anchor is used up: the caller must use
+   * random keys rather than derive one recovery could not find.
+   *
+   * @param anchorOutid - The canonical anchor outid, display hex
+   * @returns The generation for this build
+   */
+  reserveBlindingGeneration(anchorOutid: string): Promise<number>;
+  /**
+   * How many build generations this database has handed out for an anchor
+   * (the next one {@link reserveBlindingGeneration} would return), without
+   * claiming one. Null when it has never handed one out.
+   *
+   * Only says what *this* database reserved: after a seed-only restore, or on
+   * another wallet sharing the seed, outputs may exist at higher generations.
+   *
+   * @param anchorOutid - The canonical anchor outid, display hex
+   */
+  getBlindingGeneration(anchorOutid: string): Promise<number | null>;
 
   // -- created collections ----------------------------------------------
   saveCreatedCollection(record: CreatedCollectionRecord): Promise<void>;

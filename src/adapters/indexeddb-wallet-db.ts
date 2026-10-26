@@ -17,6 +17,7 @@ import { KeyManager } from '../key-manager';
 import type { HDChain, SubAddressIdentifier } from '../key-manager.types';
 import * as blsctModule from '@nav-io/navio-blsct';
 import { isStakedCommitmentOutputHex } from '../staking';
+import { isSealedBlindingKey } from '../output-blinding-key-store';
 import type {
   IWalletDB,
   SyncState,
@@ -30,7 +31,8 @@ import type {
 // v3: adds the standingOrders store
 // v4: adds the outputBlindingKeys store
 // v5: walletOutputs records carry isStakedCommitment (backfilled on upgrade)
-const IDB_VERSION = 5;
+// v6: adds the blindingGenerations store
+const IDB_VERSION = 6;
 const DEFAULT_TOKEN_ID = '0000000000000000000000000000000000000000000000000000000000000000';
 
 function idbReq<T>(req: IDBRequest<T>): Promise<T> {
@@ -129,6 +131,9 @@ export class IndexedDBWalletDB implements IWalletDB {
       ['createdCollections', { keyPath: 'collectionTokenId' }],
       ['standingOrders', { keyPath: 'localId' }],
       ['outputBlindingKeys', { keyPath: 'outputHash' }],
+      // Next build generation per blinding-key anchor. Never cleared: a
+      // forgotten generation is one that gets handed out again.
+      ['blindingGenerations', { keyPath: 'anchorOutid' }],
     ];
     for (const [name, opts] of stores) {
       if (!db.objectStoreNames.contains(name)) db.createObjectStore(name, opts);
@@ -873,6 +878,77 @@ export class IndexedDBWalletDB implements IWalletDB {
   async getOutputBlindingKey(outputHash: string): Promise<string | null> {
     const rec = await this.get<{ outputHash: string; blindingKey: string }>('outputBlindingKeys', outputHash);
     return rec?.blindingKey ?? null;
+  }
+
+  async getUnsealedOutputBlindingKeys(): Promise<Array<{ outputHash: string; blindingKey: string }>> {
+    // The store has no index on the record, so walk it with a cursor and keep
+    // only the plaintext rows rather than materialising every record.
+    const db = this.ensureOpen();
+    const tx = db.transaction('outputBlindingKeys', 'readonly');
+    const rows: Array<{ outputHash: string; blindingKey: string }> = [];
+    const req = tx.objectStore('outputBlindingKeys').openCursor();
+    req.onsuccess = () => {
+      const cursor = req.result;
+      if (!cursor) return;
+      const { outputHash, blindingKey } = cursor.value as { outputHash: string; blindingKey: string };
+      if (!isSealedBlindingKey(blindingKey)) rows.push({ outputHash, blindingKey });
+      cursor.continue();
+    };
+    await idbTx(tx);
+    return rows;
+  }
+
+  async replaceOutputBlindingKey(
+    outputHash: string,
+    expected: string,
+    replacement: string,
+  ): Promise<boolean> {
+    // Compare and write in one readwrite transaction, keeping createdAt.
+    const db = this.ensureOpen();
+    const tx = db.transaction('outputBlindingKeys', 'readwrite');
+    const store = tx.objectStore('outputBlindingKeys');
+    let replaced = false;
+    const getReq = store.get(outputHash);
+    getReq.onsuccess = () => {
+      const rec = getReq.result as { outputHash: string; blindingKey: string; createdAt?: number } | undefined;
+      if (rec?.blindingKey !== expected) return;
+      store.put({ ...rec, blindingKey: replacement });
+      replaced = true;
+    };
+    await idbTx(tx);
+    return replaced;
+  }
+
+  async getBlindingGeneration(anchorOutid: string): Promise<number | null> {
+    const rec = await this.get<{ anchorOutid: string; nextGeneration: number }>(
+      'blindingGenerations',
+      anchorOutid.toLowerCase(),
+    );
+    const next = rec?.nextGeneration;
+    return typeof next === 'number' && Number.isInteger(next) && next >= 0 ? next : null;
+  }
+
+  async reserveBlindingGeneration(anchorOutid: string): Promise<number> {
+    // Read and bump inside one readwrite transaction. IndexedDB serializes
+    // readwrite transactions over the same store, so two concurrent claims —
+    // from this page or another tab — never see the same value, and the
+    // generation is returned only once the bump has committed.
+    const db = this.ensureOpen();
+    const tx = db.transaction('blindingGenerations', 'readwrite');
+    const store = tx.objectStore('blindingGenerations');
+    const key = anchorOutid.toLowerCase();
+    let generation = -1;
+    const getReq = store.get(key);
+    getReq.onsuccess = () => {
+      const rec = getReq.result as { anchorOutid: string; nextGeneration: number } | undefined;
+      generation = rec?.nextGeneration ?? 0;
+      store.put({ anchorOutid: key, nextGeneration: generation + 1 });
+    };
+    await idbTx(tx);
+    if (!Number.isInteger(generation) || generation < 0) {
+      throw new Error('Could not reserve a blinding-key generation');
+    }
+    return generation;
   }
 
   async saveStandingOrder(row: StandingOrderRow): Promise<void> {

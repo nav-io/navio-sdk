@@ -16,6 +16,7 @@ import type { IWalletDB, SyncState, TxType } from './wallet-db.interface';
 import * as blsctModule from '@nav-io/navio-blsct';
 import { sha256 } from '@noble/hashes/sha256';
 import { canonicalAnchorOutid, searchBlindingKey } from './blinding-key';
+import { ensureOutputBlindingKeysSealed, sealOutputBlindingKey } from './output-blinding-key-store';
 import { parseOutputHex, parseTransaction, type ParsedOutput } from './p2p-block-parser';
 import { isStakedCommitmentOutput, isStakedCommitmentOutputHex } from './staking';
 
@@ -1087,7 +1088,7 @@ export class TransactionKeysSync {
         );
 
         if (candidateOutids.length > 0 && ephemeralKey) {
-          await this.backfillBlindingKey(outputHash, candidateOutids, ephemeralKey);
+          await this.backfillBlindingKey(outputHash, anchor, candidateOutids, ephemeralKey);
         }
       }
     }
@@ -1102,27 +1103,46 @@ export class TransactionKeysSync {
    * from its mnemonic and re-scanned. Only attempted for transactions this
    * wallet spent into, which bounds the work to our own outgoing transactions.
    *
+   * Because it runs on every owned output of such a transaction — including a
+   * third party's payment that block aggregation merged into it, which never
+   * matches — the search is narrower than `recoverBlindingKey`'s: the
+   * canonical anchor gets only the generations this database handed out for
+   * it (all of them when it has no record, as after a seed-only restore), and
+   * the fallback inputs get generation 0 and the legacy layout. An output
+   * outside that is left to `recoverBlindingKey`, which searches everything.
+   *
    * Entirely best-effort: a failure here must never interrupt a sync.
    *
    * @param outputHash - Output hash, display hex
+   * @param anchor - The canonical anchor over this wallet's inputs, or null
    * @param candidateOutids - Anchors to try: the canonical one first, then
    *   every input of the containing transaction
    * @param ephemeralKey - The output's ephemeral key (k*G), hex
    */
   private async backfillBlindingKey(
     outputHash: string,
+    anchor: string | null,
     candidateOutids: string[],
     ephemeralKey: string,
   ): Promise<void> {
     try {
       if (!this.keyManager || !this.keyManager.isUnlocked()) return;
+      // Sync may be the only thing touching the table for a while, so it
+      // seals plaintext rows too (once per database).
+      await ensureOutputBlindingKeysSealed(this.walletDB, this.keyManager);
       if (await this.walletDB.getOutputBlindingKey(outputHash)) return;
 
-      const match = searchBlindingKey(this.keyManager.getMasterSeedKey(), candidateOutids, ephemeralKey);
+      const anchorGenerations = anchor === null
+        ? null
+        : await this.walletDB.getBlindingGeneration(anchor);
+      const match = searchBlindingKey(this.keyManager.getMasterSeedKey(), candidateOutids, ephemeralKey, {
+        generationLimit: (outid) => (outid === anchor ? (anchorGenerations ?? undefined) : 1),
+      });
       if (match) {
+        // Encrypted with the wallet key when the wallet is encrypted.
         await this.walletDB.saveOutputBlindingKey(
           outputHash,
-          match.scalar.serialize().padStart(64, '0'),
+          await sealOutputBlindingKey(this.keyManager, match.scalar.serialize().padStart(64, '0')),
         );
       }
     } catch {
