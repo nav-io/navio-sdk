@@ -3,6 +3,17 @@
 All notable changes to navio-sdk are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/); versions follow [SemVer](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+
+- **P2P broadcasts are no longer reported as rejected when the node accepted
+  them.** Since navio-core #482 a node serves a mempool transaction to a peer
+  only after its next inventory pass to that peer (every ~5 s on average), so
+  the output lookup `broadcastTransaction` uses to confirm acceptance answered
+  `notfound` for a transaction the node had just accepted. The lookup is now
+  retried for up to 30 s; a rejected transaction takes that long to report.
+
 ## [0.4.0] - 2026-10-17
 
 ### Added

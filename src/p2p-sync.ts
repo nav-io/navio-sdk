@@ -66,6 +66,16 @@ interface CachedHeader {
 const ZERO_HASH = '0'.repeat(64);
 
 /**
+ * How long broadcastTransaction keeps asking for a just-pushed transaction
+ * before taking `notfound` as a rejection. navio-core serves a mempool
+ * transaction to a peer only after its next inventory pass to that peer
+ * (every ~5 s on average for an inbound peer), so the first answers are
+ * `notfound` even when the node accepted it.
+ */
+const BROADCAST_CONFIRM_TIMEOUT_MS = 30_000;
+const BROADCAST_CONFIRM_RETRY_MS = 1_000;
+
+/**
  * P2P Sync Provider
  *
  * Connects directly to a Navio full node via P2P protocol.
@@ -784,8 +794,10 @@ export class P2PSyncProvider extends BaseSyncProvider {
    *
    * Pushes an unsolicited `tx` message (navio-core accepts these), then
    * confirms mempool acceptance by asking the node for the transaction's
-   * first output by output hash: the node answers that lookup straight from
-   * its mempool, so a `notfound` means the transaction was rejected.
+   * first output by output hash. The node only serves a mempool transaction
+   * after its next inventory pass to this peer, so `notfound` is retried and
+   * counts as a rejection only once 30 s have
+   * passed. A rejected transaction therefore takes that long to report.
    */
   async broadcastTransaction(rawTx: string): Promise<string> {
     const txData = Buffer.from(rawTx, 'hex');
@@ -804,28 +816,37 @@ export class P2PSyncProvider extends BaseSyncProvider {
     // answered after the node validated the transaction.
     const probeHash = tx.outputs[0].outputHash;
     let holder: ParsedTransaction | null = null;
-    try {
-      await this.client.getOutputData(Buffer.from(probeHash, 'hex').reverse(), txPayload => {
-        try {
-          const candidate = parseTransaction(txPayload, 0);
-          if (candidate.outputs.some(o => o.outputHash === probeHash)) {
-            holder = candidate;
-            return true;
+    const deadline = Date.now() + BROADCAST_CONFIRM_TIMEOUT_MS;
+    for (;;) {
+      try {
+        await this.client.getOutputData(Buffer.from(probeHash, 'hex').reverse(), txPayload => {
+          try {
+            const candidate = parseTransaction(txPayload, 0);
+            if (candidate.outputs.some(o => o.outputHash === probeHash)) {
+              holder = candidate;
+              return true;
+            }
+          } catch {
+            // not a transaction we can parse
           }
-        } catch {
-          // not a transaction we can parse
+          return false;
+        });
+        break;
+      } catch (err: any) {
+        const msg = String(err?.message ?? err);
+        if (msg.startsWith('Output not found') && Date.now() < deadline) {
+          // Not served to this peer yet; see BROADCAST_CONFIRM_TIMEOUT_MS
+          await new Promise(resolve => setTimeout(resolve, BROADCAST_CONFIRM_RETRY_MS));
+          continue;
         }
-        return false;
-      });
-    } catch (err: any) {
-      const msg = String(err?.message ?? err);
-      if (msg.startsWith('Output not found')) {
-        throw new Error(
-          `Transaction ${tx.txid} was not accepted by the node's mempool ` +
-            '(the P2P protocol does not report the rejection reason; check the node debug log)'
-        );
+        if (msg.startsWith('Output not found')) {
+          throw new Error(
+            `Transaction ${tx.txid} was not accepted by the node's mempool ` +
+              '(the P2P protocol does not report the rejection reason; check the node debug log)'
+          );
+        }
+        throw new Error(`Broadcast of ${tx.txid} could not be confirmed: ${msg}`);
       }
-      throw new Error(`Broadcast of ${tx.txid} could not be confirmed: ${msg}`);
     }
     const accepted = holder as ParsedTransaction | null;
     if (accepted && accepted.txid !== tx.txid && accepted.wtxid !== tx.wtxid) {

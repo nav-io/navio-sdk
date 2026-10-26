@@ -1000,7 +1000,11 @@ export class P2PClient {
    * 12-byte command field, so nodes receive `getoutputdat` and ignore it as
    * an unknown command.
    *
-   * The node only answers for outputs in its mempool or most recent block.
+   * The node only answers for outputs in its mempool or most recent block,
+   * and since navio-core #482 applies the same relay rule as a request by
+   * txid: a mempool transaction is served only after the node's next
+   * inventory pass to this peer, so a just-relayed one gets `notfound` for
+   * a few seconds.
    */
   async getOutputData(
     outputHash: Buffer,
