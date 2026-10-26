@@ -247,7 +247,7 @@ export class KeyManager {
     // all of it is done, so a lock() in between leaves the wallet locked.
     const encryptionKey = await deriveKey(password, salt);
     const seed = this.cryptedSeed ? await this.decryptSeed(encryptionKey) : null;
-    const keys = await this.decryptKeys(encryptionKey);
+    const { keys, repaired } = await this.decryptKeys(encryptionKey, salt);
     this.assertNotLockedSince(epoch, operation);
 
     if (seed) {
@@ -259,6 +259,9 @@ export class KeyManager {
     this.encryptionKey = encryptionKey;
     for (const [keyIdHex, secretKey] of keys) {
       this.keys.set(keyIdHex, secretKey);
+    }
+    for (const [keyIdHex, cryptedData] of repaired) {
+      this.cryptedKeys.set(keyIdHex, cryptedData);
     }
     this.addSeedKeys();
 
@@ -313,6 +316,7 @@ export class KeyManager {
     if (this.cryptedSeed) {
       this.masterSeed = null;
       this.storedMnemonic = null;
+      this.mnemonicDerivation = null;
       this.mnemonicPassphrase = null;
     }
 
@@ -639,27 +643,71 @@ export class KeyManager {
   }
 
   /**
-   * Decrypt the private keys in cryptedKeys that are not already in memory.
-   * Does not change the wallet: unlock() commits the result.
-   * @returns keyId (hex) -> secret key, without keys that fail to decrypt
+   * Decrypt the private keys in cryptedKeys that are not already in memory,
+   * checking each against its public key. Does not change the wallet:
+   * unlock() commits the result.
+   *
+   * navio-sdk 0.4.0 encrypted a key whose hex has an odd number of digits
+   * (a leading zero nibble, which `Scalar.serialize()` drops) without its
+   * last digit. Such a key is recovered by trying the 16 possible digits
+   * against the public key, and re-encrypted as 32 bytes. A key that does
+   * not match its public key otherwise is left out, with a warning, rather
+   * than loaded as a wrong key.
+   * @returns keyId (hex) -> secret key, without keys that fail to decrypt or
+   *   to match; and keyId (hex) -> re-encrypted entry for recovered keys
    */
   private async decryptKeys(
-    encryptionKey: Awaited<ReturnType<typeof deriveKey>>
-  ): Promise<Map<string, ScalarType>> {
+    encryptionKey: Awaited<ReturnType<typeof deriveKey>>,
+    salt: Uint8Array
+  ): Promise<{
+    keys: Map<string, ScalarType>;
+    repaired: Map<string, { publicKey: PublicKeyType; encryptedSecret: Uint8Array }>;
+  }> {
     const keys = new Map<string, ScalarType>();
+    const repaired = new Map<string, { publicKey: PublicKeyType; encryptedSecret: Uint8Array }>();
     for (const [keyIdHex, cryptedData] of this.cryptedKeys) {
       if (this.keys.has(keyIdHex)) {
         continue;
       }
+      let decrypted: Uint8Array;
       try {
         const encrypted = this.deserializeEncryptedFromBytes(cryptedData.encryptedSecret);
-        const decrypted = await decryptWithKey(encrypted, encryptionKey);
-        keys.set(keyIdHex, Scalar.deserialize(this.bytesToHex(decrypted)));
+        decrypted = await decryptWithKey(encrypted, encryptionKey);
       } catch {
         // Skip keys that fail to decrypt
+        continue;
       }
+      const expected = this.getPublicKeyBytes(cryptedData.publicKey);
+      const matches = (scalar: ScalarType) =>
+        this.bytesToHex(this.getPublicKeyBytes(PublicKey.fromScalar(scalar))) ===
+        this.bytesToHex(expected);
+      const hex = this.bytesToHex(decrypted);
+      const secretKey = Scalar.deserialize(hex);
+      if (matches(secretKey)) {
+        keys.set(keyIdHex, secretKey);
+        continue;
+      }
+      const recovered =
+        decrypted.length < 32
+          ? '0123456789abcdef'
+              .split('')
+              .map(digit => Scalar.deserialize(hex + digit))
+              .find(matches)
+          : undefined;
+      if (!recovered) {
+        console.warn(
+          `[KeyManager] encrypted key ${keyIdHex} does not match its public key; not loaded`
+        );
+        continue;
+      }
+      keys.set(keyIdHex, recovered);
+      const reEncrypted = await encryptWithKey(this.getScalarBytes(recovered), encryptionKey, salt);
+      repaired.set(keyIdHex, {
+        publicKey: cryptedData.publicKey,
+        encryptedSecret: this.serializeEncryptedToBytes(reEncrypted),
+      });
     }
-    return keys;
+    return { keys, repaired };
   }
 
   /**

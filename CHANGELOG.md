@@ -53,9 +53,17 @@ Format follows [Keep a Changelog](https://keepachangelog.com/); versions follow 
 - `setHDSeed()`, `setHDSeedFromMnemonic()` and `generateNewMnemonic()` throw
   on an encrypted wallet.
 - A mnemonic now derives a different wallet than in 0.4.0 unless
-  `derivation: 'legacy'` is passed. Stored wallets are unaffected; restoring
-  a 0.4.0 phrase (`restoreFromMnemonic`, `restoreWalletFromMnemonic()`,
-  `setHDSeedFromMnemonic()`, `mnemonicToScalar()`) needs `'legacy'`.
+  `derivation: 'legacy'` is passed. Stored wallets are unaffected, also when
+  restored over: `restoreWalletFromMnemonic()` and `restoreFromMnemonic` keep
+  a stored wallet the phrase restores with either derivation. Restoring a
+  0.4.0 phrase into an empty database, or with `setHDSeedFromMnemonic()` and
+  `mnemonicToScalar()`, needs `'legacy'`.
+- `restoreWalletFromMnemonic()` (both backends) and `restoreFromMnemonic`
+  throw instead of replacing a stored wallet the phrase does not restore,
+  unless the stored plaintext phrase is a different one or
+  `replaceExisting: true` (`replaceExistingWallet`) is passed. An encrypted
+  stored wallet cannot be compared with the phrase, so replacing it with
+  another wallet now takes the option.
 
 ### Fixed
 
@@ -74,6 +82,12 @@ Format follows [Keep a Changelog](https://keepachangelog.com/); versions follow 
   value. Keys are now encrypted as 32 bytes. The cache id of an output's
   spending key (`getSpendingKeyForOutputWithCacheBySubAddress`) used the same
   short encoding and now uses 32 bytes too.
+- `unlock()` checks each decrypted private key against its public key. A key
+  that 0.4.0 encrypted without its last hex digit (the zero-nibble bug
+  above) is recovered and re-encrypted as 32 bytes; any other mismatching
+  key is left out with a warning instead of being loaded wrong.
+- `lock()` also forgets the mnemonic derivation, so `getMnemonicDerivation()`
+  returns null for any locked wallet, as documented.
 - `recoverBlindingKey()` reported a wallet locked while it ran as having no
   HD seed ("view-key-only wallets cannot recover blinding keys"). It now
   says the wallet is locked.
@@ -90,6 +104,9 @@ Format follows [Keep a Changelog](https://keepachangelog.com/); versions follow 
   `mnemonic_passphrase`: used as raw UTF-8 without NFKD, and ASCII-only for a
   new wallet.
 - `KeyManager.getMnemonicDerivation()`.
+- `RestoreMnemonicOptions` (`MnemonicOptions` plus `replaceExisting`), taken
+  by `restoreWalletFromMnemonic()`; `NavioClient` takes
+  `replaceExistingWallet`.
 - SQLite `master_seed` gains `mnemonic_derivation` and `mnemonic_passphrase`
   columns; the IndexedDB `mnemonic` record gains `derivation` and
   `passphrase`. The encrypted seed carries both too.

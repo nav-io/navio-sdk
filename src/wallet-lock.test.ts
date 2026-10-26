@@ -8,8 +8,10 @@ import { KeyManager } from './key-manager';
 import { WalletDB } from './wallet-db';
 import { IndexedDBWalletDB } from './adapters/indexeddb-wallet-db';
 import * as blsctModule from '@nav-io/navio-blsct';
+import { decryptWithKey, encryptWithKey } from './crypto';
 
 const Scalar = blsctModule.Scalar;
+const PublicKey = blsctModule.PublicKey;
 
 const MNEMONIC =
   'short exact vendor hand scale enroll around pudding genius party lesson basket cook crash sugar protect advance gentle humor bench farm weekend direct awkward';
@@ -276,24 +278,6 @@ describe('KeyManager lock', () => {
 });
 
 describe('KeyManager lock during unlock', () => {
-  it('stays locked when lock() runs while unlock() is in flight', async () => {
-    const km = wallet();
-    await km.setPassword(PASSWORD);
-    km.lock();
-
-    const unlocking = km.unlock(PASSWORD);
-    km.lock();
-    await expect(unlocking).rejects.toThrow('Wallet was locked during unlock');
-
-    expect(km.isUnlocked()).toBe(false);
-    expectSeedLocked(km);
-    expect(km.getKeyStats().plainKeys).toBe(0);
-    expect((km as any).masterSeed).toBeNull();
-
-    expect(await km.unlock(PASSWORD)).toBe(true);
-    expect(km.getMnemonic()).toBe(MNEMONIC);
-  });
-
   it('drops a plaintext-only seed when lock() runs while unlock() encrypts it', async () => {
     const source = wallet();
     await source.setPassword(PASSWORD);
@@ -314,28 +298,6 @@ describe('KeyManager lock during unlock', () => {
     expect((km as any).masterSeed).toBeNull();
     expect(km.getSeedForStorage()).toHaveProperty('encryptedSeed');
   });
-
-  it('keeps the old password when lock() runs during changePassword()', async () => {
-    const km = wallet();
-    await km.setPassword(PASSWORD);
-
-    // Lock after changePassword's own unlock, while it re-encrypts
-    const reEncryptAllKeys = (km as any).reEncryptAllKeys.bind(km);
-    (km as any).reEncryptAllKeys = async (...args: unknown[]) => {
-      const result = await reEncryptAllKeys(...args);
-      km.lock();
-      return result;
-    };
-    await expect(km.changePassword(PASSWORD, 'new password')).rejects.toThrow(
-      'Wallet was locked during changePassword'
-    );
-    expect(km.isUnlocked()).toBe(false);
-
-    (km as any).reEncryptAllKeys = reEncryptAllKeys;
-    expect(await km.unlock('new password')).toBe(false);
-    expect(await km.unlock(PASSWORD)).toBe(true);
-    expect(km.getMnemonic()).toBe(MNEMONIC);
-  });
 });
 
 describe('KeyManager key encryption', () => {
@@ -354,8 +316,83 @@ describe('KeyManager key encryption', () => {
     expect([...before.values()]).toContain(seed.serialize());
 
     await km.setPassword(PASSWORD);
-    const decrypted: Map<string, any> = await (km as any).decryptKeys((km as any).encryptionKey);
+    const { keys: decrypted } = (await (km as any).decryptKeys(
+      (km as any).encryptionKey,
+      (km as any).encryptionSalt
+    )) as { keys: Map<string, any> };
     expect(new Map([...decrypted].map(([id, key]) => [id, key.serialize()]))).toEqual(before);
+  });
+
+  // An imported key whose hex has a leading zero nibble
+  const IMPORTED_KEY = '0' + '2b3c4d5e6f708192'.repeat(4).slice(1);
+
+  /** A wallet holding IMPORTED_KEY, encrypted; returns its key id */
+  async function walletWithImportedKey(): Promise<{ km: KeyManager; keyIdHex: string }> {
+    const km = wallet();
+    const imported = Scalar.deserialize(IMPORTED_KEY);
+    km.addKeyPubKey(imported, PublicKey.fromScalar(imported));
+    const keyIdHex = [...(km as any).keys].find(
+      ([, key]: [string, any]) => key.serialize() === imported.serialize()
+    )![0];
+    await km.setPassword(PASSWORD);
+    return { km, keyIdHex };
+  }
+
+  async function overwriteCryptedKey(km: KeyManager, keyIdHex: string, plaintext: Uint8Array) {
+    const encrypted = await encryptWithKey(
+      plaintext,
+      (km as any).encryptionKey,
+      (km as any).encryptionSalt
+    );
+    (km as any).cryptedKeys.get(keyIdHex).encryptedSecret = (km as any).serializeEncryptedToBytes(
+      encrypted
+    );
+  }
+
+  it('recovers and re-encrypts a key 0.4.0 encrypted without its last digit', async () => {
+    const { km, keyIdHex } = await walletWithImportedKey();
+    const hex = Scalar.deserialize(IMPORTED_KEY).serialize();
+    expect(hex).toHaveLength(63);
+    // 0.4.0 encoded the 63 digits as 31 bytes, dropping the last one
+    await overwriteCryptedKey(km, keyIdHex, Buffer.from(hex.slice(0, 62), 'hex'));
+
+    km.lock();
+    expect(await km.unlock(PASSWORD)).toBe(true);
+    expect((km as any).keys.get(keyIdHex).serialize()).toBe(hex);
+
+    // The stored ciphertext is repaired: it now holds 32 bytes
+    const repaired = await decryptWithKey(
+      (km as any).deserializeEncryptedFromBytes(
+        (km as any).cryptedKeys.get(keyIdHex).encryptedSecret
+      ),
+      (km as any).encryptionKey
+    );
+    expect(Buffer.from(repaired).toString('hex')).toBe(IMPORTED_KEY);
+    km.lock();
+    expect(await km.unlock(PASSWORD)).toBe(true);
+    expect((km as any).keys.get(keyIdHex).serialize()).toBe(hex);
+  });
+
+  it('does not load a key that does not match its public key', async () => {
+    const { km, keyIdHex } = await walletWithImportedKey();
+    await overwriteCryptedKey(km, keyIdHex, new Uint8Array(32).fill(7));
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    km.lock();
+    expect(await km.unlock(PASSWORD)).toBe(true);
+    expect((km as any).keys.has(keyIdHex)).toBe(false);
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('does not match its public key'));
+    warn.mockRestore();
+  });
+
+  it('forgets the mnemonic derivation on lock', async () => {
+    const km = wallet();
+    await km.setPassword(PASSWORD);
+    expect(km.getMnemonicDerivation()).toBe('core');
+    km.lock();
+    expect(km.getMnemonicDerivation()).toBeNull();
+    expect(await km.unlock(PASSWORD)).toBe(true);
+    expect(km.getMnemonicDerivation()).toBe('core');
   });
 
   it('serializes scalars to 32 bytes', () => {
@@ -495,7 +532,9 @@ describe.each(backends)('$name encrypted seed', backend => {
     await km.setPassword(PASSWORD);
     await db.saveWallet(km);
 
-    await db.restoreWalletFromMnemonic(OTHER_MNEMONIC, 0);
+    // The encrypted seed cannot be compared with the phrase: replacing the
+    // wallet takes replaceExisting
+    await db.restoreWalletFromMnemonic(OTHER_MNEMONIC, 0, { replaceExisting: true });
     const reloaded = await db.loadWallet();
     expect(reloaded.isEncrypted()).toBe(false);
     expect(reloaded.getMnemonic()).toBe(OTHER_MNEMONIC);

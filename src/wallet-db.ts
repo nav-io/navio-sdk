@@ -29,7 +29,14 @@
  */
 
 import { KeyManager } from './key-manager';
-import type { HDChain, SubAddressIdentifier, MnemonicDerivation, MnemonicOptions } from './key-manager.types';
+import type {
+  HDChain,
+  SubAddressIdentifier,
+  MnemonicDerivation,
+  MnemonicOptions,
+  RestoreMnemonicOptions,
+} from './key-manager.types';
+import { keyManagerForMnemonicRestore, type StoredWalletIdentity } from './mnemonic-restore';
 import * as blsctModule from '@nav-io/navio-blsct';
 import type { IDatabaseAdapter, DatabaseAdapterOptions } from './database-adapter';
 import { createDatabaseAdapter } from './database-adapter';
@@ -779,22 +786,31 @@ export class WalletDB {
    * @param creationHeight - Optional block height to start scanning from (for faster restore)
    * @param options - Derivation (default `'core'`, as navio-core and
    *   navio-electrum; `'legacy'` for a wallet created by navio-sdk 0.4.0 or
-   *   earlier) and BIP39 passphrase
+   *   earlier), BIP39 passphrase, and whether to replace a stored wallet the
+   *   phrase does not restore. A wallet already stored keeps its derivation
+   *   and data; see {@link RestoreMnemonicOptions}.
    * @returns The restored KeyManager instance
+   * @throws When the database holds a wallet this phrase does not restore and
+   *   that may be this phrase's with another derivation or passphrase,
+   *   unless `options.replaceExisting` is set
    */
   async restoreWalletFromMnemonic(
     mnemonic: string,
     creationHeight?: number,
-    options: MnemonicOptions = {}
+    options: RestoreMnemonicOptions = {}
   ): Promise<KeyManager> {
     if (!this.opened || !this.adapter) {
       throw new Error('Database not open. Call open() first.');
     }
 
-    const keyManager = new KeyManager();
-
-    // Set seed from mnemonic
-    keyManager.setHDSeedFromMnemonic(mnemonic, options);
+    // Set seed from mnemonic, with the stored wallet's derivation when this
+    // phrase restores it
+    const keyManager = keyManagerForMnemonicRestore(
+      mnemonic,
+      options,
+      await this.storedWalletIdentity(),
+      km => this.serializePublicKey(km.getPublicSpendingKey())
+    );
 
     // Initialize sub-address pools
     keyManager.newSubAddressPool(0);
@@ -1179,6 +1195,31 @@ export class WalletDB {
     // Another seed's blinding scalars are not ours and can never verify.
     await this.adapter.run('DELETE FROM output_blinding_keys');
     await this.clearSyncData();
+  }
+
+  /**
+   * The stored wallet's spending key and plaintext mnemonic, for matching a
+   * mnemonic restore against it.
+   */
+  private async storedWalletIdentity(): Promise<StoredWalletIdentity> {
+    const spend = await this.adapter!.exec('SELECT public_key FROM spend_key LIMIT 1');
+    const seed = await this.adapter!.exec(
+      'SELECT mnemonic, mnemonic_derivation, mnemonic_passphrase FROM master_seed WHERE id = 0'
+    );
+    const seedRow = seed.length > 0 && seed[0].values.length > 0 ? seed[0].values[0] : null;
+    return {
+      spendPublicKey:
+        spend.length > 0 && spend[0].values.length > 0 ? String(spend[0].values[0][0]) : null,
+      mnemonic:
+        seedRow && seedRow[0]
+          ? {
+              mnemonic: String(seedRow[0]),
+              // No derivation: written by navio-sdk 0.4.0 or earlier
+              derivation: (seedRow[1] as MnemonicDerivation | null) ?? 'legacy',
+              passphrase: (seedRow[2] as string | null) ?? undefined,
+            }
+          : null,
+    };
   }
 
   private async holdsDifferentWallet(incoming: KeyManager): Promise<boolean> {

@@ -118,6 +118,7 @@ interface NavioClientConfig {
   restoreFromMnemonic?: string; // Restore from BIP39 mnemonic (24 words, or 26 with the birthday words)
   mnemonicDerivation?: 'core' | 'legacy'; // Mnemonic key derivation (default: 'core'; 'legacy' for wallets from navio-sdk <= 0.4.0)
   mnemonicPassphrase?: string; // BIP39 passphrase for restoreFromMnemonic / createWalletIfNotExists ('core' only)
+  replaceExistingWallet?: boolean; // Let restoreFromMnemonic replace a stored wallet the phrase does not restore
   restoreFromAuditKey?: string; // Restore watch-only wallet from audit key (160 hex chars)
   restoreFromHeight?: number; // Block height when wallet was created (for restore)
   creationHeight?: number; // Creation height for new wallets (default: chainTip - 100)
@@ -854,6 +855,18 @@ mnemonic for a raw master key: `seedToMnemonic()`, and `getMnemonic()` on a
 wallet imported from a seed, give a phrase that restores it only with
 `'legacy'`.
 
+`restoreWalletFromMnemonic()` (and `restoreFromMnemonic` in `NavioClient`)
+over a database that already holds a wallet keeps that wallet when the phrase
+restores it: with the stored derivation and passphrase when the database
+stores this phrase in plaintext, otherwise with whichever derivation matches
+its keys. Its outputs and sync state are kept, so an app may pass the phrase
+on every start, including for a wallet created by 0.4.0. A phrase that does
+not restore the stored wallet replaces it (deleting its outputs and sync
+state) only when the stored plaintext phrase is a different one, or with
+`replaceExisting: true` (`replaceExistingWallet` in `NavioClient`); otherwise
+it throws, since it may be the stored wallet's phrase with another derivation
+or passphrase.
+
 #### Sub-addresses
 
 ```typescript
@@ -978,7 +991,8 @@ const keyManager = await walletDB.loadWallet();
 // Restore wallet from seed
 const keyManager = await walletDB.restoreWallet(seedHex, creationHeight);
 
-// Restore wallet from mnemonic (options: derivation, passphrase)
+// Restore wallet from mnemonic (options: derivation, passphrase, replaceExisting).
+// A wallet already stored that this phrase restores keeps its derivation and data.
 const keyManager = await walletDB.restoreWalletFromMnemonic(mnemonic, creationHeight);
 const legacy = await walletDB.restoreWalletFromMnemonic(mnemonic, creationHeight, {
   derivation: 'legacy', // created by navio-sdk 0.4.0 or earlier

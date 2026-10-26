@@ -14,7 +14,13 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
 import { KeyManager } from '../key-manager';
-import type { HDChain, SubAddressIdentifier, MnemonicOptions } from '../key-manager.types';
+import type {
+  HDChain,
+  SubAddressIdentifier,
+  MnemonicOptions,
+  RestoreMnemonicOptions,
+} from '../key-manager.types';
+import { keyManagerForMnemonicRestore, type StoredWalletIdentity } from '../mnemonic-restore';
 import * as blsctModule from '@nav-io/navio-blsct';
 import { isStakedCommitmentOutputHex } from '../staking';
 import type {
@@ -404,13 +410,24 @@ export class IndexedDBWalletDB implements IWalletDB {
     return km;
   }
 
+  /**
+   * Restore a wallet from a mnemonic phrase. A wallet already stored keeps
+   * its derivation and data; see {@link RestoreMnemonicOptions}.
+   * @throws When the database holds a wallet this phrase does not restore and
+   *   that may be this phrase's with another derivation or passphrase,
+   *   unless `options.replaceExisting` is set
+   */
   async restoreWalletFromMnemonic(
     mnemonic: string,
     creationHeight?: number,
-    options: MnemonicOptions = {}
+    options: RestoreMnemonicOptions = {}
   ): Promise<KeyManager> {
-    const km = new KeyManager();
-    km.setHDSeedFromMnemonic(mnemonic, options);
+    const km = keyManagerForMnemonicRestore(
+      mnemonic,
+      options,
+      await this.storedWalletIdentity(),
+      k => this.serializePublicKey(k.getPublicSpendingKey())
+    );
     km.newSubAddressPool(0);
     km.newSubAddressPool(-1);
     km.newSubAddressPool(-2);
@@ -542,6 +559,26 @@ export class IndexedDBWalletDB implements IWalletDB {
     tx.objectStore('outputBlindingKeys').clear();
     await idbTx(tx);
     await this.clearSyncData();
+  }
+
+  /**
+   * The stored wallet's spending key and plaintext mnemonic, for matching a
+   * mnemonic restore against it.
+   */
+  private async storedWalletIdentity(): Promise<StoredWalletIdentity> {
+    const spendRec = await this.get<any>('config', 'spendKey');
+    const seedRec = await this.get<any>('config', 'mnemonic');
+    return {
+      spendPublicKey: spendRec?.publicKey ? String(spendRec.publicKey) : null,
+      mnemonic: seedRec?.mnemonic
+        ? {
+            mnemonic: String(seedRec.mnemonic),
+            // No derivation: written by navio-sdk 0.4.0 or earlier
+            derivation: seedRec.derivation ?? 'legacy',
+            passphrase: seedRec.passphrase || undefined,
+          }
+        : null,
+    };
   }
 
   private async holdsDifferentWallet(incoming: KeyManager): Promise<boolean> {
