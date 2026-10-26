@@ -10,7 +10,9 @@ import { P2PSyncProvider } from './p2p-sync';
 import { MAX_HEADERS_RESULTS, P2PClient } from './p2p-protocol';
 
 function displayHash(header: Buffer): string {
-  return Buffer.from(sha256(sha256(header))).reverse().toString('hex');
+  return Buffer.from(sha256(sha256(header)))
+    .reverse()
+    .toString('hex');
 }
 
 /** An 80-byte header on `branch` at `height`, child of `prevDisplayHash`. */
@@ -132,6 +134,24 @@ describe('P2PSyncProvider header reorgs', () => {
     await syncHeaders(provider);
 
     expectHeaderChain(provider, chainA2);
+  });
+
+  it('follows a reorg whose fork is more than a full reply above the common locator block', async () => {
+    const longA = chain([], 0, 12_000, 0xa);
+    const node = new SimulatedNode();
+    node.active = longA;
+    const provider = providerOn(node);
+    await syncHeaders(provider);
+    expectHeaderChain(provider, longA);
+
+    // From tip 12000 the locator holds heights ..., 9945, 7897, ...: with
+    // the fork at 9944 the node answers from 7897, and its first full reply
+    // (7898..9897) holds only headers we already have.
+    const longB = chain(longA, 9944, 12_100, 0xb);
+    node.active = longB;
+    await syncHeaders(provider);
+
+    expectHeaderChain(provider, longB);
   });
 
   it('replaces the tip on a one-block reorg', async () => {

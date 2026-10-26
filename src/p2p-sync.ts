@@ -344,8 +344,16 @@ export class P2PSyncProvider extends BaseSyncProvider {
   private async syncHeadersInner(): Promise<void> {
     this.tipDirty = false;
 
+    // After a deep reorg the sparse part of the locator can put the node's
+    // common block more than a full reply below the fork, so a reply may
+    // hold only headers we already have. The next request then asks for the
+    // headers after the last one of that reply, which is on the node's chain.
+    let resumeAfter: string | null = null;
     for (let round = 0; ; round++) {
       const locator = this.buildLocator();
+      if (resumeAfter) {
+        locator.unshift(P2PClient.hashFromDisplay(resumeAfter));
+      }
       const rawHeaders = await this.client.getHeaders(locator);
       this.log(`Received ${rawHeaders.length} headers (round ${round})`);
 
@@ -355,8 +363,20 @@ export class P2PSyncProvider extends BaseSyncProvider {
       }
 
       // Fewer than a full batch means we reached the node's tip.
-      if (rawHeaders.length < MAX_HEADERS_RESULTS || accepted.length === 0) {
+      if (rawHeaders.length < MAX_HEADERS_RESULTS) {
         break;
+      }
+      if (accepted.length > 0) {
+        resumeAfter = null;
+      } else {
+        const last = this.extractBlockHash(rawHeaders[rawHeaders.length - 1].toString('hex'));
+        // Stop unless the reply was a run of known headers that moved us on
+        // (a reply that does not connect, or the same reply again, would
+        // loop).
+        if (!this.headersByHash.has(last) || last === resumeAfter) {
+          break;
+        }
+        resumeAfter = last;
       }
       if (round > 100000) {
         throw new Error('Header sync did not converge');

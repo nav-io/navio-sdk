@@ -51,7 +51,9 @@ Format follows [Keep a Changelog](https://keepachangelog.com/); versions follow 
   the reply opened with known headers and the new branch was written over the
   old one, leaving the old branch's headers above a shorter new tip and its
   hashes in the cache, which broke a later reorg back. Every new header is
-  now checked, and orphaned headers are dropped with their hashes.
+  now checked, and orphaned headers are dropped with their hashes. When the
+  fork is so deep that a full reply holds only known headers, the next
+  request continues after the reply's last header instead of stopping.
 - **A reorg between fetching a batch's keys and its headers is caught.**
   Sync could store one branch's block hashes with the other branch's
   outputs, and nothing later noticed. Each pass records the hash of the
