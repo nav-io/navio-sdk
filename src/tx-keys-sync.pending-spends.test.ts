@@ -106,7 +106,10 @@ describe('TransactionKeysSync pending spends', () => {
     await spendAgo('b1', 'live', 31 * MINUTE);
     await spendAgo('c1', 'silent', 31 * MINUTE);
     const known: Record<string, boolean | null> = { dropped: false, live: true, silent: null };
-    const sync = new TransactionKeysSync(walletDB, provider(10, async tx => known[tx]));
+    const sync = new TransactionKeysSync(
+      walletDB,
+      provider(10, async tx => known[tx])
+    );
 
     const result = await sync.checkPendingSpends();
 
@@ -114,7 +117,9 @@ describe('TransactionKeysSync pending spends', () => {
     expect(await walletDB.isOutputUnspent('a1')).toBe(true);
     expect(await walletDB.isOutputUnspent('b1')).toBe(false);
     expect(await walletDB.isOutputUnspent('c1')).toBe(false);
-    expect((await walletDB.getAllOutputs()).map(o => o.outputHash)).not.toContain('mempool:dropped:0');
+    expect((await walletDB.getAllOutputs()).map(o => o.outputHash)).not.toContain(
+      'mempool:dropped:0'
+    );
   });
 
   it('does not ask about spends younger than the threshold', async () => {
@@ -122,20 +127,25 @@ describe('TransactionKeysSync pending spends', () => {
     const hasTransaction = vi.fn().mockResolvedValue(false);
     const sync = new TransactionKeysSync(walletDB, provider(10, hasTransaction));
 
-    expect(await sync.checkPendingSpends()).toEqual({ released: [], stillPending: [], unknown: [] });
+    expect(await sync.checkPendingSpends()).toEqual({
+      released: [],
+      stillPending: [],
+      unknown: [],
+    });
     expect(hasTransaction).not.toHaveBeenCalled();
 
     expect((await sync.checkPendingSpends(5 * MINUTE)).released).toEqual(['dropped']);
   });
 
   it('treats a spend without a recorded start as old', async () => {
-    await walletDB
-      .getAdapter()
-      .run(
-        `UPDATE wallet_outputs SET is_spent = 1, spent_tx_hash = 'dropped', spent_block_height = 0, spent_at = NULL
+    await walletDB.getAdapter().run(
+      `UPDATE wallet_outputs SET is_spent = 1, spent_tx_hash = 'dropped', spent_block_height = 0, spent_at = NULL
          WHERE output_hash = 'a1'`
-      );
-    const sync = new TransactionKeysSync(walletDB, provider(10, async () => false));
+    );
+    const sync = new TransactionKeysSync(
+      walletDB,
+      provider(10, async () => false)
+    );
 
     expect((await sync.checkPendingSpends()).released).toEqual(['dropped']);
   });
@@ -183,9 +193,13 @@ describe('TransactionKeysSync pending spends', () => {
       await spendAgo('a1', 'dropped', 31 * MINUTE);
       const sync = await syncedTo(10, async () => false);
       vi.mocked(sync.getSyncProvider().getChainTipHeight).mockResolvedValue(12);
-      sync.getSyncProvider().getBlockHeaders = vi.fn().mockImplementation(
-        async (_start: number, count: number) => ({ count, hex: '00'.repeat(80 * count), max: 2016 })
-      );
+      sync.getSyncProvider().getBlockHeaders = vi
+        .fn()
+        .mockImplementation(async (_start: number, count: number) => ({
+          count,
+          hex: '00'.repeat(80 * count),
+          max: 2016,
+        }));
 
       await sync.sync({ verifyHashes: false });
 
@@ -364,7 +378,9 @@ describe('own spends recorded as sent', () => {
       outputs: parsed.outputs.filter(o => o.keys).map(o => o.keys),
     };
     const serialized = new Map(parsed.outputs.map(o => [o.outputHash, o.serializedHex]));
-    sync.getSyncProvider().getTransactionOutput = vi.fn(async (hash: string) => serialized.get(hash)!);
+    sync.getSyncProvider().getTransactionOutput = vi.fn(
+      async (hash: string) => serialized.get(hash)!
+    );
     sync.getSyncProvider().getRawTransaction = vi.fn(async () => rawTx);
 
     await (sync as any).processTransactionKeys('aggregated-tx', keys, 20, 'hash', 0, false);

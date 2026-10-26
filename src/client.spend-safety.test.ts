@@ -24,8 +24,7 @@ const NAV = 100_000_000n;
 const OWN_KEY = PublicKey.fromScalar(new Scalar(501)).serialize();
 const FOREIGN_KEY = PublicKey.fromScalar(new Scalar(502)).serialize();
 const RPC_TOKEN_HASH = 'b12a2ee7491ef649c0a6677fe2e996065f02210f84a934297cc8ba554f54e31c';
-const STORED_TOKEN_ID =
-  RPC_TOKEN_HASH.match(/../g)!.reverse().join('') + 'ffffffffffffffff';
+const STORED_TOKEN_ID = RPC_TOKEN_HASH.match(/../g)!.reverse().join('') + 'ffffffffffffffff';
 
 function testAddress(seed: number): string {
   setChain(BlsctChain.Testnet);
@@ -81,7 +80,11 @@ describe('NavioClient spend safety', () => {
         isUnlocked: () => true,
         getMasterTokenKey: () => new Scalar(31337),
         getSubAddress: () =>
-          SubAddr.generate(new Scalar(401), PublicKey.fromScalar(new Scalar(402)), SubAddrId.generate(-1, 0)),
+          SubAddr.generate(
+            new Scalar(401),
+            PublicKey.fromScalar(new Scalar(402)),
+            SubAddrId.generate(-1, 0)
+          ),
         calculateHashId: (_blinding: unknown, spending: { serialize(): string }) =>
           Uint8Array.from(Buffer.from(spending.serialize().slice(0, 40), 'hex')),
         getSubAddressId: (hashId: Uint8Array, id: { account: number; address: number }) => {
@@ -109,7 +112,10 @@ describe('NavioClient spend safety', () => {
   async function fund(
     outputHash: string,
     amount: bigint,
-    { tokenId = null, spendingKey = OWN_KEY }: { tokenId?: string | null; spendingKey?: string } = {}
+    {
+      tokenId = null,
+      spendingKey = OWN_KEY,
+    }: { tokenId?: string | null; spendingKey?: string } = {}
   ): Promise<string> {
     await walletDB.storeWalletOutput({
       outputHash,
@@ -165,7 +171,10 @@ describe('NavioClient spend safety', () => {
 
       const [many, created] = await Promise.all([
         client.sendToMany({ recipients: [{ address: testAddress(21), amount: NAV }] }),
-        client.createTokenCollection({ metadata: { name: 'Lock', symbol: 'LCK' }, totalSupply: 10 }),
+        client.createTokenCollection({
+          metadata: { name: 'Lock', symbol: 'LCK' },
+          totalSupply: 10,
+        }),
       ]);
 
       expect(await spentBy(big)).toBe(many.txId);
@@ -176,9 +185,9 @@ describe('NavioClient spend safety', () => {
       await fund('c1'.repeat(32), 10n * NAV);
       broadcast.mockRejectedValueOnce(new Error('rejected'));
 
-      await expect(client.sendTransaction({ address: testAddress(31), amount: NAV })).rejects.toThrow(
-        'rejected'
-      );
+      await expect(
+        client.sendTransaction({ address: testAddress(31), amount: NAV })
+      ).rejects.toThrow('rejected');
       await expect(
         client.sendTransaction({ address: testAddress(31), amount: NAV })
       ).resolves.toMatchObject({ inputCount: 1 });
@@ -186,7 +195,7 @@ describe('NavioClient spend safety', () => {
   });
 
   describe('releasePendingSpend', () => {
-    it('unmarks the inputs and drops the transaction\'s mempool rows', async () => {
+    it("unmarks the inputs and drops the transaction's mempool rows", async () => {
       const input = await fund('d1'.repeat(32), 10n * NAV);
       const result = await client.sendTransaction({ address: testAddress(41), amount: NAV });
       await walletDB.storeWalletOutput({
@@ -223,7 +232,11 @@ describe('NavioClient spend safety', () => {
       const input = await fund('e1'.repeat(32), NAV);
 
       await expect(
-        client.sendTransaction({ address: testAddress(51), amount: 5n * NAV, subtractFeeFromAmount: true })
+        client.sendTransaction({
+          address: testAddress(51),
+          amount: 5n * NAV,
+          subtractFeeFromAmount: true,
+        })
       ).rejects.toThrow(`Insufficient funds: need ${5n * NAV} sat but only have ${NAV} sat`);
       await expect(
         client.sendTransaction({
@@ -246,13 +259,25 @@ describe('NavioClient spend safety', () => {
         client.sendTransaction({ address: testAddress(61), amount: NAV, selectedUtxos: twice })
       ).rejects.toThrow('selectedUtxos lists an output more than once');
       await expect(
-        client.sendToken({ address: testAddress(61), amount: 1n, tokenId: RPC_TOKEN_HASH, selectedUtxos: twice })
+        client.sendToken({
+          address: testAddress(61),
+          amount: 1n,
+          tokenId: RPC_TOKEN_HASH,
+          selectedUtxos: twice,
+        })
       ).rejects.toThrow('more than once');
       await expect(
-        client.sendToMany({ recipients: [{ address: testAddress(61), amount: NAV }], selectedUtxos: twice })
+        client.sendToMany({
+          recipients: [{ address: testAddress(61), amount: NAV }],
+          selectedUtxos: twice,
+        })
       ).rejects.toThrow('more than once');
       await expect(
-        client.createTokenCollection({ metadata: { name: 'Dup', symbol: 'DUP' }, totalSupply: 1, selectedUtxos: twice })
+        client.createTokenCollection({
+          metadata: { name: 'Dup', symbol: 'DUP' },
+          totalSupply: 1,
+          selectedUtxos: twice,
+        })
       ).rejects.toThrow('more than once');
       expect(broadcast).not.toHaveBeenCalled();
     });
@@ -269,9 +294,9 @@ describe('NavioClient spend safety', () => {
       await expect(
         client.sendToken({ address: testAddress(71), amount, tokenId: RPC_TOKEN_HASH })
       ).rejects.toThrow('amount must be a bigint');
-      await expect(
-        client.delegateStake({ amount, delegateKey: '00'.repeat(48) })
-      ).rejects.toThrow('amount must be a bigint');
+      await expect(client.delegateStake({ amount, delegateKey: '00'.repeat(48) })).rejects.toThrow(
+        'amount must be a bigint'
+      );
       await expect(client.unstake({ amount })).rejects.toThrow('amount must be a bigint');
       expect(broadcast).not.toHaveBeenCalled();
     });
@@ -290,7 +315,10 @@ describe('NavioClient spend safety', () => {
     });
 
     it('are skipped by token sends, for the token and for the fee', async () => {
-      const foreignToken = await fund('2a'.repeat(32), 500n, { tokenId: STORED_TOKEN_ID, spendingKey: FOREIGN_KEY });
+      const foreignToken = await fund('2a'.repeat(32), 500n, {
+        tokenId: STORED_TOKEN_ID,
+        spendingKey: FOREIGN_KEY,
+      });
       const ownToken = await fund('2b'.repeat(32), 100n, { tokenId: STORED_TOKEN_ID });
       const foreignNav = await fund('2c'.repeat(32), 50n * NAV, { spendingKey: FOREIGN_KEY });
       const ownNav = await fund('2d'.repeat(32), 10n * NAV);
@@ -309,7 +337,11 @@ describe('NavioClient spend safety', () => {
       const input = await fund('3a'.repeat(32), 10n * NAV);
       const output = UnsignedOutput.fromTxOut(
         TxOut.generate(
-          SubAddr.generate(new Scalar(3), PublicKey.fromScalar(new Scalar(4)), SubAddrId.generate(0, 0)),
+          SubAddr.generate(
+            new Scalar(3),
+            PublicKey.fromScalar(new Scalar(4)),
+            SubAddrId.generate(0, 0)
+          ),
           Number(9n * NAV),
           '',
           TokenId.default()
