@@ -181,6 +181,100 @@ describe('NavioClient spend safety', () => {
       expect(await spentBy(small)).toBe(created.txId);
     });
 
+    describe('swap halves', () => {
+      const QUOTE = {
+        quote_id: 'q1',
+        fill: 500,
+        sell_cost: Number(NAV),
+        price: 0,
+        order_expiry: 999,
+      };
+      let electrum: Record<string, ReturnType<typeof vi.fn>>;
+
+      beforeEach(() => {
+        electrum = {
+          rfqListQuotes: vi.fn(async () => [QUOTE]),
+          rfqAcceptQuote: vi.fn(async () => 'swap-tx'),
+          swapSendQuote: vi.fn(async () => 'quote-id'),
+          swapBroadcastOrder: vi.fn(async () => 'order-id'),
+        };
+        (client as any).electrumClient = electrum;
+      });
+
+      const accept = (selectedUtxos?: string[]) =>
+        client.acceptQuote({
+          uuid: 'u1',
+          quoteId: 'q1',
+          buyTokenId: RPC_TOKEN_HASH,
+          sellTokenId: null,
+          maxPay: NAV,
+          minRecv: 500n,
+          selectedUtxos,
+        });
+      const reply = (selectedUtxos?: string[]) =>
+        client.replyQuote({
+          request: {
+            uuid: 'u1',
+            buyTokenId: null,
+            sellTokenId: RPC_TOKEN_HASH,
+            fill: NAV,
+            sellCost: 500n,
+            replyKey: '00',
+          },
+          selectedUtxos,
+        });
+      const order = (selectedUtxos?: string[]) =>
+        client.broadcastOrder({
+          offerTokenId: null,
+          offerAmount: NAV,
+          wantTokenId: RPC_TOKEN_HASH,
+          wantAmount: 500n,
+          expiry: Math.floor(Date.now() / 1000) + 3600,
+          selectedUtxos,
+        });
+
+      it('acceptQuote never selects an output an overlapping send spends', async () => {
+        const big = await fund('a3'.repeat(32), 10n * NAV);
+        const small = await fund('a4'.repeat(32), 9n * NAV);
+
+        const [sent, accepted] = await Promise.all([
+          client.sendTransaction({ address: testAddress(15), amount: NAV }),
+          accept(),
+        ]);
+
+        expect(accepted.txId).toBe('swap-tx');
+        expect(await spentBy(big)).toBe(sent.txId);
+        expect(await spentBy(small)).toBe('swap-tx');
+      });
+
+      it('maker halves wait for an overlapping send', async () => {
+        const big = await fund('a5'.repeat(32), 10n * NAV);
+        const small = await fund('a6'.repeat(32), 9n * NAV);
+
+        const [sent, replied, ordered] = await Promise.all([
+          client.sendTransaction({ address: testAddress(17), amount: NAV }),
+          reply(),
+          order(),
+        ]);
+
+        expect(await spentBy(big)).toBe(sent.txId);
+        expect(replied.inputs).toEqual([small]);
+        expect(ordered.inputs).toEqual([small]);
+      });
+
+      it('refuse an output listed twice', async () => {
+        const input = await fund('a7'.repeat(32), 10n * NAV);
+        const twice = [input, input];
+
+        await expect(accept(twice)).rejects.toThrow('selectedUtxos lists an output more than once');
+        await expect(reply(twice)).rejects.toThrow('more than once');
+        await expect(order(twice)).rejects.toThrow('more than once');
+        expect(electrum.rfqAcceptQuote).not.toHaveBeenCalled();
+        expect(electrum.swapSendQuote).not.toHaveBeenCalled();
+        expect(electrum.swapBroadcastOrder).not.toHaveBeenCalled();
+      });
+    });
+
     it('a failed send does not block the next one', async () => {
       await fund('c1'.repeat(32), 10n * NAV);
       broadcast.mockRejectedValueOnce(new Error('rejected'));

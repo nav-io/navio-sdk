@@ -55,12 +55,16 @@ Format follows [Keep a Changelog](https://keepachangelog.com/); versions follow 
   `sendToMany`, token/NFT sends, collection creation, mints, `delegateStake`,
   `unstake`) could select the same outputs before either marked them spent,
   and the second was rejected as a double spend. Each now selects, signs,
-  broadcasts and marks its inputs spent under a per-client lock.
+  broadcasts and marks its inputs spent under a per-client lock. Swap halves
+  take the same lock: `acceptQuote` through marking its inputs spent,
+  `broadcastOrder` through recording the order (which reserves its inputs),
+  and `replyQuote` for coin selection.
 - A `subtractFeeFromAmount` NAV send larger than the selected inputs built a
   transaction with more output than input; it now fails with
   `Insufficient funds`.
 - A manual `selectedUtxos` list naming an output twice is refused on every
-  spend path, as `unstake` already refused repeated `stakedOutputs`.
+  spend path (swap halves included), as `unstake` already refused repeated
+  `stakedOutputs`.
 - The change of the wallet's own broadcasts was recorded as `received`
   instead of `sent`, both in the mempool and once the transaction confirmed,
   because the inputs were already marked spent when the transaction was

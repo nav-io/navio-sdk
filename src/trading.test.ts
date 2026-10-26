@@ -318,6 +318,19 @@ describe('broadcastOrder standing-order tracking', () => {
     await expect(client.broadcastOrder(order())).rejects.toThrow(/Insufficient funds/);
   });
 
+  it('overlapping orders never commit the same coins', async () => {
+    const { client } = makeOrderClient([{ outputHash: 'coin-a' }, { outputHash: 'coin-b' }]);
+    let n = 0;
+    stubElectrum(client, { swapBroadcastOrder: async () => `q${++n}` });
+
+    const [first, second] = await Promise.all([
+      client.broadcastOrder(order()),
+      client.broadcastOrder(order()),
+    ]);
+
+    expect([first.inputs, second.inputs]).toEqual([['coin-a'], ['coin-b']]);
+  });
+
   it('keeps the reservation when the broadcast times out, releases it on other failures', async () => {
     const { client, store } = makeOrderClient([{ outputHash: 'coin-a' }, { outputHash: 'coin-b' }]);
     stubElectrum(client, { swapBroadcastOrder: async () => { throw new Error('Request timeout for method: blockchain.swap.broadcast_order'); } });

@@ -3947,24 +3947,28 @@ export class NavioClient {
       throw new Error(`Quote delivers ${quote.fill} which is below minRecv ${minRecv}`);
     }
 
-    // The taker half pays no fee: the maker half over-funds the combined fee.
-    const { halfHex, fee, spentInputs } = await this.buildSwapHalf({
-      payTokenId: options.sellTokenId,
-      payAmount: quote.sellCost,
-      recvTokenId: options.buyTokenId,
-      recvAmount: quote.fill,
-      makerFee: false,
-      selectedUtxos: options.selectedUtxos,
+    // Select, hand over and mark spent under the spend lock, like any other
+    // spend: an overlapping send must not pick the same coins.
+    return this.withSpendLock(async () => {
+      // The taker half pays no fee: the maker half over-funds the combined fee.
+      const { halfHex, fee, spentInputs } = await this.buildSwapHalf({
+        payTokenId: options.sellTokenId,
+        payAmount: quote.sellCost,
+        recvTokenId: options.buyTokenId,
+        recvAmount: quote.fill,
+        makerFee: false,
+        selectedUtxos: options.selectedUtxos,
+      });
+
+      const txId = await electrum.rfqAcceptQuote(uuid, quoteId, halfHex);
+
+      const { walletDB } = await this.ensureSpendReady();
+      for (const outputHash of spentInputs) {
+        await walletDB.markOutputSpent(outputHash, txId, 0);
+      }
+
+      return { txId, quote, fee };
     });
-
-    const txId = await electrum.rfqAcceptQuote(uuid, quoteId, halfHex);
-
-    const { walletDB } = await this.ensureSpendReady();
-    for (const outputHash of spentInputs) {
-      await walletDB.markOutputSpent(outputHash, txId, 0);
-    }
-
-    return { txId, quote, fee };
   }
 
   /**
@@ -4051,7 +4055,7 @@ export class NavioClient {
    * encrypts it to the taker's reply key and broadcasts it over the bus.
    *
    * The half over-funds the transaction fee so the taker can accept with a
-   * fee-free half. The coins it spends are NOT locked: if the taker accepts,
+   * fee-free half. The coins it spends are NOT marked spent: if the taker accepts,
    * the wallet sees them spent on-chain; if the quote expires unaccepted,
    * they remain spendable. Avoid spending them manually while a quote is
    * outstanding, or the swap will fail to confirm.
@@ -4062,14 +4066,19 @@ export class NavioClient {
     const orderExpiry = options.orderExpiry ?? Math.floor(Date.now() / 1000) + 600;
 
     // The maker pays what the taker buys, and receives what the taker sells.
-    const { halfHex, fee, spentInputs } = await this.buildSwapHalf({
-      payTokenId: request.buyTokenId,
-      payAmount: request.fill,
-      recvTokenId: request.sellTokenId,
-      recvAmount: request.sellCost,
-      makerFee: true,
-      selectedUtxos: options.selectedUtxos,
-    });
+    // Selection waits for spends in flight, so it never picks coins a send
+    // is about to mark spent. The coins are not marked here (see above), so
+    // the lock is not held while the daemon publishes the quote.
+    const { halfHex, fee, spentInputs } = await this.withSpendLock(() =>
+      this.buildSwapHalf({
+        payTokenId: request.buyTokenId,
+        payAmount: request.fill,
+        recvTokenId: request.sellTokenId,
+        recvAmount: request.sellCost,
+        makerFee: true,
+        selectedUtxos: options.selectedUtxos,
+      })
+    );
 
     const quoteId = await electrum.swapSendQuote(
       request.uuid,
@@ -4099,42 +4108,49 @@ export class NavioClient {
     NavioClient.assertUnixExpiry(options.expiry, 'expiry');
     const electrum = this.getTradingClient();
 
-    // Coins committed to other live standing orders are off limits: the
-    // network's order cache refuses an order spending an input of a stored
-    // order, and only evicts orders on expiry or when an input is spent.
-    const reserved = options.reserveInputs === false
-      ? new Set<string>()
-      : await this.reservedStandingOrderInputs();
+    // Reading the reservations, selecting and recording the order run under
+    // the spend lock: an overlapping send or order must not pick the same
+    // coins. Once the row is saved the coins are reserved, so the lock is
+    // not held while the daemon grinds the order's proof-of-work.
+    const { halfHex, fee, spentInputs, localId, row } = await this.withSpendLock(async () => {
+      // Coins committed to other live standing orders are off limits: the
+      // network's order cache refuses an order spending an input of a stored
+      // order, and only evicts orders on expiry or when an input is spent.
+      const reserved = options.reserveInputs === false
+        ? new Set<string>()
+        : await this.reservedStandingOrderInputs();
 
-    const { halfHex, fee, spentInputs } = await this.buildSwapHalf({
-      payTokenId: options.offerTokenId,
-      payAmount: options.offerAmount,
-      recvTokenId: options.wantTokenId,
-      recvAmount: options.wantAmount,
-      makerFee: true,
-      selectedUtxos: options.selectedUtxos,
-      excludeUtxos: reserved,
+      const half = await this.buildSwapHalf({
+        payTokenId: options.offerTokenId,
+        payAmount: options.offerAmount,
+        recvTokenId: options.wantTokenId,
+        recvAmount: options.wantAmount,
+        makerFee: true,
+        selectedUtxos: options.selectedUtxos,
+        excludeUtxos: reserved,
+      });
+
+      // Track the order BEFORE broadcasting. The daemon grinds proof-of-work
+      // before it answers, so a timed-out call may still have published the
+      // order; recording first keeps those coins reserved either way.
+      const id = Array.from(randomBytes(16)).map((b) => b.toString(16).padStart(2, '0')).join('');
+      const unconfirmed: StandingOrderRow = {
+        localId: id,
+        quoteId: null,
+        status: 'unconfirmed',
+        offerTokenId: options.offerTokenId,
+        offerAmount: options.offerAmount.toString(),
+        wantTokenId: options.wantTokenId,
+        wantAmount: options.wantAmount.toString(),
+        expiry: options.expiry,
+        inputs: half.spentInputs,
+        halfTxHex: half.halfHex,
+        fee: half.fee.toString(),
+        createdAt: Math.floor(Date.now() / 1000),
+      };
+      await this.saveStandingOrderRow(unconfirmed);
+      return { ...half, localId: id, row: unconfirmed };
     });
-
-    // Track the order BEFORE broadcasting. The daemon grinds proof-of-work
-    // before it answers, so a timed-out call may still have published the
-    // order; recording first keeps those coins reserved either way.
-    const localId = Array.from(randomBytes(16)).map((b) => b.toString(16).padStart(2, '0')).join('');
-    const row: StandingOrderRow = {
-      localId,
-      quoteId: null,
-      status: 'unconfirmed',
-      offerTokenId: options.offerTokenId,
-      offerAmount: options.offerAmount.toString(),
-      wantTokenId: options.wantTokenId,
-      wantAmount: options.wantAmount.toString(),
-      expiry: options.expiry,
-      inputs: spentInputs,
-      halfTxHex: halfHex,
-      fee: fee.toString(),
-      createdAt: Math.floor(Date.now() / 1000),
-    };
-    await this.saveStandingOrderRow(row);
 
     let quoteId: string;
     try {
@@ -4257,7 +4273,8 @@ export class NavioClient {
   }
 
   /**
-   * Build and sign an unbalanced swap half: inputs cover `payAmount` of the
+   * Build and sign an unbalanced swap half; callers run it inside
+   * {@link withSpendLock}. Inputs cover `payAmount` of the
    * pay token (plus the fee, when this half funds it); outputs are the
    * received leg (recv token, no matching input — the counterparty's half
    * supplies it), pay-token change, and NAV change when the fee is funded
@@ -4277,6 +4294,7 @@ export class NavioClient {
     /** outputHashes never to select automatically (reserved by standing orders) */
     excludeUtxos?: Set<string>;
   }): Promise<{ halfHex: string; fee: bigint; spentInputs: string[] }> {
+    NavioClient.assertNoDuplicateSelection(params.selectedUtxos);
     const { keyManager, walletDB } = await this.ensureSpendReady();
     const { payAmount, recvAmount, makerFee } = params;
     if (payAmount <= 0n || recvAmount <= 0n) {
@@ -4588,8 +4606,9 @@ export class NavioClient {
    * spending them must run its select → sign → broadcast → markOutputSpent
    * sequence inside this lock; otherwise two overlapping spends select the
    * same outputs before either marks them spent, and the second is rejected
-   * as a double spend. That includes swap halves, whose inputs are marked
-   * spent once the half is handed to the counterparty.
+   * as a double spend. That includes swap halves: a taker half's inputs are
+   * marked spent once it is handed over, and a standing order's are reserved
+   * once its row is saved.
    *
    * Not reentrant: `fn` must not call another public spend method (or this)
    * — it would wait on itself forever.
