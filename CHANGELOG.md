@@ -67,7 +67,8 @@ Format follows [Keep a Changelog](https://keepachangelog.com/); versions follow 
   one socket each; they now share one attempt. A replaced socket's late
   `close` event cleared the live socket and failed its requests; events of a
   socket that is no longer live are ignored. `connect()` now fails after the
-  `timeout` option instead of waiting forever for a socket that never opens.
+  `timeout` option instead of waiting forever for a socket that never opens,
+  and a `disconnect()` right after `connect()` cancels it.
 - **Restoring from a birthday mnemonic no longer starts past the birthday.**
   The start height assumed 120 s blocks, so on mainnet (about 130 s) it
   overshot the wallet's first outputs once the wallet was a couple of weeks

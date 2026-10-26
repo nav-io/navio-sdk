@@ -318,8 +318,25 @@ export class ElectrumClient {
    * finish, closing the socket.
    */
   private async openConnection(): Promise<void> {
-    // Ensure WebSocket is loaded (handles async loading for ESM)
-    await ensureWebSocketLoaded();
+    // A disconnect() during the await below must cancel the attempt too, so
+    // the abort hook is in place before the first await (which yields even
+    // when the module is already loaded).
+    let abortedBy: Error | null = null;
+    const abortEarly = (error: Error) => {
+      abortedBy = error;
+    };
+    this.abortConnect = abortEarly;
+    try {
+      // Ensure WebSocket is loaded (handles async loading for ESM)
+      await ensureWebSocketLoaded();
+    } finally {
+      if (this.abortConnect === abortEarly) {
+        this.abortConnect = null;
+      }
+    }
+    if (abortedBy) {
+      throw abortedBy;
+    }
 
     return new Promise((resolve, reject) => {
       const protocol = this.options.ssl ? 'wss' : 'ws';
