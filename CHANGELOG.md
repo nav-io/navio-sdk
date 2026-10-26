@@ -29,10 +29,14 @@ Format follows [Keep a Changelog](https://keepachangelog.com/); versions follow 
   Electrum server could make the wallet record any amount. Sync now requires
   the output to hash to its output hash and carry the keys the ownership
   check matched, and the raw transaction to hash to its id and contain the
-  output. A mismatch throws the new `SyncVerificationError` and the batch is
-  not committed. Recovery from a raw transaction also finds the output by
-  hash instead of by its position in the server's key list, which skips
-  outputs. Hash checks only; there are no merkle proofs.
+  output. A mismatch throws the new `SyncVerificationError`, and nothing from
+  the batch is stored: a batch's outputs are now fetched and checked before
+  any of its rows are written. If writing a batch is cut short (a crash, a
+  storage error), the next sync first removes what it left above the last
+  synced height, which the reorg check does not cover. Recovery from a raw
+  transaction also finds the output by hash instead of by its position in
+  the server's key list, which skips outputs. Hash checks only; there are no
+  merkle proofs.
 
 ### Fixed
 
@@ -94,8 +98,8 @@ Format follows [Keep a Changelog](https://keepachangelog.com/); versions follow 
 - `sync()` stops at the chain tip it saw when it started, even when
   `endHeight` is higher; blocks found since are left for the next sync. With
   `verifyHashes` (the default) each pass reads one more header, the anchor
-  block, at the start and after every batch, and a batch's headers are all
-  fetched before it is processed.
+  block, at the start and after every batch, and a batch's headers and
+  wallet outputs are all fetched before any of it is written.
 - A wallet restored from a birthday mnemonic connects to the backend before
   it is created, to read the headers.
 

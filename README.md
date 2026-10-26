@@ -192,8 +192,11 @@ sync again.
 to be the wallet's, the serialized output must hash to its output hash and
 carry the keys the ownership check used, and a raw transaction it reads the
 amount from must hash to the transaction id and contain that output. A
-mismatch throws `SyncVerificationError`; the batch holding it is not
-committed, so the next sync retries from the last good block. (These are hash
+mismatch throws `SyncVerificationError`. A batch is fetched and checked in full
+before any of it is written, so nothing from the failing batch is stored and
+the next sync retries from the last good block; if writing a batch is cut
+short (a crash, a storage error), the next sync first removes what it left
+above the last synced height. (These are hash
 checks only: there are no merkle proofs, so a server can still withhold
 outputs, or invent a whole output together with its hash.)
 

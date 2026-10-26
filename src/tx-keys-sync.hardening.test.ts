@@ -28,7 +28,9 @@ import type { BlockTransactionKeys, TransactionKeys } from './electrum';
 import type { KeyManager } from './key-manager';
 
 function hashHeader(headerHex: string): string {
-  return Buffer.from(sha256(sha256(Buffer.from(headerHex, 'hex')))).reverse().toString('hex');
+  return Buffer.from(sha256(sha256(Buffer.from(headerHex, 'hex'))))
+    .reverse()
+    .toString('hex');
 }
 
 /** 80-byte header served at a height nobody overrode */
@@ -64,7 +66,10 @@ function mockProvider(options: MockOptions): SyncProvider {
     disconnect: vi.fn(),
     isConnected: vi.fn().mockReturnValue(true),
     getChainTipHeight: vi.fn(async () => options.tip),
-    getChainTip: vi.fn(async () => ({ height: options.tip, hash: hashHeader(headerAt(options.tip)) })),
+    getChainTip: vi.fn(async () => ({
+      height: options.tip,
+      hash: hashHeader(headerAt(options.tip)),
+    })),
     getBlockHeader: vi.fn(async (height: number) => headerAt(height)),
     getBlockHeaders: vi.fn(async (start: number, count: number) => {
       let hex = '';
@@ -106,15 +111,34 @@ describe('served outputs and transactions are checked against their hashes', () 
   function buildPayment(): { rawTx: string; txid: string; mine: ParsedOutput[] } {
     const destination = keyManager.getSubAddress({ account: 0, address: 0 });
     const tx = UnsignedTransaction.create();
-    tx.addInput(UnsignedInput.fromTxIn(TxIn.generate(
-      2_000_000, new Scalar(7), new Scalar(8), TokenId.default(),
-      OutPoint.generate(CTxId.deserialize('33'.repeat(32))), false, false,
-    )));
+    tx.addInput(
+      UnsignedInput.fromTxIn(
+        TxIn.generate(
+          2_000_000,
+          new Scalar(7),
+          new Scalar(8),
+          TokenId.default(),
+          OutPoint.generate(CTxId.deserialize('33'.repeat(32))),
+          false,
+          false
+        )
+      )
+    );
     for (const [i, amount] of [500_000, 700_000].entries()) {
-      tx.addOutput(UnsignedOutput.fromTxOut(TxOut.generate(
-        destination, amount, `memo-${i}`, TokenId.default(), TxOutputType.Normal, 0, false,
-        new Scalar(100 + i),
-      )));
+      tx.addOutput(
+        UnsignedOutput.fromTxOut(
+          TxOut.generate(
+            destination,
+            amount,
+            `memo-${i}`,
+            TokenId.default(),
+            TxOutputType.Normal,
+            0,
+            false,
+            new Scalar(100 + i)
+          )
+        )
+      );
     }
     tx.setFee(500_000);
     const rawTx = tx.sign();
@@ -135,7 +159,7 @@ describe('served outputs and transactions are checked against their hashes', () 
   function syncWith(
     txid: string,
     outputs: ReturnType<typeof listed>[],
-    serve: Partial<Pick<SyncProvider, 'getTransactionOutput' | 'getRawTransaction'>>,
+    serve: Partial<Pick<SyncProvider, 'getTransactionOutput' | 'getRawTransaction'>>
   ): { sync: TransactionKeysSync; provider: SyncProvider } {
     const provider = mockProvider({
       tip: 60,
@@ -236,6 +260,45 @@ describe('served outputs and transactions are checked against their hashes', () 
 
     expect(error).toBeInstanceOf(SyncVerificationError);
     expect(error.message).toContain(`does not contain output ${mine[0].outputHash}`);
+  });
+
+  describe('a batch that fails verification', () => {
+    it('leaves nothing from the batch, not even the blocks before the failure', async () => {
+      const { txid, mine } = buildPayment();
+      const spendTx = 'aa'.repeat(32);
+      const provider = mockProvider({
+        tip: 60,
+        keysAt: h => {
+          // 53 pays the wallet, 55 spends that output, 57 is served wrong.
+          if (h === 53) return [{ txHash: txid, keys: { inputs: [], outputs: [listed(mine[0])] } }];
+          if (h === 55) {
+            return [
+              {
+                txHash: spendTx,
+                keys: { inputs: [{ prevoutHash: mine[0].outputHash }], outputs: [] },
+              },
+            ];
+          }
+          if (h === 57) return [{ txHash: txid, keys: { inputs: [], outputs: [listed(mine[1])] } }];
+          return [];
+        },
+      });
+      // mine[1] is served as mine[0]'s serialization, which does not hash to it.
+      provider.getTransactionOutput = vi.fn(async () => mine[0].serializedHex);
+      const sync = new TransactionKeysSync(walletDB, provider);
+      sync.setKeyManager(keyManager);
+
+      const error = await sync.sync({ startHeight: 51, keepTxKeys: true }).catch(e => e);
+
+      expect(error).toBeInstanceOf(SyncVerificationError);
+      expect(error.message).toContain(`output ${mine[1].outputHash} hashes to`);
+      expect(sync.getLastSyncedHeight()).toBe(-1);
+      expect(await walletDB.getAllOutputs()).toEqual([]);
+      for (let h = 51; h <= 60; h++) {
+        expect(await walletDB.getBlockHash(h)).toBeNull();
+        expect(await walletDB.getTxKeysByHeight(h)).toEqual([]);
+      }
+    });
   });
 });
 
@@ -343,6 +406,57 @@ describe('a reorg between fetching keys and headers', () => {
     // The first attempt and three restarts (each also prefetching page 60)
     const starts = vi.mocked(provider.getBlockTransactionKeysRange).mock.calls.map(c => c[0]);
     expect(starts.filter(s => s === 50).length).toBe(4);
+  });
+});
+
+describe('a batch whose writes were interrupted', () => {
+  it('is discarded before the next sync, so a reorg of its heights leaves no stale rows', async () => {
+    let reorged = false;
+    const chain: MockOptions = {
+      tip: 60,
+      headerAt: h => (reorged && h > 60 ? branchHeader(h) : defaultHeader(h)),
+    };
+    const provider = mockProvider(chain);
+    const sync = new TransactionKeysSync(walletDB, provider);
+    sync.setKeyManager(keyManager);
+    await sync.sync({ startHeight: 51 });
+    expect(sync.getLastSyncedHeight()).toBe(60);
+
+    // A batch for 61..62 was cut short after writing block 61: its hash and
+    // an output of the wallet, with an older output marked spent there.
+    const output = (outputHash: string, blockHeight: number) => ({
+      outputHash,
+      txHash: `tx-${outputHash}`,
+      outputIndex: 0,
+      blockHeight,
+      outputData: '',
+      amount: 1_000,
+      gamma: '0',
+      memo: null,
+      tokenId: null,
+      blindingKey: '',
+      ephemeralKey: null,
+      spendingKey: '',
+      isSpent: false,
+      spentTxHash: null,
+      spentBlockHeight: null,
+      txType: 'received' as const,
+      timestamp: 0,
+    });
+    await walletDB.storeWalletOutput(output('old', 52));
+    await walletDB.saveBlockHash(61, hashHeader(defaultHeader(61)));
+    await walletDB.storeWalletOutput(output('abandoned', 61));
+    await walletDB.markOutputSpent('old', 'abandoned-spend', 61);
+
+    // Blocks 61..62 are then replaced by a branch that has nothing for us.
+    reorged = true;
+    chain.tip = 62;
+    await sync.sync();
+
+    expect(sync.getLastSyncedHeight()).toBe(62);
+    expect(await walletDB.getBlockHash(61)).toBe(hashHeader(branchHeader(61)));
+    const outputs = await walletDB.getAllOutputs();
+    expect(outputs.map(o => [o.outputHash, o.isSpent])).toEqual([['old', false]]);
   });
 });
 

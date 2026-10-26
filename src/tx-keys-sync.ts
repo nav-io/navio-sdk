@@ -203,8 +203,9 @@ export class DeepReorgError extends Error {
  * transaction that does not hash to its id. Without the check a malicious or
  * broken server could make the wallet record any amount it liked.
  *
- * Nothing from the failing batch is committed: the sync state stays at the
- * last good batch, so the next sync retries from there (against a server
+ * Nothing from the failing batch is written: a batch's outputs are fetched
+ * and checked before any of its rows are stored, and the sync state stays at
+ * the last good batch, so the next sync retries from there (against a server
  * that answers correctly).
  */
 export class SyncVerificationError extends Error {
@@ -242,6 +243,31 @@ interface ExpectedOutputKeys {
   viewTag: number;
   /** Only the P2P provider lists it */
   ephemeralKey: string | null;
+}
+
+/** An output of the wallet, fetched, verified and recovered before its batch is written. */
+interface VerifiedOwnOutput {
+  /** Index in the transaction's key list */
+  outputIndex: number;
+  outputHash: string;
+  blindingKey: string;
+  spendingKey: string;
+  /** Serialized output as the server served it ('' when it served none) */
+  outputHex: string;
+  ephemeralKey: string | null;
+  recovered: { amount: number; gamma: string; memo: string | null; tokenIdHex: string | null };
+}
+
+/**
+ * The hash a transaction's rows are stored under: the one listed with its
+ * keys, or a placeholder from its position in the block.
+ */
+function txHashOf(txKeys: TransactionKeys, height: number, index: number): string {
+  let txHash = txKeys.txHash;
+  if (!txHash && txKeys.keys && typeof txKeys.keys === 'object') {
+    txHash = (txKeys.keys as any).txHash || (txKeys.keys as any).hash || '';
+  }
+  return txHash || `block_${height}_tx_${index}`;
 }
 
 /** Counters carried across the passes of one sync() call. */
@@ -419,7 +445,7 @@ export class TransactionKeysSync {
    * @param options - Sync options
    * @returns Number of transaction keys synced
    * @throws SyncVerificationError if the server's data does not hash to what
-   *   it claims; the batch holding it is not committed
+   *   it claims; nothing from the batch holding it is written
    */
   sync(options: SyncOptions = {}): Promise<number> {
     const run = this.syncQueue.then(() => this.runSync(options));
@@ -478,6 +504,11 @@ export class TransactionKeysSync {
    * block below it, so the keys, the headers and the reorg check all describe
    * one chain. A changed anchor (or a provider block hash that differs from
    * the header) throws ChainChangedError before the batch is stored.
+   *
+   * Each batch is fetched and verified in full before any of it is written,
+   * so a batch that fails leaves nothing behind. Rows that an interrupted
+   * write left above the last synced height are removed first
+   * (discardInterruptedBatch).
    */
   private async syncPass(options: SyncOptions, progress: SyncPassProgress): Promise<void> {
     const {
@@ -504,6 +535,8 @@ export class TransactionKeysSync {
     // moves lastSyncedHeight back to the fork, and the replacement blocks from
     // there on must be scanned. This also runs when the tip did not advance,
     // since a reorg can replace the tip block at the same height.
+    await this.discardInterruptedBatch();
+
     let reorgInfo: ReorganizationInfo | null = null;
     if (this.syncState && verifyHashes) {
       reorgInfo = await this.checkReorganization(this.syncState.lastSyncedHeight, chainTip);
@@ -600,6 +633,28 @@ export class TransactionKeysSync {
         await this.verifyBatchChain(blocksToProcess, headers, anchor);
       }
 
+      // Everything the batch needs from the server is fetched and checked
+      // before any of it is written, so a batch that fails (a
+      // SyncVerificationError, a network error) leaves nothing behind.
+      const blockInfo = blocksToProcess.map(block => {
+        const headerHex = headers.get(block.height);
+        if (!headerHex) {
+          throw new Error(`Server returned no header for block ${block.height}`);
+        }
+        // Block timestamp and PoS flag from the 80-byte header
+        let timestamp = 0;
+        let isPoS = false;
+        if (headerHex.length >= 160) {
+          const headerBytes = Buffer.from(headerHex, 'hex');
+          timestamp = headerBytes.readUInt32LE(68);
+          const blockVersion = headerBytes.readInt32LE(0);
+          isPoS = (blockVersion & 0x01000000) !== 0;
+        }
+        return { hash: this.extractBlockHash(headerHex), timestamp, isPoS };
+      });
+      const ownOutputs = await this.fetchBatchOwnOutputs(blocksToProcess);
+
+      // From here on only the local database is touched.
       let lastBlockHash = '';
       for (let blockIdx = 0; blockIdx < blocksToProcess.length; blockIdx++) {
         const block = blocksToProcess[blockIdx];
@@ -610,28 +665,22 @@ export class TransactionKeysSync {
           await yieldToMainThread();
         }
 
-        const headerHex = headers.get(block.height);
-        if (!headerHex) {
-          throw new Error(`Server returned no header for block ${block.height}`);
-        }
-        const blockHash = this.extractBlockHash(headerHex);
+        const { hash: blockHash, timestamp: blockTimestamp, isPoS } = blockInfo[blockIdx];
         lastBlockHash = blockHash;
-
-        // Extract block timestamp and PoS flag from the 80-byte header
-        let blockTimestamp = 0;
-        let isPoS = false;
-        if (headerHex.length >= 160) {
-          const headerBytes = Buffer.from(headerHex, 'hex');
-          blockTimestamp = headerBytes.readUInt32LE(68);
-          const blockVersion = headerBytes.readInt32LE(0);
-          isPoS = (blockVersion & 0x01000000) !== 0;
-        }
 
         // Reorgs are caught by the check before this loop: once the block at
         // lastSyncedHeight matches the server, every block below it does too.
+        // The block hash is written before the block's other rows, so that
+        // discardInterruptedBatch() can tell a batch was cut short.
         await this.storeBlockHash(block.height, blockHash, chainTip);
 
-        const txKeysCount = await this.storeBlockTransactionKeys(block, blockHash, keepTxKeys, blockTimestamp, isPoS);
+        const txKeysCount = await this.storeBlockTransactionKeys(
+          block,
+          ownOutputs,
+          keepTxKeys,
+          blockTimestamp,
+          isPoS
+        );
 
         if (this.keyManager) {
           await this.processBlockForSpentOutputs(block, blockHash);
@@ -663,6 +712,30 @@ export class TransactionKeysSync {
     }
 
     // Final save after sync completes to ensure state is persisted
+    await this.walletDB.saveDatabase();
+  }
+
+  /**
+   * Remove what an interrupted batch wrote above the last synced height.
+   *
+   * A batch is fetched and verified before any of it is written, but its
+   * writes are separate operations and the sync state moves only after the
+   * last one. A crash or storage error in between leaves rows above
+   * lastSyncedHeight that the reorg check does not look at: if those heights
+   * were replaced before the retry, outputs from the abandoned branch would
+   * stay. A batch writes each block's hash before its other rows, so a block
+   * hash stored at lastSyncedHeight + 1 means one was cut short; everything
+   * from there on is reverted (the pass writes it again).
+   */
+  private async discardInterruptedBatch(): Promise<void> {
+    if (!this.syncState || this.syncState.lastSyncedHeight < 0) {
+      return;
+    }
+    const from = this.syncState.lastSyncedHeight + 1;
+    if ((await this.getStoredBlockHash(from)) === null) {
+      return;
+    }
+    await this.walletDB.revertBlocksFrom(from, this.syncState);
     await this.walletDB.saveDatabase();
   }
 
@@ -1065,9 +1138,43 @@ export class TransactionKeysSync {
   }
 
   /**
+   * Fetch and verify every output of a batch that belongs to the wallet:
+   * its serialization (or, failing that, its raw transaction) and its
+   * amount. Nothing is written.
+   * @param blocks - The batch
+   * @returns The wallet's outputs of each transaction that has any
+   * @throws SyncVerificationError if the server's data does not match
+   */
+  private async fetchBatchOwnOutputs(
+    blocks: BlockTransactionKeys[]
+  ): Promise<Map<TransactionKeys, VerifiedOwnOutput[]>> {
+    const result = new Map<TransactionKeys, VerifiedOwnOutput[]>();
+    if (!this.keyManager) {
+      return result;
+    }
+    for (let blockIdx = 0; blockIdx < blocks.length; blockIdx++) {
+      const block = blocks[blockIdx];
+      if (blockIdx > 0 && blockIdx % YIELD_EVERY_N_BLOCKS === 0) {
+        await yieldToMainThread();
+      }
+      for (let txIdx = 0; txIdx < block.txKeys.length; txIdx++) {
+        const txKeys = block.txKeys[txIdx];
+        const outputs = await this.fetchOwnOutputs(
+          txHashOf(txKeys, block.height, txIdx),
+          txKeys.keys
+        );
+        if (outputs.length > 0) {
+          result.set(txKeys, outputs);
+        }
+      }
+    }
+    return result;
+  }
+
+  /**
    * Store transaction keys for a block
    * @param block - Block transaction keys
-   * @param blockHash - Block hash
+   * @param ownOutputs - The batch's wallet outputs, from fetchBatchOwnOutputs
    * @param keepTxKeys - Whether to keep transaction keys in database after processing
    * @param blockTimestamp - Unix epoch timestamp from the block header
    * @param isPoS - Whether this block is a Proof-of-Stake block
@@ -1075,7 +1182,7 @@ export class TransactionKeysSync {
    */
   private async storeBlockTransactionKeys(
     block: BlockTransactionKeys,
-    blockHash: string,
+    ownOutputs: Map<TransactionKeys, VerifiedOwnOutput[]>,
     keepTxKeys: boolean = false,
     blockTimestamp: number = 0,
     isPoS: boolean = false
@@ -1083,16 +1190,17 @@ export class TransactionKeysSync {
     let count = 0;
 
     for (const txKeys of block.txKeys) {
-      let txHash = txKeys.txHash;
-      if (!txHash && txKeys.keys && typeof txKeys.keys === 'object') {
-        txHash = (txKeys.keys as any).txHash || (txKeys.keys as any).hash || '';
-      }
-      if (!txHash) {
-        txHash = `block_${block.height}_tx_${count}`;
-      }
+      const txHash = txHashOf(txKeys, block.height, count);
 
       if (this.keyManager) {
-        await this.processTransactionKeys(txHash, txKeys.keys, block.height, blockHash, blockTimestamp, isPoS);
+        await this.processTransactionKeys(
+          txHash,
+          txKeys.keys,
+          ownOutputs.get(txKeys) ?? [],
+          block.height,
+          blockTimestamp,
+          isPoS
+        );
       }
 
       if (keepTxKeys) {
@@ -1106,49 +1214,138 @@ export class TransactionKeysSync {
   }
 
   /**
-   * Process transaction keys to detect and store wallet outputs
+   * Fetch and verify the outputs of one transaction that belong to the
+   * wallet, and recover their amounts. Nothing is written.
    * @param txHash - Transaction hash
    * @param keys - Transaction keys data
-   * @param blockHeight - Block height
-   * @param _blockHash - Block hash (for reference, currently unused)
-   * @param blockTimestamp - Unix epoch timestamp of the block
-   * @param isPoS - Whether this block is a Proof-of-Stake block
+   * @returns The wallet's outputs, in key-list order
+   * @throws SyncVerificationError if the server's data does not match
    */
-  private async processTransactionKeys(
-    txHash: string,
-    keys: any,
-    blockHeight: number,
-    _blockHash: string,
-    blockTimestamp: number = 0,
-    isPoS: boolean = false
-  ): Promise<void> {
-    if (!this.keyManager) return;
+  private async fetchOwnOutputs(txHash: string, keys: any): Promise<VerifiedOwnOutput[]> {
+    if (!this.keyManager) return [];
 
     // Transaction keys structure depends on the provider: ElectrumX delivers
     // [txHash, { vout: [...] }] tuples, the P2P provider delivers
     // { outputs: [...] } objects. Accept both shapes.
     const outputs = keys?.[1]?.outputs || keys?.[1]?.vout || keys?.outputs || keys?.vout || [];
 
-    if (!Array.isArray(outputs)) return;
+    if (!Array.isArray(outputs)) return [];
+
+    const own: VerifiedOwnOutput[] = [];
+    for (let outputIndex = 0; outputIndex < outputs.length; outputIndex++) {
+      const outputKeys = outputs[outputIndex];
+
+      // Extract keys from output
+      const blindingKey = outputKeys?.blindingKey || outputKeys?.blinding_key;
+      const spendingKey = outputKeys?.spendingKey || outputKeys?.spending_key;
+      const viewTag = outputKeys?.viewTag ?? outputKeys?.view_tag;
+      const outputHash = outputKeys?.outputHash || outputKeys?.output_hash;
+
+      if (!blindingKey || !spendingKey || viewTag === undefined || !outputHash) {
+        continue;
+      }
+
+      // Convert keys to PublicKey format if needed (they might be hex strings or serialized)
+      const PublicKey = blsctModule.PublicKey;
+      let blindingKeyObj: any;
+      let isMine: boolean;
+      try {
+        blindingKeyObj = PublicKey.deserialize(blindingKey);
+        const spendingKeyObj = PublicKey.deserialize(spendingKey);
+        // Check if output belongs to wallet
+        isMine = this.keyManager.isMineByKeys(blindingKeyObj, spendingKeyObj, viewTag);
+      } catch {
+        // Anyone can broadcast an output whose BLSCT keys are not valid
+        // curve points (testnet block 48020 has one). Such an output is
+        // spendable by no wallet, so it cannot be ours — skip it instead of
+        // letting one malformed output abort the sync loop forever.
+        continue;
+      }
+      if (!isMine) {
+        continue;
+      }
+
+      // The keys isMine accepted; whatever the server serves for this
+      // output must carry exactly these.
+      const expectedKeys: ExpectedOutputKeys = {
+        outputHash: String(outputHash).toLowerCase(),
+        blindingKey: String(blindingKey).toLowerCase(),
+        spendingKey: String(spendingKey).toLowerCase(),
+        viewTag: Number(viewTag),
+        ephemeralKey: outputKeys?.ephemeralKey || outputKeys?.ephemeral_key || null,
+      };
+
+      let outputHex = '';
+      try {
+        outputHex = await this.withRetry(() => this.syncProvider.getTransactionOutput(outputHash));
+      } catch {
+        // Some providers may not expose standalone output serialization.
+        // Recovery falls back to parsing the full raw transaction below.
+      }
+      if (outputHex) {
+        this.verifyServedOutput(outputHex, expectedKeys, `output ${outputHash}`);
+      }
+
+      const recovered = await this.recoverConfirmedOutput(
+        txHash,
+        blindingKeyObj,
+        outputHex,
+        expectedKeys
+      );
+
+      // The public counterpart of the sender's blinding scalar is the
+      // EPHEMERAL key (k*G), not the field called blindingKey, which is
+      // k*sk_destination and bound to the recipient. The P2P backend reports
+      // it with the other keys; the Electrum key server does not, so fall
+      // back to reading it out of the serialized output.
+      const ephemeralKey: string | null =
+        outputKeys?.ephemeralKey ||
+        outputKeys?.ephemeral_key ||
+        (outputHex ? this.extractRangeProofFromOutput(outputHex).ephemeralKeyHex : null) ||
+        null;
+
+      own.push({ outputIndex, outputHash, blindingKey, spendingKey, outputHex, ephemeralKey, recovered });
+    }
+    return own;
+  }
+
+  /**
+   * Store a transaction's wallet outputs. Only touches the local database.
+   * @param txHash - Transaction hash
+   * @param keys - Transaction keys data
+   * @param ownOutputs - The transaction's wallet outputs, from fetchOwnOutputs
+   * @param blockHeight - Block height
+   * @param blockTimestamp - Unix epoch timestamp of the block
+   * @param isPoS - Whether this block is a Proof-of-Stake block
+   */
+  private async processTransactionKeys(
+    txHash: string,
+    keys: any,
+    ownOutputs: VerifiedOwnOutput[],
+    blockHeight: number,
+    blockTimestamp: number = 0,
+    isPoS: boolean = false
+  ): Promise<void> {
+    if (!this.keyManager || ownOutputs.length === 0) return;
 
     // Determine txType by checking if any inputs reference wallet-owned outputs.
     // - If yes and block is PoS: the wallet's stake UTXO was spent as a staking input → 'stake'
     // - If yes and block is not PoS: this is a change output from an outgoing transaction → 'sent'
     // - Otherwise: coins received from an external sender → 'received'
     const txData = keys[1] || keys;
-    const inputs: any[] = txData?.inputs || txData?.vin || [];
+    const inputs: any[] = Array.isArray(txData?.inputs || txData?.vin)
+      ? txData?.inputs || txData?.vin
+      : [];
     let txType: TxType = 'received';
     // Inputs this wallet recognises as spending its own outputs. Collected
     // here rather than short-circuiting because the blinding-key backfill
     // below needs the whole set to pick its canonical anchor.
     const ownInputOutids: string[] = [];
-    if (Array.isArray(inputs) && inputs.length > 0) {
-      for (const input of inputs) {
-        const outputHash = input?.prevoutHash || input?.outputHash || input?.output_hash || input?.prevout?.hash;
-        if (outputHash && await this.walletDB.isOutputUnspent(outputHash)) {
-          txType = isPoS ? 'stake' : 'sent';
-          ownInputOutids.push(outputHash);
-        }
+    for (const input of inputs) {
+      const outputHash = input?.prevoutHash || input?.outputHash || input?.output_hash || input?.prevout?.hash;
+      if (outputHash && await this.walletDB.isOutputUnspent(outputHash)) {
+        txType = isPoS ? 'stake' : 'sent';
+        ownInputOutids.push(outputHash);
       }
     }
 
@@ -1169,103 +1366,31 @@ export class TransactionKeysSync {
       ? []
       : (anchor === null ? allInputOutids : [anchor, ...allInputOutids]);
 
-    for (let outputIndex = 0; outputIndex < outputs.length; outputIndex++) {
-      const outputKeys = outputs[outputIndex];
+    for (const own of ownOutputs) {
+      // Store output as spendable with recovered amount
+      await this.storeWalletOutput(
+        own.outputHash,
+        txHash,
+        own.outputIndex,
+        blockHeight,
+        own.outputHex,
+        own.recovered.amount,
+        own.recovered.gamma,
+        own.recovered.memo,
+        own.recovered.tokenIdHex,
+        own.blindingKey,
+        own.spendingKey,
+        false, // not spent
+        null, // spent_tx_hash
+        null, // spent_block_height
+        txType,
+        blockTimestamp,
+        own.ephemeralKey,
+        isStakedCommitmentOutputHex(own.outputHex)
+      );
 
-      // Extract keys from output
-      const blindingKey = outputKeys?.blindingKey || outputKeys?.blinding_key;
-      const spendingKey = outputKeys?.spendingKey || outputKeys?.spending_key;
-      const viewTag = outputKeys?.viewTag ?? outputKeys?.view_tag;
-      const outputHash = outputKeys?.outputHash || outputKeys?.output_hash;
-
-      if (!blindingKey || !spendingKey || viewTag === undefined || !outputHash) {
-        continue;
-      }
-
-      // Convert keys to PublicKey format if needed (they might be hex strings or serialized)
-      const PublicKey = blsctModule.PublicKey;
-      let blindingKeyObj: any;
-      let spendingKeyObj: any;
-      let isMine: boolean;
-      try {
-        blindingKeyObj = PublicKey.deserialize(blindingKey);
-        spendingKeyObj = PublicKey.deserialize(spendingKey);
-        // Check if output belongs to wallet
-        isMine = this.keyManager.isMineByKeys(blindingKeyObj, spendingKeyObj, viewTag);
-      } catch {
-        // Anyone can broadcast an output whose BLSCT keys are not valid
-        // curve points (testnet block 48020 has one). Such an output is
-        // spendable by no wallet, so it cannot be ours — skip it instead of
-        // letting one malformed output abort the sync loop forever.
-        continue;
-      }
-      if (isMine) {
-        // The keys isMine accepted; whatever the server serves for this
-        // output must carry exactly these.
-        const expectedKeys: ExpectedOutputKeys = {
-          outputHash: String(outputHash).toLowerCase(),
-          blindingKey: String(blindingKey).toLowerCase(),
-          spendingKey: String(spendingKey).toLowerCase(),
-          viewTag: Number(viewTag),
-          ephemeralKey: outputKeys?.ephemeralKey || outputKeys?.ephemeral_key || null,
-        };
-
-        let outputHex = '';
-        try {
-          outputHex = await this.withRetry(() =>
-            this.syncProvider.getTransactionOutput(outputHash)
-          );
-        } catch {
-          // Some providers may not expose standalone output serialization.
-          // Recovery falls back to parsing the full raw transaction below.
-        }
-        if (outputHex) {
-          this.verifyServedOutput(outputHex, expectedKeys, `output ${outputHash}`);
-        }
-
-        const recoveredOutput = await this.recoverConfirmedOutput(
-          txHash,
-          blindingKeyObj,
-          outputHex,
-          expectedKeys
-        );
-
-        // The public counterpart of the sender's blinding scalar is the
-        // EPHEMERAL key (k*G), not the field called blindingKey, which is
-        // k*sk_destination and bound to the recipient. The P2P backend reports
-        // it with the other keys; the Electrum key server does not, so fall
-        // back to reading it out of the serialized output.
-        const ephemeralKey: string | null =
-          outputKeys?.ephemeralKey
-          || outputKeys?.ephemeral_key
-          || (outputHex ? this.extractRangeProofFromOutput(outputHex).ephemeralKeyHex : null)
-          || null;
-
-        // Store output as spendable with recovered amount
-        await this.storeWalletOutput(
-          outputHash,
-          txHash,
-          outputIndex,
-          blockHeight,
-          outputHex,
-          recoveredOutput.amount,
-          recoveredOutput.gamma,
-          recoveredOutput.memo,
-          recoveredOutput.tokenIdHex,
-          blindingKey,
-          spendingKey,
-          false, // not spent
-          null, // spent_tx_hash
-          null, // spent_block_height
-          txType,
-          blockTimestamp,
-          ephemeralKey,
-          isStakedCommitmentOutputHex(outputHex)
-        );
-
-        if (candidateOutids.length > 0 && ephemeralKey) {
-          await this.backfillBlindingKey(outputHash, candidateOutids, ephemeralKey);
-        }
+      if (candidateOutids.length > 0 && own.ephemeralKey) {
+        await this.backfillBlindingKey(own.outputHash, candidateOutids, own.ephemeralKey);
       }
     }
   }
