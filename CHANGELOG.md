@@ -29,24 +29,39 @@ Format follows [Keep a Changelog](https://keepachangelog.com/); versions follow 
   or abandoned send — derived the same scalar for a different amount, and two
   range proofs sharing it leak both amounts. The derivation now matches
   navio-core's (PR #472): a 95-byte pre-image ending in a big-endian build
-  *generation*, and the wallet database claims and persists a fresh
+  _generation_, and the wallet database claims and persists a fresh
   generation per anchor before every build (`IWalletDB.reserveBlindingGeneration`;
   SQLite gains a `blinding_generations` table, IndexedDB a
   `blindingGenerations` store and version 6). Fee-estimation rounds of one
   build share its generation; token-send estimation now uses random keys and
-  claims none. When a generation cannot be persisted, or an anchor has used
+  claims none. A build that fails before broadcast still uses up its
+  generation. When a generation cannot be persisted, or an anchor has used
   all 32, the build uses random, unrecoverable keys rather than a derived key
-  that could repeat. Recovery searches generations 0–31 of the new layout,
-  then the 91-byte layout of navio-sdk 0.4 and earlier, so outputs built by
-  either SDK version or by navio-core remain recoverable.
+  that could repeat, and logs a `console.warn` once per reason and anchor.
+  Recovery searches generation 0, then the 91-byte layout of navio-sdk 0.4 and
+  earlier, then generations 1–31, so outputs built by either SDK version or
+  by navio-core remain recoverable, and a legacy output costs no more to find
+  than a new one. Sync's backfill, which also runs on owned outputs this
+  wallet did not build, bounds the anchor by the generations this database
+  handed out for it (`IWalletDB.getBlindingGeneration`) and gives fallback
+  inputs generation 0 and the legacy layout only; `recoverBlindingKey`
+  still searches everything. `searchBlindingKey` takes an optional
+  `generationLimit`.
 - **An encrypted wallet's output blinding scalars are stored encrypted.**
   `saveOutputBlindingKey` rows held the private scalar in plaintext. An
   encrypted wallet now stores them encrypted with the wallet key (`enc1:` +
   hex; new `KeyManager.encryptSecret()` / `decryptSecret()`), and reading one
-  needs the wallet unlocked. Plaintext rows written earlier are encrypted by
-  the new `NavioClient.sealStoredBlindingKeys()`, which the client also runs
-  the first time it touches the table while unlocked. Unencrypted wallets keep
-  plaintext. Sync is unaffected while locked: the backfill already skips.
+  needs the wallet unlocked. Plaintext rows written earlier are encrypted, in
+  place, by the new `NavioClient.sealStoredBlindingKeys()`; call it after
+  `unlock()` or `setPassword()`. Until then they stay on disk in plaintext:
+  the client runs the same pass only when it next uses the table while
+  unlocked (recovering a blinding key, building a transaction, or sync storing
+  a backfilled key), once per database, logging a `console.warn` and retrying
+  on the next use if it fails. Unencrypted wallets keep plaintext. Sync is
+  unaffected while locked: the backfill already skips. New
+  `IWalletDB.getUnsealedOutputBlindingKeys()` and
+  `replaceOutputBlindingKey()` (compare-and-set, keeps the row's creation
+  time).
 
 ### Changed
 
