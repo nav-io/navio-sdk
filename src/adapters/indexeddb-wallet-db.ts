@@ -504,13 +504,15 @@ export class IndexedDBWalletDB implements IWalletDB {
    * created collections and sync progress are tied to the keys that detected
    * them; kept across a restore with another seed they are selected as inputs
    * and the spend fails with "does not map to a known sub-address in this
-   * wallet". Restoring the same seed keeps everything.
+   * wallet". The token registry entries go too: the token data is public,
+   * but which collections are cached says which ones the previous wallet
+   * held. Restoring the same seed keeps everything.
    */
   private async discardForeignWalletData(incoming: KeyManager): Promise<void> {
     if (!(await this.holdsDifferentWallet(incoming))) return;
     const db = this.ensureOpen();
     const tx = db.transaction(
-      ['walletOutputs', 'createdCollections', 'standingOrders', 'outputBlindingKeys'],
+      ['walletOutputs', 'createdCollections', 'standingOrders', 'outputBlindingKeys', 'tokenRegistry'],
       'readwrite',
     );
     tx.objectStore('walletOutputs').clear();
@@ -518,6 +520,7 @@ export class IndexedDBWalletDB implements IWalletDB {
     tx.objectStore('standingOrders').clear();
     // Another seed's blinding scalars are not ours and can never verify.
     tx.objectStore('outputBlindingKeys').clear();
+    tx.objectStore('tokenRegistry').clear();
     await idbTx(tx);
     await this.clearSyncData();
   }

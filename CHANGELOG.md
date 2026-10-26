@@ -15,7 +15,9 @@ Format follows [Keep a Changelog](https://keepachangelog.com/); versions follow 
   minted entries, is shown at once and refreshed in the background after five
   minutes. Collections are looked up in parallel, once each, and concurrent
   balance calls share a lookup in flight. SQLite gains a `token_registry`
-  table and the IndexedDB database moves to version 9.
+  table and the IndexedDB database moves to version 9. Like the wallet's
+  other data, the stored entries are cleared when a different wallet is
+  written into the database, since they show which collections it held.
 
 ### Breaking
 

@@ -143,6 +143,36 @@ describe('IndexedDBWalletDB token registry cache', () => {
     }
   });
 
+  it('keeps entries for the same wallet and drops them for another', async () => {
+    const entry = {
+      publicTokenId: 'ab'.repeat(32),
+      kind: 'token' as const,
+      metadata: { name: 'Token' },
+      totalSupply: '1000',
+      mintedNft: {},
+      fetchedAt: 1_700_000_000_000,
+    };
+    const walletDB = new IndexedDBWalletDB();
+    await walletDB.open(PATH);
+    try {
+      const mnemonic = (await walletDB.createWallet()).getMnemonic();
+      await walletDB.storeWalletOutput({
+        ...oldRecord('07'.repeat(32), '', 1_000),
+        isSpent: false,
+        txType: 'received',
+      });
+      await walletDB.saveTokenRegistryEntry(entry);
+
+      await walletDB.restoreWalletFromMnemonic(mnemonic);
+      expect(await walletDB.getTokenRegistryEntry(entry.publicTokenId)).toEqual(entry);
+
+      await walletDB.createWallet();
+      expect(await walletDB.getTokenRegistryEntry(entry.publicTokenId)).toBeNull();
+    } finally {
+      await walletDB.close();
+    }
+  });
+
   it('adds the store to a database from 0.4.0 (version 5)', async () => {
     await new Promise<void>((resolve, reject) => {
       const req = indexedDB.open(IndexedDBWalletDB.getDatabaseName(PATH), 5);

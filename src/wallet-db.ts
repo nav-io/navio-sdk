@@ -1067,6 +1067,8 @@ export class WalletDB {
    * detected them: kept across a restore with a different seed they show up
    * in the new wallet's balance and get selected as inputs, and the spend
    * then fails with "does not map to a known sub-address in this wallet".
+   * The token registry entries go too: the token data is public, but which
+   * collections are cached says which ones the previous wallet held.
    * Restoring the same seed again keeps everything (no re-sync needed).
    */
   private async discardForeignWalletData(incoming: KeyManager): Promise<void> {
@@ -1081,6 +1083,7 @@ export class WalletDB {
     await this.adapter.run('DELETE FROM standing_orders');
     // Another seed's blinding scalars are not ours and can never verify.
     await this.adapter.run('DELETE FROM output_blinding_keys');
+    await this.adapter.run('DELETE FROM token_registry');
     await this.clearSyncData();
   }
 

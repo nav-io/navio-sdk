@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { WalletDB } from './wallet-db';
-import type { TokenRegistryEntry } from './wallet-db.interface';
+import type { StoreOutputParams, TokenRegistryEntry } from './wallet-db.interface';
 
 const ENTRY: TokenRegistryEntry = {
   publicTokenId: 'ab'.repeat(32),
@@ -33,5 +33,36 @@ describe('WalletDB token registry cache', () => {
     await walletDB.saveTokenRegistryEntry(updated);
     expect(await walletDB.getTokenRegistryEntry(ENTRY.publicTokenId)).toEqual(updated);
     expect(await walletDB.getTokenRegistryEntry('cd'.repeat(32))).toBeNull();
+  });
+
+  it('keeps entries for the same wallet and drops them for another', async () => {
+    const output: StoreOutputParams = {
+      outputHash: '01'.repeat(32),
+      txHash: 'cc'.repeat(32),
+      outputIndex: 0,
+      blockHeight: 10,
+      outputData: '',
+      amount: 1,
+      gamma: '01',
+      memo: null,
+      tokenId: null,
+      blindingKey: '02',
+      ephemeralKey: null,
+      spendingKey: '03',
+      isSpent: false,
+      spentTxHash: null,
+      spentBlockHeight: null,
+      txType: 'received',
+      timestamp: 0,
+    };
+    const mnemonic = (await walletDB.createWallet()).getMnemonic();
+    await walletDB.storeWalletOutput(output);
+    await walletDB.saveTokenRegistryEntry(ENTRY);
+
+    await walletDB.restoreWalletFromMnemonic(mnemonic);
+    expect(await walletDB.getTokenRegistryEntry(ENTRY.publicTokenId)).toEqual(ENTRY);
+
+    await walletDB.createWallet();
+    expect(await walletDB.getTokenRegistryEntry(ENTRY.publicTokenId)).toBeNull();
   });
 });
