@@ -163,6 +163,14 @@ export class ElectrumSyncProvider extends BaseSyncProvider {
     return this.client.getRawTransaction(txHash, verbose);
   }
 
+  /**
+   * Whether the server's daemon has the transaction (mempool or chain).
+   * See {@link ElectrumClient.hasTransaction}.
+   */
+  async hasTransaction(txHash: string): Promise<boolean | null> {
+    return this.client.hasTransaction(txHash);
+  }
+
   // ============================================================================
   // Additional Electrum-specific Methods (passthrough)
   // ============================================================================

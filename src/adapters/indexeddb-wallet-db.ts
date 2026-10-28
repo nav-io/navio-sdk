@@ -24,7 +24,7 @@ import type {
   WalletMetadata,
   StoreOutputParams,
   TxType,
-  CreatedCollectionRecord, SubAddressEntry, StandingOrderRow } from '../wallet-db.interface';
+  CreatedCollectionRecord, SubAddressEntry, StandingOrderRow, PendingSpend } from '../wallet-db.interface';
 
 // v2: adds the createdCollections store
 // v3: adds the standingOrders store
@@ -796,6 +796,8 @@ export class IndexedDBWalletDB implements IWalletDB {
     rec.isSpent = 1;
     rec.spentTxHash = spentTxHash;
     rec.spentBlockHeight = spentBlockHeight;
+    // When an unconfirmed spend was made, so a stuck one can be released.
+    rec.spentAt = spentBlockHeight === 0 ? Date.now() : null;
     await this.put('walletOutputs', rec);
   }
 
@@ -905,6 +907,53 @@ export class IndexedDBWalletDB implements IWalletDB {
       total += BigInt(rec.amount);
     }
     return total;
+  }
+
+  async getPendingSpends(): Promise<PendingSpend[]> {
+    const recs = await this.getAllByIndex<any>('walletOutputs', 'spentBlockHeight', 0);
+    return recs
+      .filter((rec) => rec.isSpent === 1 && rec.spentTxHash)
+      .map((rec) => ({
+        outputHash: rec.outputHash,
+        spentTxHash: rec.spentTxHash,
+        pendingSince: typeof rec.spentAt === 'number' ? rec.spentAt : null,
+      }));
+  }
+
+  async releasePendingSpend(spentTxHash: string): Promise<string[]> {
+    const db = this.ensureOpen();
+    const tx = db.transaction('walletOutputs', 'readwrite');
+    const done = idbTx(tx);
+    const store = tx.objectStore('walletOutputs');
+    const released: string[] = [];
+
+    const unspendReq = store.index('spentBlockHeight').openCursor(IDBKeyRange.only(0));
+    unspendReq.onsuccess = () => {
+      const cursor = unspendReq.result;
+      if (!cursor) return;
+      const rec = cursor.value;
+      // Skip the transaction's own rows: the delete below removes them, and
+      // updating one after its delete has been queued would write it back.
+      const ownRow = rec.blockHeight === 0 && rec.txHash === spentTxHash;
+      if (rec.isSpent === 1 && rec.spentTxHash === spentTxHash && !ownRow) {
+        cursor.update({ ...rec, isSpent: 0, spentTxHash: null, spentBlockHeight: null, spentAt: null });
+        released.push(rec.outputHash);
+      }
+      cursor.continue();
+    };
+
+    const deleteReq = store.index('blockHeight').openCursor(IDBKeyRange.only(0));
+    deleteReq.onsuccess = () => {
+      const cursor = deleteReq.result;
+      if (!cursor) return;
+      if (cursor.value.txHash === spentTxHash) {
+        cursor.delete();
+      }
+      cursor.continue();
+    };
+
+    await done;
+    return released;
   }
 
   async deleteUnconfirmedOutputsByTxHash(txHash: string): Promise<void> {

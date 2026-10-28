@@ -103,6 +103,22 @@ export interface StoreOutputParams {
 }
 
 /**
+ * A wallet output marked spent by a transaction this wallet broadcast (or saw
+ * in the mempool) that has not confirmed yet.
+ */
+export interface PendingSpend {
+  /** The spent output, display hex */
+  outputHash: string;
+  /** The unconfirmed transaction that spends it */
+  spentTxHash: string;
+  /**
+   * When the output was marked spent (ms since epoch), or null when that was
+   * not recorded (pending spends stored by older versions).
+   */
+  pendingSince: number | null;
+}
+
+/**
  * A token/NFT collection created by this wallet, recorded at creation time.
  */
 export interface CreatedCollectionRecord {
@@ -252,6 +268,21 @@ export interface IWalletDB {
   // -- pending/mempool balance ------------------------------------------
   getPendingSpentAmount(tokenId?: string | null): Promise<bigint>;
   deleteUnconfirmedOutputsByTxHash(txHash: string): Promise<void>;
+  /**
+   * Every output marked spent by an unconfirmed transaction
+   * (`spentBlockHeight` 0), with when it was marked.
+   */
+  getPendingSpends(): Promise<PendingSpend[]>;
+  /**
+   * Undo an unconfirmed spend, in one atomic write: mark the outputs
+   * `spentTxHash` spent at height 0 unspent again, and delete that
+   * transaction's own unconfirmed (block height 0) outputs. Outputs it spent
+   * in a block are left alone.
+   *
+   * @param spentTxHash - The unconfirmed transaction
+   * @returns The outputs that were released
+   */
+  releasePendingSpend(spentTxHash: string): Promise<string[]>;
 
   // -- output blinding keys (secret; never part of WalletOutput) ---------
   /**

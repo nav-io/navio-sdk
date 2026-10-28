@@ -227,6 +227,24 @@ export class ElectrumError extends Error {
 
 
 /**
+ * Whether an error from `blockchain.transaction.get` means the daemon does
+ * not have the transaction. ElectrumX relays the daemon's
+ * `getrawtransaction` failure as `daemon error: DaemonError({'code': -5,
+ * 'message': 'No such mempool or blockchain transaction. ...'})` (or "No such
+ * mempool transaction" on a daemon without -txindex). Anything else (a
+ * timeout, a dropped connection, a server error) leaves the answer unknown.
+ *
+ * @category Sync
+ */
+export function isTransactionNotFoundError(error: unknown): boolean {
+  const message = String((error as { message?: unknown })?.message ?? error ?? '');
+  // While -txindex is still being built, the daemon cannot rule out a
+  // confirmed copy: unknown, not "not found".
+  return /No such mempool (or blockchain )?transaction/i.test(message) &&
+    !/still in the process of being indexed/i.test(message);
+}
+
+/**
  * Subscription callback type
  */
 export type SubscriptionCallback = (params: any) => void;
@@ -791,6 +809,24 @@ export class ElectrumClient {
       return this.call('blockchain.transaction.get', txHash, verbose, blockHash);
     }
     return this.call('blockchain.transaction.get', txHash, verbose);
+  }
+
+  /**
+   * Whether the server's daemon has a transaction, in its mempool or on
+   * chain, via `blockchain.transaction.get`.
+   *
+   * @param txHash - Transaction hash (hex string)
+   * @returns true if the server returns it; false if the daemon reports it
+   *   unknown ("No such mempool ... transaction");
+   *   null on any other error, when the answer is unknown
+   */
+  async hasTransaction(txHash: string): Promise<boolean | null> {
+    try {
+      const raw = await this.getRawTransaction(txHash, false);
+      return typeof raw === 'string' && raw.length > 0 ? true : null;
+    } catch (error) {
+      return isTransactionNotFoundError(error) ? false : null;
+    }
   }
 
   /**

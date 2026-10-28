@@ -8,7 +8,7 @@
 /**
  * Network type for Navio
  */
-export type NavioNetwork = 'mainnet' | 'testnet' | 'regtest';
+export type NavioNetwork = 'mainnet' | 'testnet' | 'signet' | 'regtest';
 
 /**
  * Generic hex string type

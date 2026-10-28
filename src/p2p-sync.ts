@@ -869,6 +869,30 @@ export class P2PSyncProvider extends BaseSyncProvider {
     };
   }
 
+  /**
+   * Whether the node has the transaction: `true` when it is in the node's
+   * mempool or most recent block (getdata), or in a block this provider
+   * scanned; otherwise `null` (unknown), never `false`.
+   *
+   * A `notfound` is not a reliable "not held": the node serves a mempool
+   * transaction over getdata only under its relay rules, which since
+   * navio-core #482 also apply to the transaction's sender. It withholds one
+   * still embargoed in its Dandelion stem phase, and one that entered its
+   * mempool after the last inventory pass to this connection; a transaction
+   * this wallet just sent is in that window. The client cannot tell
+   * those cases from a dropped transaction, so pending spends are never
+   * released automatically on the P2P backend; use
+   * `NavioClient.releasePendingSpend` for one you know will not confirm.
+   */
+  async hasTransaction(txHash: string): Promise<boolean | null> {
+    try {
+      await this.fetchTransaction(txHash);
+      return true;
+    } catch {
+      return null;
+    }
+  }
+
   private async fetchTransaction(txHash: string): Promise<ParsedTransaction> {
     const wanted = txHash.toLowerCase();
 

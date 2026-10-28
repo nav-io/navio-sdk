@@ -109,7 +109,9 @@ interface NavioClientConfig {
     maxConcurrentBlockRequests?: number; // Parallel block downloads (default: 8)
   };
 
-  // Network configuration (for navio-blsct)
+  // Network configuration (for navio-blsct). Address prefixes: nav (mainnet),
+  // tnv (testnet), snv (signet), rnv (regtest); a send to another network's
+  // address is refused.
   network?: 'mainnet' | 'testnet' | 'signet' | 'regtest';
 
   // Wallet options
@@ -173,10 +175,26 @@ interface SyncOptions {
   saveInterval?: number; // Save every N blocks (default: 100)
   keepTxKeys?: boolean; // Keep TX keys in DB (default: false)
   blockHashRetention?: number; // Keep last N hashes (default: 10000)
+  pendingSpendTimeoutMs?: number; // Check unconfirmed spends older than this (default: 30 min; 0 disables)
 }
 ```
 
 Returns: Number of transaction keys synced
+
+Once synced to the tip, `sync()` also checks this wallet's unconfirmed
+spends. A broadcast transaction marks its inputs spent until a block confirms
+it; for one still unconfirmed after `pendingSpendTimeoutMs`, sync asks the
+backend whether it still has the transaction (in its mempool or on chain). If
+the backend definitively says it does not, the inputs become spendable again
+and the transaction's unconfirmed outputs are dropped from the balance. If the
+backend cannot answer, nothing changes. The Electrum backend answers
+definitively; the P2P backend never does (a node's `notfound` also covers
+transactions it holds but does not yet serve to this connection, including
+this wallet's own), so on P2P a stuck spend is only released by
+`releasePendingSpend`. The check runs only if the wallet is still at the tip
+when the sync ends. Should a released transaction confirm after all, the next
+sync marks its inputs spent again. The check is also available on its own as
+`client.getSyncManager().checkPendingSpends(olderThanMs)`.
 
 On a chain reorganization, `sync()` reverts the orphaned blocks (their
 outputs, spends and block hashes) and re-syncs from the fork point, calling
@@ -288,6 +306,21 @@ interface WalletOutput {
 
 Get all wallet outputs (spent and unspent).
 
+##### `getPendingSpends(): Promise<PendingSpend[]>`
+
+Outputs marked spent by a transaction that has not confirmed yet:
+`{ outputHash, spentTxHash, pendingSince }`, where `pendingSince` is when the
+output was marked (ms since epoch; null for spends recorded by older
+versions).
+
+##### `releasePendingSpend(txId: string): Promise<string[]>`
+
+Give up on an unconfirmed transaction: its inputs become spendable again and
+its unconfirmed outputs are dropped. Returns the released outputs. Unlike the
+automatic check in `sync()`, this does not ask the backend, so use it only for
+a transaction you know will not confirm; spending the released outputs while
+it is still in a mempool is rejected as a double spend.
+
 ##### `getTokenBalance(tokenId: string): Promise<bigint>`
 
 Get the current balance for a specific token or NFT.
@@ -350,6 +383,14 @@ Returns the configured network.
 Check if client is connected to the backend.
 
 #### Transaction Creation
+
+Spends on one client run one at a time: each selects its inputs, signs,
+broadcasts and marks the inputs spent before the next one starts, so
+overlapping calls never pick the same outputs. Amounts are bigints in
+satoshis; a number is refused. A manual `selectedUtxos` list may not name an
+output twice. Before broadcasting, the fee is checked against the size of the
+signed transaction, and a transaction whose fee falls short is refused rather
+than sent.
 
 ##### `sendTransaction(options: SendTransactionOptions): Promise<SendTransactionResult>`
 

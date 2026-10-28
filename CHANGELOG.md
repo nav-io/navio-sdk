@@ -53,6 +53,67 @@ Format follows [Keep a Changelog](https://keepachangelog.com/); versions follow 
 - `setHDSeed()`, `setHDSeedFromMnemonic()` and `generateNewMnemonic()` throw
   on an encrypted wallet.
 
+### Added
+
+- **Unconfirmed spends are released when the transaction is gone.** A
+  broadcast transaction that never confirmed left its inputs spent forever
+  and its unconfirmed change in the balance. Spends are now timestamped
+  (SQLite `spent_at` column, IndexedDB `spentAt` field), and `sync()`, once
+  at the tip, asks the backend about transactions unconfirmed for longer than
+  `pendingSpendTimeoutMs` (default 30 minutes, 0 disables), provided the
+  wallet is still at the tip when the sync ends. If the backend definitively
+  no longer has one, its inputs are marked unspent and its unconfirmed outputs
+  deleted; if the backend cannot answer, nothing changes. On the P2P backend
+  the answer is never definitive, so nothing is released automatically there.
+  `TransactionKeysSync.checkPendingSpends()` runs the check on its own.
+- `NavioClient.getPendingSpends()` and `releasePendingSpend(txId)`, the
+  manual override, which does not ask the backend.
+- `IWalletDB.getPendingSpends()` and `releasePendingSpend(spentTxHash)`.
+- `SyncProvider.hasTransaction(txHash)` (optional), implemented by the
+  Electrum provider (`blockchain.transaction.get`, `ElectrumClient.hasTransaction`)
+  and the P2P provider (getdata): `true` found, `false` definitively not
+  found, `null` unknown. The P2P provider returns `null` instead of `false`:
+  a node's `notfound` also covers a transaction it holds but withholds under
+  its relay rules (stem phase, or not yet in an inventory pass to this
+  connection), which includes this wallet's own just-sent transactions. `isTransactionNotFoundError()` tells the Electrum "not found" error
+  apart from others.
+
+### Fixed
+
+- **Spends are serialized.** Two overlapping sends (`sendTransaction`,
+  `sendToMany`, token/NFT sends, collection creation, mints, `delegateStake`,
+  `unstake`) could select the same outputs before either marked them spent,
+  and the second was rejected as a double spend. Each now selects, signs,
+  broadcasts and marks its inputs spent under a per-client lock. Swap halves
+  take the same lock: `acceptQuote` through marking its inputs spent,
+  `broadcastOrder` through recording the order (which reserves its inputs),
+  and `replyQuote` for coin selection.
+- A `subtractFeeFromAmount` NAV send larger than the selected inputs built a
+  transaction with more output than input; it now fails with
+  `Insufficient funds`.
+- A manual `selectedUtxos` list naming an output twice is refused on every
+  spend path (swap halves included), as `unstake` already refused repeated
+  `stakedOutputs`.
+- The change of the wallet's own broadcasts was recorded as `received`
+  instead of `sent`, both in the mempool and once the transaction confirmed,
+  because the inputs were already marked spent when the transaction was
+  scanned. An input the wallet already marked spent in the mempool now
+  counts as its own.
+- Token sends and `sendToMany` skip outputs the wallet's keys cannot sign
+  for, as `sendTransaction` already did, instead of failing with
+  `Cannot derive spending key`.
+- A fee loop that ran out of rounds could broadcast a fee sized for fewer
+  inputs. The fee is now checked against the signed transaction before
+  broadcast, and a short one is refused.
+- The signet address check expected the mainnet prefix `nav`, while
+  navio-blsct encodes and decodes signet addresses as `snv`, so every signet
+  send was refused. It now expects `snv`, so mainnet and signet addresses are
+  told apart. (navio-core's signet chainparams still use `nav`.)
+- `sendTransaction`, `sendToken`, `delegateStake` and `unstake` refuse a
+  number amount with a clear error instead of `Cannot mix BigInt and other
+  types`.
+- `NavioNetwork` includes `'signet'`.
+
 ### Changed
 
 - `WalletDB.saveWallet()` / `loadWallet()` (SQLite) now save and restore the

@@ -15,7 +15,7 @@ import { TransactionKeysSync, SyncOptions, BackgroundSyncOptions } from './tx-ke
 import { KeyManager } from './key-manager';
 import { parseBirthdayMnemonic } from './crypto/birthday-mnemonic';
 import { randomBytes } from './crypto/encryption';
-import type { IWalletDB, WalletOutput, StandingOrderRow } from './wallet-db.interface';
+import type { IWalletDB, WalletOutput, StandingOrderRow, PendingSpend } from './wallet-db.interface';
 import { SyncProvider } from './sync-provider';
 import { P2PSyncProvider } from './p2p-sync';
 import { P2PConnectionOptions } from './p2p-protocol';
@@ -85,13 +85,19 @@ function estimateHeightForTimestamp(network: NetworkType, ts: number): number {
 const DEFAULT_FEE_PER_COMPONENT = 200_000;
 
 /**
- * BLSCT address prefix (bech32_mod_hrp) per network, from navio-core
- * chainparams. Signet reuses the mainnet prefix.
+ * BLSCT address prefix per network: the prefix navio-blsct encodes and
+ * decodes addresses with once `setChain` has selected the network
+ * (`blsct::bech32_hrp` in navio-core's src/blsct/key_io.h).
+ *
+ * Signet is "snv" there. navio-core's signet chainparams still set
+ * `bech32_mod_hrp = "nav"`, so a signet node's own wallet uses mainnet-looking
+ * addresses this SDK can neither produce nor decode on signet; the library
+ * prefix is what the check below must match, or every signet send fails it.
  */
 const NETWORK_ADDRESS_HRP: Record<NetworkType, string> = {
   mainnet: 'nav',
   testnet: 'tnv',
-  signet: 'nav',
+  signet: 'snv',
   regtest: 'rnv',
 };
 
@@ -1044,6 +1050,9 @@ export class NavioClient {
   private blockHeaderCallback: ((header: { height: number; hex: string }) => void) | null = null;
   private usingSubscriptions = false;
 
+  /** Tail of the spend queue; see {@link withSpendLock}. */
+  private spendLockTail: Promise<void> = Promise.resolve();
+
   /**
    * Create a new NavioClient instance
    * @param config - Client configuration
@@ -1525,6 +1534,7 @@ export class NavioClient {
         verifyHashes: opts?.verifyHashes,
         keepTxKeys: opts?.keepTxKeys,
         blockHashRetention: opts?.blockHashRetention,
+        pendingSpendTimeoutMs: opts?.pendingSpendTimeoutMs,
         stopOnReorg: false,
       });
 
@@ -2016,6 +2026,43 @@ export class NavioClient {
   }
 
   /**
+   * Unconfirmed spends: outputs marked spent by a transaction that has not
+   * confirmed yet, with when they were marked.
+   */
+  async getPendingSpends(): Promise<PendingSpend[]> {
+    if (!this.walletDB) {
+      throw new Error('Client not initialized');
+    }
+    return this.walletDB.getPendingSpends();
+  }
+
+  /**
+   * Give up on an unconfirmed transaction: mark the outputs it spends
+   * unspent again and drop its unconfirmed outputs from the wallet.
+   *
+   * Sync does this on its own for a transaction that stays unconfirmed past
+   * `pendingSpendTimeoutMs` (30 minutes by default) once the backend no
+   * longer has it; this is the manual override, and it does not ask the
+   * backend. Use it only for a transaction you know will not confirm: if it
+   * is still in a mempool, spending the released outputs again is rejected
+   * as a double spend. Should it confirm after all, the next sync marks the
+   * outputs spent again.
+   *
+   * @param txId - The unconfirmed transaction
+   * @returns The outputs that were released (empty if `txId` spent none
+   *   unconfirmed)
+   */
+  async releasePendingSpend(txId: string): Promise<string[]> {
+    if (!this.walletDB) {
+      throw new Error('Client not initialized');
+    }
+    const walletDB = this.walletDB;
+    const released = await this.withSpendLock(() => walletDB.releasePendingSpend(txId));
+    await walletDB.saveDatabase();
+    return released;
+  }
+
+  /**
    * Get unspent outputs (UTXOs) that can be spent: staked commitments, which
    * are locked for staking, are left out (see {@link getStakedOutputs}).
    * @param tokenId - Optional token ID to filter by (null for NAV)
@@ -2154,6 +2201,7 @@ export class NavioClient {
    * @returns Transaction result with txId and details
    */
   async delegateStake(options: DelegateStakeOptions): Promise<SendTransactionResult> {
+    NavioClient.assertBigintAmount(options.amount, 'amount');
     const { keyManager } = await this.ensureSpendReady();
     const { amount, selectedUtxos, randomBlindingKeys } = options;
 
@@ -2206,6 +2254,14 @@ export class NavioClient {
    * @returns Transaction result with txId and details
    */
   async unstake(options: UnstakeOptions = {}): Promise<SendTransactionResult> {
+    if (options.amount !== undefined) {
+      NavioClient.assertBigintAmount(options.amount, 'amount');
+    }
+    return this.withSpendLock(() => this.unstakeLocked(options));
+  }
+
+  /** {@link unstake}, run under the spend lock. */
+  private async unstakeLocked(options: UnstakeOptions): Promise<SendTransactionResult> {
     const { walletDB } = await this.ensureSpendReady();
 
     const confirmed = (await this.getStakedOutputs()).filter(output => output.blockHeight > 0);
@@ -2443,6 +2499,13 @@ export class NavioClient {
    * ```
    */
   async sendTransaction(options: SendTransactionOptions): Promise<SendTransactionResult> {
+    NavioClient.assertBigintAmount(options.amount, 'amount');
+    NavioClient.assertNoDuplicateSelection(options.selectedUtxos);
+    return this.withSpendLock(() => this.sendTransactionLocked(options));
+  }
+
+  /** {@link sendTransaction}, run under the spend lock. */
+  private async sendTransactionLocked(options: SendTransactionOptions): Promise<SendTransactionResult> {
     const { walletDB } = await this.ensureSpendReady();
 
     const {
@@ -2523,7 +2586,7 @@ export class NavioClient {
           throw new Error('No unspent outputs available for the requested asset.');
         }
         ({ selected: selectedAssetOutputs, totalIn: totalAssetIn } = NavioClient.selectInputsByAmount(
-          confirmedAssetOutputs,
+          this.selectableUtxos(confirmedAssetOutputs),
           amount,
         ));
       }
@@ -2539,6 +2602,10 @@ export class NavioClient {
       let totalNavIn = manualNavOutputs.reduce((sum, output) => sum + output.amount, 0n);
       let fee = 0n;
       let includeNavChange = selectedNavOutputs.length > 0;
+      // Fee-funding candidates for automatic selection, filtered once.
+      let selectableNavOutputs: WalletOutput[] | null = null;
+      const navCandidates = (): WalletOutput[] =>
+        (selectableNavOutputs ??= this.selectableUtxos(confirmedNavOutputs));
 
       for (let attempt = 0; attempt < 6; attempt++) {
         if (manualNavOutputs.length === 0 && selectedNavOutputs.length === 0) {
@@ -2550,7 +2617,7 @@ export class NavioClient {
           }
 
           ({ selected: selectedNavOutputs, totalIn: totalNavIn } = NavioClient.selectInputsByAmount(
-            confirmedNavOutputs,
+            navCandidates(),
             1n,
           ));
         }
@@ -2578,7 +2645,7 @@ export class NavioClient {
           }
         } else if (totalNavIn < estimatedFee) {
           ({ selected: selectedNavOutputs, totalIn: totalNavIn } = NavioClient.selectInputsByAmount(
-            confirmedNavOutputs,
+            navCandidates(),
             estimatedFee,
           ));
           if (totalNavIn < estimatedFee) {
@@ -2709,6 +2776,9 @@ export class NavioClient {
       let sendAmount: bigint;
       let changeAmount: bigint;
       if (subtractFeeFromAmount) {
+        if (totalIn < amount) {
+          throw new Error(`Insufficient funds: need ${amount} sat but only have ${totalIn} sat`);
+        }
         sendAmount = amount - fee;
         if (sendAmount <= 0n) {
           throw new Error(`Fee (${fee} sat) exceeds send amount (${amount} sat)`);
@@ -2786,6 +2856,12 @@ export class NavioClient {
    * ```
    */
   async sendToMany(options: SendToManyOptions): Promise<SendTransactionResult> {
+    NavioClient.assertNoDuplicateSelection(options.selectedUtxos);
+    return this.withSpendLock(() => this.sendToManyLocked(options));
+  }
+
+  /** {@link sendToMany}, run under the spend lock. */
+  private async sendToManyLocked(options: SendToManyOptions): Promise<SendTransactionResult> {
     const { walletDB } = await this.ensureSpendReady();
 
     const { recipients, selectedUtxos, randomBlindingKeys } = options;
@@ -2846,7 +2922,7 @@ export class NavioClient {
         throw new Error('No unspent outputs available');
       }
 
-      const sorted = [...confirmedUtxos].sort((a, b) => {
+      const sorted = [...this.selectableUtxos(confirmedUtxos)].sort((a, b) => {
         if (b.amount > a.amount) return 1;
         if (b.amount < a.amount) return -1;
         return 0;
@@ -3875,24 +3951,28 @@ export class NavioClient {
       throw new Error(`Quote delivers ${quote.fill} which is below minRecv ${minRecv}`);
     }
 
-    // The taker half pays no fee: the maker half over-funds the combined fee.
-    const { halfHex, fee, spentInputs } = await this.buildSwapHalf({
-      payTokenId: options.sellTokenId,
-      payAmount: quote.sellCost,
-      recvTokenId: options.buyTokenId,
-      recvAmount: quote.fill,
-      makerFee: false,
-      selectedUtxos: options.selectedUtxos,
+    // Select, hand over and mark spent under the spend lock, like any other
+    // spend: an overlapping send must not pick the same coins.
+    return this.withSpendLock(async () => {
+      // The taker half pays no fee: the maker half over-funds the combined fee.
+      const { halfHex, fee, spentInputs } = await this.buildSwapHalf({
+        payTokenId: options.sellTokenId,
+        payAmount: quote.sellCost,
+        recvTokenId: options.buyTokenId,
+        recvAmount: quote.fill,
+        makerFee: false,
+        selectedUtxos: options.selectedUtxos,
+      });
+
+      const txId = await electrum.rfqAcceptQuote(uuid, quoteId, halfHex);
+
+      const { walletDB } = await this.ensureSpendReady();
+      for (const outputHash of spentInputs) {
+        await walletDB.markOutputSpent(outputHash, txId, 0);
+      }
+
+      return { txId, quote, fee };
     });
-
-    const txId = await electrum.rfqAcceptQuote(uuid, quoteId, halfHex);
-
-    const { walletDB } = await this.ensureSpendReady();
-    for (const outputHash of spentInputs) {
-      await walletDB.markOutputSpent(outputHash, txId, 0);
-    }
-
-    return { txId, quote, fee };
   }
 
   /**
@@ -3979,7 +4059,7 @@ export class NavioClient {
    * encrypts it to the taker's reply key and broadcasts it over the bus.
    *
    * The half over-funds the transaction fee so the taker can accept with a
-   * fee-free half. The coins it spends are NOT locked: if the taker accepts,
+   * fee-free half. The coins it spends are NOT marked spent: if the taker accepts,
    * the wallet sees them spent on-chain; if the quote expires unaccepted,
    * they remain spendable. Avoid spending them manually while a quote is
    * outstanding, or the swap will fail to confirm.
@@ -3990,14 +4070,19 @@ export class NavioClient {
     const orderExpiry = options.orderExpiry ?? Math.floor(Date.now() / 1000) + 600;
 
     // The maker pays what the taker buys, and receives what the taker sells.
-    const { halfHex, fee, spentInputs } = await this.buildSwapHalf({
-      payTokenId: request.buyTokenId,
-      payAmount: request.fill,
-      recvTokenId: request.sellTokenId,
-      recvAmount: request.sellCost,
-      makerFee: true,
-      selectedUtxos: options.selectedUtxos,
-    });
+    // Selection waits for spends in flight, so it never picks coins a send
+    // is about to mark spent. The coins are not marked here (see above), so
+    // the lock is not held while the daemon publishes the quote.
+    const { halfHex, fee, spentInputs } = await this.withSpendLock(() =>
+      this.buildSwapHalf({
+        payTokenId: request.buyTokenId,
+        payAmount: request.fill,
+        recvTokenId: request.sellTokenId,
+        recvAmount: request.sellCost,
+        makerFee: true,
+        selectedUtxos: options.selectedUtxos,
+      })
+    );
 
     const quoteId = await electrum.swapSendQuote(
       request.uuid,
@@ -4027,42 +4112,49 @@ export class NavioClient {
     NavioClient.assertUnixExpiry(options.expiry, 'expiry');
     const electrum = this.getTradingClient();
 
-    // Coins committed to other live standing orders are off limits: the
-    // network's order cache refuses an order spending an input of a stored
-    // order, and only evicts orders on expiry or when an input is spent.
-    const reserved = options.reserveInputs === false
-      ? new Set<string>()
-      : await this.reservedStandingOrderInputs();
+    // Reading the reservations, selecting and recording the order run under
+    // the spend lock: an overlapping send or order must not pick the same
+    // coins. Once the row is saved the coins are reserved, so the lock is
+    // not held while the daemon grinds the order's proof-of-work.
+    const { halfHex, fee, spentInputs, localId, row } = await this.withSpendLock(async () => {
+      // Coins committed to other live standing orders are off limits: the
+      // network's order cache refuses an order spending an input of a stored
+      // order, and only evicts orders on expiry or when an input is spent.
+      const reserved = options.reserveInputs === false
+        ? new Set<string>()
+        : await this.reservedStandingOrderInputs();
 
-    const { halfHex, fee, spentInputs } = await this.buildSwapHalf({
-      payTokenId: options.offerTokenId,
-      payAmount: options.offerAmount,
-      recvTokenId: options.wantTokenId,
-      recvAmount: options.wantAmount,
-      makerFee: true,
-      selectedUtxos: options.selectedUtxos,
-      excludeUtxos: reserved,
+      const half = await this.buildSwapHalf({
+        payTokenId: options.offerTokenId,
+        payAmount: options.offerAmount,
+        recvTokenId: options.wantTokenId,
+        recvAmount: options.wantAmount,
+        makerFee: true,
+        selectedUtxos: options.selectedUtxos,
+        excludeUtxos: reserved,
+      });
+
+      // Track the order BEFORE broadcasting. The daemon grinds proof-of-work
+      // before it answers, so a timed-out call may still have published the
+      // order; recording first keeps those coins reserved either way.
+      const id = Array.from(randomBytes(16)).map((b) => b.toString(16).padStart(2, '0')).join('');
+      const unconfirmed: StandingOrderRow = {
+        localId: id,
+        quoteId: null,
+        status: 'unconfirmed',
+        offerTokenId: options.offerTokenId,
+        offerAmount: options.offerAmount.toString(),
+        wantTokenId: options.wantTokenId,
+        wantAmount: options.wantAmount.toString(),
+        expiry: options.expiry,
+        inputs: half.spentInputs,
+        halfTxHex: half.halfHex,
+        fee: half.fee.toString(),
+        createdAt: Math.floor(Date.now() / 1000),
+      };
+      await this.saveStandingOrderRow(unconfirmed);
+      return { ...half, localId: id, row: unconfirmed };
     });
-
-    // Track the order BEFORE broadcasting. The daemon grinds proof-of-work
-    // before it answers, so a timed-out call may still have published the
-    // order; recording first keeps those coins reserved either way.
-    const localId = Array.from(randomBytes(16)).map((b) => b.toString(16).padStart(2, '0')).join('');
-    const row: StandingOrderRow = {
-      localId,
-      quoteId: null,
-      status: 'unconfirmed',
-      offerTokenId: options.offerTokenId,
-      offerAmount: options.offerAmount.toString(),
-      wantTokenId: options.wantTokenId,
-      wantAmount: options.wantAmount.toString(),
-      expiry: options.expiry,
-      inputs: spentInputs,
-      halfTxHex: halfHex,
-      fee: fee.toString(),
-      createdAt: Math.floor(Date.now() / 1000),
-    };
-    await this.saveStandingOrderRow(row);
 
     let quoteId: string;
     try {
@@ -4185,7 +4277,8 @@ export class NavioClient {
   }
 
   /**
-   * Build and sign an unbalanced swap half: inputs cover `payAmount` of the
+   * Build and sign an unbalanced swap half; callers run it inside
+   * {@link withSpendLock}. Inputs cover `payAmount` of the
    * pay token (plus the fee, when this half funds it); outputs are the
    * received leg (recv token, no matching input — the counterparty's half
    * supplies it), pay-token change, and NAV change when the fee is funded
@@ -4205,6 +4298,7 @@ export class NavioClient {
     /** outputHashes never to select automatically (reserved by standing orders) */
     excludeUtxos?: Set<string>;
   }): Promise<{ halfHex: string; fee: bigint; spentInputs: string[] }> {
+    NavioClient.assertNoDuplicateSelection(params.selectedUtxos);
     const { keyManager, walletDB } = await this.ensureSpendReady();
     const { payAmount, recvAmount, makerFee } = params;
     if (payAmount <= 0n || recvAmount <= 0n) {
@@ -4508,6 +4602,54 @@ export class NavioClient {
     return { selected, totalIn };
   }
 
+  /**
+   * Run `fn` with this client's spend lock held, after every spend started
+   * before it has finished.
+   *
+   * Every path that selects wallet outputs and broadcasts a transaction
+   * spending them must run its select → sign → broadcast → markOutputSpent
+   * sequence inside this lock; otherwise two overlapping spends select the
+   * same outputs before either marks them spent, and the second is rejected
+   * as a double spend. That includes swap halves: a taker half's inputs are
+   * marked spent once it is handed over, and a standing order's are reserved
+   * once its row is saved.
+   *
+   * Not reentrant: `fn` must not call another public spend method (or this)
+   * — it would wait on itself forever.
+   */
+  private async withSpendLock<T>(fn: () => Promise<T>): Promise<T> {
+    const previous = this.spendLockTail;
+    let release!: () => void;
+    this.spendLockTail = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    try {
+      await previous;
+      return await fn();
+    } finally {
+      release();
+    }
+  }
+
+  /**
+   * Refuse a non-bigint amount up front, before it reaches bigint arithmetic
+   * (where a number throws "Cannot mix BigInt and other types").
+   */
+  private static assertBigintAmount(value: unknown, fieldName: string): void {
+    if (typeof value !== 'bigint') {
+      throw new Error(
+        `${fieldName} must be a bigint in satoshis (e.g. 100_000_000n for 1 NAV), got ${typeof value}`
+      );
+    }
+  }
+
+  /** Refuse a manual input selection that names an output more than once. */
+  private static assertNoDuplicateSelection(selectedUtxos: string[] | undefined): void {
+    if (selectedUtxos && new Set(selectedUtxos).size !== selectedUtxos.length) {
+      throw new Error('selectedUtxos lists an output more than once');
+    }
+  }
+
   private async ensureSpendReady(): Promise<{ keyManager: KeyManager; walletDB: IWalletDB }> {
     if (!this.initialized) {
       await this.initialize();
@@ -4741,6 +4883,19 @@ export class NavioClient {
     selectedUtxos?: string[],
     useRandomBlindingKeys?: boolean,
     fundedAmount: bigint = 0n,
+  ): Promise<SendTransactionResult> {
+    NavioClient.assertNoDuplicateSelection(selectedUtxos);
+    return this.withSpendLock(() => this.buildAndBroadcastUnsignedTransactionLocked(
+      buildAssetOutputs, selectedUtxos, useRandomBlindingKeys, fundedAmount,
+    ));
+  }
+
+  /** {@link buildAndBroadcastUnsignedTransaction}, run under the spend lock. */
+  private async buildAndBroadcastUnsignedTransactionLocked(
+    buildAssetOutputs: (blindingKeys: BlindingKeyAllocator) => InstanceType<typeof UnsignedOutput>[],
+    selectedUtxos: string[] | undefined,
+    useRandomBlindingKeys: boolean | undefined,
+    fundedAmount: bigint,
   ): Promise<SendTransactionResult> {
     const { walletDB } = await this.ensureSpendReady();
     const { selected, totalIn } = await this.selectFundingUtxos(walletDB, selectedUtxos, fundedAmount);
@@ -4978,6 +5133,17 @@ export class NavioClient {
     blindingKeys?: BlindingKeyAllocator,
   ): Promise<SendTransactionResult> {
     const { rawTx, txId, ctx } = this.signUnsignedTransaction(inputs, outputs, fee);
+
+    // The fee loops stop after a fixed number of rounds; one that ends with
+    // the selection still moving can leave a fee sized for a smaller
+    // transaction. Check the transaction actually being broadcast.
+    const required = requiredBlsctFee(rawTx.length / 2);
+    if (fee < required) {
+      throw new Error(
+        `Fee did not converge: the transaction needs ${required} sat but the fee is ${fee} sat. ` +
+        'Nothing was broadcast; try again, or select inputs manually.'
+      );
+    }
 
     await this.broadcastRawTransaction(rawTx);
 
